@@ -330,7 +330,10 @@ mod tests {
         let incoming = vec![row(b"a", b"a-v1"), row(b"b", b"b-v1"), row(b"c", b"c-v1")];
         let diff = classify_snapshot_diff(incoming, Vec::new());
         assert!(diff.deletes.is_empty());
-        assert_eq!(payloads(&diff.inserts), vec![b"a-v1".to_vec(), b"b-v1".to_vec(), b"c-v1".to_vec()]);
+        assert_eq!(
+            payloads(&diff.inserts),
+            vec![b"a-v1".to_vec(), b"b-v1".to_vec(), b"c-v1".to_vec()]
+        );
     }
 
     #[test]
@@ -338,7 +341,10 @@ mod tests {
         let current = vec![row(b"a", b"a-v1"), row(b"b", b"b-v1")];
         let diff = classify_snapshot_diff(Vec::new(), current);
         assert!(diff.inserts.is_empty());
-        assert_eq!(payloads(&diff.deletes), vec![b"a-v1".to_vec(), b"b-v1".to_vec()]);
+        assert_eq!(
+            payloads(&diff.deletes),
+            vec![b"a-v1".to_vec(), b"b-v1".to_vec()]
+        );
     }
 
     #[test]
@@ -375,16 +381,8 @@ mod tests {
     #[test]
     fn mixed_insert_update_delete_noop() {
         // A unchanged, B updated, C deleted, D newly inserted.
-        let current = vec![
-            row(b"A", b"a-v1"),
-            row(b"B", b"b-v1"),
-            row(b"C", b"c-v1"),
-        ];
-        let incoming = vec![
-            row(b"A", b"a-v1"),
-            row(b"B", b"b-v2"),
-            row(b"D", b"d-v1"),
-        ];
+        let current = vec![row(b"A", b"a-v1"), row(b"B", b"b-v1"), row(b"C", b"c-v1")];
+        let incoming = vec![row(b"A", b"a-v1"), row(b"B", b"b-v2"), row(b"D", b"d-v1")];
         let diff = classify_snapshot_diff(incoming, current);
         assert_eq!(
             payloads(&diff.deletes),

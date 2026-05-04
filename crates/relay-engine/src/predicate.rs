@@ -72,7 +72,11 @@ pub enum Literal {
 impl Predicate {
     pub fn matches(&self, cells: &[Cell]) -> bool {
         match self {
-            Self::Cmp { col_idx, op, literal } => {
+            Self::Cmp {
+                col_idx,
+                op,
+                literal,
+            } => {
                 let Some(cell) = cells.get(*col_idx) else {
                     return false;
                 };
@@ -180,7 +184,7 @@ mod tests {
         // back the LE bytes as u64.
         let p = pred_op(0, PredicateOp::Gt, Literal::U64(255));
         let cell_256 = Cell::Bytea(Some(vec![0, 1, 0, 0, 0, 0, 0, 0]));
-        assert!(p.matches(&[cell_256.clone()]));
+        assert!(p.matches(std::slice::from_ref(&cell_256)));
         let cell_255 = Cell::Bytea(Some(vec![0xff, 0, 0, 0, 0, 0, 0, 0]));
         assert!(!p.matches(&[cell_255]));
         let p_eq = pred_eq(0, Literal::U64(256));

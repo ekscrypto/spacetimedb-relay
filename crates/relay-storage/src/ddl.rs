@@ -110,10 +110,7 @@ fn field_to_column(
     schema: &MirroredSchema,
     field: &MirroredField,
 ) -> Result<ColumnSpec, StorageError> {
-    let upstream_name = field
-        .name
-        .clone()
-        .unwrap_or_else(|| "unnamed".to_string());
+    let upstream_name = field.name.clone().unwrap_or_else(|| "unnamed".to_string());
     let postgres_name = sanitize_ident(&upstream_name)?;
     let mapping = map_type(schema, &field.ty);
     Ok(ColumnSpec {
@@ -179,17 +176,11 @@ fn is_wrapper(fields: &[MirroredField]) -> bool {
 
 fn is_optional(variants: &[relay_protocol::MirroredVariant]) -> bool {
     variants.len() == 2
-        && variants
-            .iter()
-            .any(|v| v.name.as_deref() == Some("some"))
-        && variants
-            .iter()
-            .any(|v| v.name.as_deref() == Some("none"))
+        && variants.iter().any(|v| v.name.as_deref() == Some("some"))
+        && variants.iter().any(|v| v.name.as_deref() == Some("none"))
 }
 
-fn optional_inner(
-    variants: &[relay_protocol::MirroredVariant],
-) -> Option<&MirroredType> {
+fn optional_inner(variants: &[relay_protocol::MirroredVariant]) -> Option<&MirroredType> {
     variants
         .iter()
         .find(|v| v.name.as_deref() == Some("some"))
@@ -221,7 +212,7 @@ pub fn sanitize_ident(name: &str) -> Result<String, StorageError> {
 
 pub fn create_table_sql(spec: &TableSpec) -> String {
     let mut sql = String::new();
-    write!(&mut sql, "CREATE TABLE \"{}\" (\n", spec.postgres_name).unwrap();
+    writeln!(&mut sql, "CREATE TABLE \"{}\" (", spec.postgres_name).unwrap();
     for col in spec.columns.iter() {
         let null = if col.nullable { "" } else { " NOT NULL" };
         writeln!(

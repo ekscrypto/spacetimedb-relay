@@ -26,16 +26,18 @@ pub async fn fetch_schema(host: &Url, database: &str) -> Result<Vec<u8>, SchemaF
             .set_scheme("https")
             .map_err(|_| SchemaFetchError::Url("scheme rewrite wss->https failed".into()))?,
         "http" | "https" => {}
-        other => return Err(SchemaFetchError::Url(format!("unsupported scheme: {other}"))),
+        other => {
+            return Err(SchemaFetchError::Url(format!(
+                "unsupported scheme: {other}"
+            )))
+        }
     }
     let mut path = url.path().trim_end_matches('/').to_string();
     path.push_str("/v1/database/");
     path.push_str(database);
     path.push_str("/schema");
     url.set_path(&path);
-    url.query_pairs_mut()
-        .clear()
-        .append_pair("version", "9");
+    url.query_pairs_mut().clear().append_pair("version", "9");
 
     let response = reqwest::get(url).await?;
     let status = response.status();

@@ -149,14 +149,24 @@ fn parse_table(v: &Value, path: &str) -> Result<MirroredTable, SchemaParseError>
         })
         .collect::<Result<Vec<_>, _>>()?;
     let access = match sum_variant(v.get("table_access"), &format!("{path}.table_access"))?.0 {
-        v if v == "Public" => TableAccess::Public,
-        v if v == "Private" => TableAccess::Private,
-        other => return Err(shape(format!("{path}.table_access"), format!("unknown variant {other}"))),
+        "Public" => TableAccess::Public,
+        "Private" => TableAccess::Private,
+        other => {
+            return Err(shape(
+                format!("{path}.table_access"),
+                format!("unknown variant {other}"),
+            ))
+        }
     };
     let kind = match sum_variant(v.get("table_type"), &format!("{path}.table_type"))?.0 {
-        v if v == "User" => TableKind::User,
-        v if v == "System" => TableKind::System,
-        other => return Err(shape(format!("{path}.table_type"), format!("unknown variant {other}"))),
+        "User" => TableKind::User,
+        "System" => TableKind::System,
+        other => {
+            return Err(shape(
+                format!("{path}.table_type"),
+                format!("unknown variant {other}"),
+            ))
+        }
     };
     Ok(MirroredTable {
         name,
@@ -221,7 +231,10 @@ fn parse_type(v: &Value, path: &str) -> Result<MirroredType, SchemaParseError> {
                 as u32;
             Ok(MirroredType::Ref(n))
         }
-        other => Err(shape(path, format!("unknown algebraic type variant: {other}"))),
+        other => Err(shape(
+            path,
+            format!("unknown algebraic type variant: {other}"),
+        )),
     }
 }
 

@@ -65,6 +65,12 @@ spacetimedb-client-api-messages = "2.2"
 spacetimedb-lib = "2.2"
 spacetimedb-sql-parser = "2.2"
 
+# Pinned v1.12.0 — the last v1.x release. Pulled in alongside the 2.x crates so we can decode
+# upstream traffic from servers that still speak `v1.bsatn.spacetimedb`. Used only inside
+# `relay-upstream`; v1 messages are translated to the v2 shape before reaching other crates.
+spacetimedb-client-api-messages-v1 = { package = "spacetimedb-client-api-messages", version = "=1.12.0" }
+spacetimedb-lib-v1 = { package = "spacetimedb-lib", version = "=1.12.0" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

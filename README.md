@@ -128,6 +128,7 @@ matching environment variable. Flags win.
 | `--bind`              | `RELAY_BIND`             | `0.0.0.0:3001`                                   | Address for the downstream WS server                      |
 | `--subscribe-table`   | `RELAY_SUBSCRIBE_TABLES` | all `User` tables with `Public` access           | Repeatable. Comma-separated when set via env              |
 | `--frame-limit`       | `RELAY_FRAME_LIMIT`      | unlimited                                        | Stop after N upstream frames — useful for smoke tests     |
+| `--upstream-protocol` | `RELAY_UPSTREAM_PROTOCOL`| `v2`                                             | `v2` for current SpacetimeDB; `v1` for pre-2.0 servers still on `v1.bsatn.spacetimedb`. v1 messages are translated to v2 internally; downstream clients always see v2 |
 
 `RUST_LOG` controls log level (default `info,relay=debug`). For
 example, `RUST_LOG=relay=trace,relay_storage=debug cargo run -p relay …`.

@@ -113,7 +113,8 @@ async fn handle_client_frame(
     if data.is_empty() {
         return Err(HandleError::Empty);
     }
-    let msg: ClientMessage = bsatn::from_slice(data).map_err(|e| HandleError::Decode(e.to_string()))?;
+    let msg: ClientMessage =
+        bsatn::from_slice(data).map_err(|e| HandleError::Decode(e.to_string()))?;
     match msg {
         ClientMessage::Subscribe(sub) => {
             let n_queries = sub.query_strings.len();
@@ -223,4 +224,3 @@ impl Drop for ConnectionGuard {
         self.handle.deregister(self.client_id);
     }
 }
-

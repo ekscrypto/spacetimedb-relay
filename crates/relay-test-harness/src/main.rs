@@ -44,7 +44,11 @@ use spacetimedb_client_api_messages::websocket::v2::ServerMessage;
 #[command(name = "relay-test-harness", version)]
 struct Args {
     /// Upstream SpacetimeDB server URL (where C connects).
-    #[arg(long, env = "TEST_UPSTREAM", default_value = "wss://maincloud.spacetimedb.com")]
+    #[arg(
+        long,
+        env = "TEST_UPSTREAM",
+        default_value = "wss://maincloud.spacetimedb.com"
+    )]
     upstream: Url,
 
     /// Local relay URL (where D connects).
@@ -118,7 +122,9 @@ async fn main() -> Result<()> {
         run_writer(upstream_url, args.database.clone(), reducer, name).await
     });
 
-    let writer_outcome = writer.await.map_err(|e| anyhow!("writer task panicked: {e}"))?;
+    let writer_outcome = writer
+        .await
+        .map_err(|e| anyhow!("writer task panicked: {e}"))?;
     writer_outcome.map_err(|e| anyhow!("writer error: {e}"))?;
     tracing::info!("writer completed; waiting on subscriber");
 
@@ -141,12 +147,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_writer(
-    upstream: Url,
-    database: String,
-    reducer: String,
-    name: String,
-) -> Result<()> {
+async fn run_writer(upstream: Url, database: String, reducer: String, name: String) -> Result<()> {
     tracing::info!(target: "harness::writer", "connecting to upstream");
     let mut conn = open_connection(&upstream, &database).await?;
     let initial = expect_initial_connection(&mut conn).await?;

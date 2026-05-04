@@ -188,9 +188,9 @@ fn compile_predicate(
             })
         }
         SqlExpr::Param(_) => Err(CompileError::UnresolvedSender),
-        SqlExpr::Lit(_) | SqlExpr::Var(_) | SqlExpr::Field(_, _) => Err(
-            CompileError::Unsupported("expected a comparison or AND/OR expression"),
-        ),
+        SqlExpr::Lit(_) | SqlExpr::Var(_) | SqlExpr::Field(_, _) => Err(CompileError::Unsupported(
+            "expected a comparison or AND/OR expression",
+        )),
     }
 }
 
@@ -270,17 +270,23 @@ fn literal_for_field(
 
     match (resolved, lit) {
         (MirroredType::Bool, SqlLiteral::Bool(b)) => Ok(Literal::Bool(*b)),
-        (MirroredType::I8, SqlLiteral::Num(s)) => parse_int::<i8>(s, "i8")
-            .map(|n| Literal::Smallint(n as i16)),
-        (MirroredType::I16, SqlLiteral::Num(s)) => parse_int::<i16>(s, "i16").map(Literal::Smallint),
+        (MirroredType::I8, SqlLiteral::Num(s)) => {
+            parse_int::<i8>(s, "i8").map(|n| Literal::Smallint(n as i16))
+        }
+        (MirroredType::I16, SqlLiteral::Num(s)) => {
+            parse_int::<i16>(s, "i16").map(Literal::Smallint)
+        }
         (MirroredType::I32, SqlLiteral::Num(s)) => parse_int::<i32>(s, "i32").map(Literal::Integer),
         (MirroredType::I64, SqlLiteral::Num(s)) => parse_int::<i64>(s, "i64").map(Literal::Bigint),
-        (MirroredType::U8, SqlLiteral::Num(s)) => parse_int::<u8>(s, "u8")
-            .map(|n| Literal::Smallint(n as i16)),
-        (MirroredType::U16, SqlLiteral::Num(s)) => parse_int::<u16>(s, "u16")
-            .map(|n| Literal::Integer(n as i32)),
-        (MirroredType::U32, SqlLiteral::Num(s)) => parse_int::<u32>(s, "u32")
-            .map(|n| Literal::Bigint(n as i64)),
+        (MirroredType::U8, SqlLiteral::Num(s)) => {
+            parse_int::<u8>(s, "u8").map(|n| Literal::Smallint(n as i16))
+        }
+        (MirroredType::U16, SqlLiteral::Num(s)) => {
+            parse_int::<u16>(s, "u16").map(|n| Literal::Integer(n as i32))
+        }
+        (MirroredType::U32, SqlLiteral::Num(s)) => {
+            parse_int::<u32>(s, "u32").map(|n| Literal::Bigint(n as i64))
+        }
         (MirroredType::U64, SqlLiteral::Num(s)) => parse_int::<u64>(s, "u64").map(Literal::U64),
         (MirroredType::F32, SqlLiteral::Num(s)) => s
             .parse::<f32>()
@@ -575,14 +581,13 @@ mod tests {
     #[test]
     fn and_or_compile() {
         let schema = fixture_schema();
-        let q = compile(
-            &schema,
-            "SELECT * FROM item WHERE qty > 2 AND rarity = 1",
-        )
-        .unwrap();
+        let q = compile(&schema, "SELECT * FROM item WHERE qty > 2 AND rarity = 1").unwrap();
         assert!(matches!(
             q.predicate.unwrap(),
-            Predicate::Logic { op: LogicOp::And, .. }
+            Predicate::Logic {
+                op: LogicOp::And,
+                ..
+            }
         ));
         let q2 = compile(
             &schema,
@@ -591,7 +596,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             q2.predicate.unwrap(),
-            Predicate::Logic { op: LogicOp::Or, .. }
+            Predicate::Logic {
+                op: LogicOp::Or,
+                ..
+            }
         ));
     }
 
@@ -652,7 +660,10 @@ mod tests {
     #[test]
     fn sender_unresolved_without_binding() {
         let schema = fixture_schema();
-        let r = compile(&schema, "SELECT * FROM user_account WHERE identity = :sender");
+        let r = compile(
+            &schema,
+            "SELECT * FROM user_account WHERE identity = :sender",
+        );
         assert!(matches!(r, Err(CompileError::UnresolvedSender)));
     }
 
@@ -737,11 +748,7 @@ mod tests {
         let schema = fixture_schema();
         // `qualify_vars` rewrites `name` into `<table>.name`; this
         // exercises the ProjectExpr::Field branch.
-        let q = compile(
-            &schema,
-            "SELECT user_account.name FROM user_account",
-        )
-        .unwrap();
+        let q = compile(&schema, "SELECT user_account.name FROM user_account").unwrap();
         match q.projection {
             Projection::Cols(cs) => assert_eq!(cs, vec![1]),
             other => panic!("expected Cols, got {other:?}"),

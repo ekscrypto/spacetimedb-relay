@@ -11,9 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rand::RngCore;
 
-use relay_protocol::api_messages::websocket::common::{
-    BsatnRowList, QuerySetId, RowSizeHint,
-};
+use relay_protocol::api_messages::websocket::common::{BsatnRowList, QuerySetId, RowSizeHint};
 use relay_protocol::api_messages::websocket::v2::{
     InitialConnection, PersistentTableRows, QueryRows, QuerySetUpdate, ServerMessage,
     SingleTableRows, SubscribeApplied, SubscriptionError, TableUpdate, TableUpdateRows,
@@ -48,7 +46,11 @@ pub fn random_identity_and_connection() -> (Identity, ConnectionId) {
     )
 }
 
-pub fn initial_connection(identity: Identity, connection_id: ConnectionId, token: &str) -> ServerMessage {
+pub fn initial_connection(
+    identity: Identity,
+    connection_id: ConnectionId,
+    token: &str,
+) -> ServerMessage {
     ServerMessage::InitialConnection(InitialConnection {
         identity,
         connection_id,

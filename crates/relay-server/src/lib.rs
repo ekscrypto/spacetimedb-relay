@@ -167,12 +167,6 @@ async fn subscribe_handler(
     }
     ws.protocols(["v2.bsatn.spacetimedb"])
         .on_upgrade(move |socket| {
-            connection::run(
-                socket,
-                addr,
-                state.storage,
-                state.engine,
-                state.handle,
-            )
+            connection::run(socket, addr, state.storage, state.engine, state.handle)
         })
 }

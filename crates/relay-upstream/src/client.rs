@@ -17,7 +17,54 @@ use relay_protocol::api_messages::websocket::v2::{ClientMessage, ServerMessage, 
 use relay_protocol::sats::bsatn;
 use relay_protocol::tags;
 
-const SUBPROTOCOL: &str = "v2.bsatn.spacetimedb";
+use crate::v1_compat;
+
+const SUBPROTOCOL_V2: &str = "v2.bsatn.spacetimedb";
+const SUBPROTOCOL_V1: &str = "v1.bsatn.spacetimedb";
+
+/// Which SpacetimeDB WebSocket subprotocol the upstream speaks.
+///
+/// `V2` is the current stable. `V1` is for older deployments still on
+/// `v1.bsatn.spacetimedb` (pre-2.0 SpacetimeDB releases). When `V1`,
+/// the upstream client decodes v1 wire types and translates them into
+/// the v2 shape the rest of the relay uses internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtocolVersion {
+    V1,
+    #[default]
+    V2,
+}
+
+impl ProtocolVersion {
+    fn subprotocol(self) -> &'static str {
+        match self {
+            ProtocolVersion::V1 => SUBPROTOCOL_V1,
+            ProtocolVersion::V2 => SUBPROTOCOL_V2,
+        }
+    }
+}
+
+impl std::fmt::Display for ProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProtocolVersion::V1 => "v1",
+            ProtocolVersion::V2 => "v2",
+        })
+    }
+}
+
+impl std::str::FromStr for ProtocolVersion {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "v1" | "V1" | "1" => Ok(ProtocolVersion::V1),
+            "v2" | "V2" | "2" => Ok(ProtocolVersion::V2),
+            other => Err(format!(
+                "unknown upstream protocol `{other}` (expected v1 or v2)"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
@@ -52,17 +99,20 @@ pub struct UpstreamConfig {
     pub auth_token: Option<String>,
     pub compression: Compression,
     pub connect_timeout: Duration,
+    pub protocol: ProtocolVersion,
 }
 
 /// One decoded WebSocket frame from the upstream.
 ///
 /// `bsatn` is the BSATN-encoded `ServerMessage` after stripping the
 /// outer compression byte and decompressing if needed. Its first byte
-/// is the sum discriminant, so `from_slice::<ServerMessage>(&bsatn)`
-/// is the canonical way to consume it.
+/// is the sum discriminant; for `protocol = V2` the discriminant is
+/// the v2 `ServerMessage` tag, for `V1` it is the v1 tag (which differs
+/// — `decode()` handles the translation).
 #[derive(Debug, Clone)]
 pub struct UpstreamFrame {
     pub bsatn: Bytes,
+    pub protocol: ProtocolVersion,
 }
 
 impl UpstreamFrame {
@@ -71,8 +121,11 @@ impl UpstreamFrame {
     }
 
     pub fn decode(&self) -> Result<ServerMessage, UpstreamError> {
-        bsatn::from_slice::<ServerMessage>(&self.bsatn)
-            .map_err(|e| UpstreamError::Decode(e.to_string()))
+        match self.protocol {
+            ProtocolVersion::V2 => bsatn::from_slice::<ServerMessage>(&self.bsatn)
+                .map_err(|e| UpstreamError::Decode(e.to_string())),
+            ProtocolVersion::V1 => v1_compat::decode_and_translate(&self.bsatn),
+        }
     }
 }
 
@@ -115,17 +168,33 @@ pub enum UpstreamError {
     Encode(String),
 }
 
-pub fn server_tag_name(tag: u8) -> &'static str {
-    match tag {
-        tags::SERVER_INITIAL_CONNECTION => "InitialConnection",
-        tags::SERVER_SUBSCRIBE_APPLIED => "SubscribeApplied",
-        tags::SERVER_UNSUBSCRIBE_APPLIED => "UnsubscribeApplied",
-        tags::SERVER_SUBSCRIPTION_ERROR => "SubscriptionError",
-        tags::SERVER_TRANSACTION_UPDATE => "TransactionUpdate",
-        tags::SERVER_ONE_OFF_QUERY_RESULT => "OneOffQueryResult",
-        tags::SERVER_REDUCER_RESULT => "ReducerResult",
-        tags::SERVER_PROCEDURE_RESULT => "ProcedureResult",
-        _ => "Unknown",
+pub fn server_tag_name(tag: u8, protocol: ProtocolVersion) -> &'static str {
+    match protocol {
+        ProtocolVersion::V2 => match tag {
+            tags::SERVER_INITIAL_CONNECTION => "InitialConnection",
+            tags::SERVER_SUBSCRIBE_APPLIED => "SubscribeApplied",
+            tags::SERVER_UNSUBSCRIBE_APPLIED => "UnsubscribeApplied",
+            tags::SERVER_SUBSCRIPTION_ERROR => "SubscriptionError",
+            tags::SERVER_TRANSACTION_UPDATE => "TransactionUpdate",
+            tags::SERVER_ONE_OFF_QUERY_RESULT => "OneOffQueryResult",
+            tags::SERVER_REDUCER_RESULT => "ReducerResult",
+            tags::SERVER_PROCEDURE_RESULT => "ProcedureResult",
+            _ => "Unknown",
+        },
+        ProtocolVersion::V1 => match tag {
+            0 => "InitialSubscription",
+            1 => "TransactionUpdate",
+            2 => "TransactionUpdateLight",
+            3 => "IdentityToken",
+            4 => "OneOffQueryResponse",
+            5 => "SubscribeApplied",
+            6 => "UnsubscribeApplied",
+            7 => "SubscriptionError",
+            8 => "SubscribeMultiApplied",
+            9 => "UnsubscribeMultiApplied",
+            10 => "ProcedureResult",
+            _ => "Unknown",
+        },
     }
 }
 
@@ -173,19 +242,25 @@ pub async fn connect_and_run(
             cmd = commands_rx.recv() => {
                 match cmd {
                     Some(UpstreamCommand::Subscribe { request_id, query_set_id, queries }) => {
-                        let msg = ClientMessage::Subscribe(Subscribe {
-                            request_id,
-                            query_set_id: QuerySetId::new(query_set_id),
-                            query_strings: queries
-                                .iter()
-                                .map(|s| s.clone().into_boxed_str())
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice(),
-                        });
-                        let frame = bsatn::to_vec(&msg)
-                            .map_err(|e| UpstreamError::Encode(e.to_string()))?;
+                        let frame = match config.protocol {
+                            ProtocolVersion::V2 => {
+                                let msg = ClientMessage::Subscribe(Subscribe {
+                                    request_id,
+                                    query_set_id: QuerySetId::new(query_set_id),
+                                    query_strings: queries
+                                        .iter()
+                                        .map(|s| s.clone().into_boxed_str())
+                                        .collect::<Vec<_>>()
+                                        .into_boxed_slice(),
+                                });
+                                bsatn::to_vec(&msg)
+                                    .map_err(|e| UpstreamError::Encode(e.to_string()))?
+                            }
+                            ProtocolVersion::V1 => v1_compat::encode_subscribe(request_id, &queries)?,
+                        };
                         debug!(
                             target: "relay::upstream",
+                            protocol = %config.protocol,
                             request_id, query_set_id, n_queries = queries.len(),
                             frame_len = frame.len(),
                             "sending Subscribe"
@@ -205,12 +280,12 @@ pub async fn connect_and_run(
                 let Some(msg) = msg else { break };
                 match msg? {
                     Message::Binary(data) => {
-                        match decode_frame(&data, config.compression) {
+                        match decode_frame(&data, config.compression, config.protocol) {
                             Ok(frame) => {
                                 debug!(
                                     target: "relay::upstream",
                                     tag = frame.server_tag(),
-                                    kind = server_tag_name(frame.server_tag()),
+                                    kind = server_tag_name(frame.server_tag(), frame.protocol),
                                     bsatn_len = frame.bsatn.len(),
                                     "frame"
                                 );
@@ -243,7 +318,9 @@ pub async fn connect_and_run(
     }
 
     let _ = events_tx
-        .send(UpstreamEvent::Disconnected { reason: "stream ended".into() })
+        .send(UpstreamEvent::Disconnected {
+            reason: "stream ended".into(),
+        })
         .await;
     Ok(())
 }
@@ -279,7 +356,9 @@ fn build_connect_request(
         .map_err(|e| UpstreamError::Url(e.to_string()))?;
     request.headers_mut().insert(
         SEC_WEBSOCKET_PROTOCOL,
-        SUBPROTOCOL
+        config
+            .protocol
+            .subprotocol()
             .parse()
             .map_err(|_| UpstreamError::Url("invalid subprotocol header".into()))?,
     );
@@ -295,7 +374,11 @@ fn build_connect_request(
     Ok(request)
 }
 
-fn decode_frame(data: &[u8], expected: Compression) -> Result<UpstreamFrame, UpstreamError> {
+fn decode_frame(
+    data: &[u8],
+    expected: Compression,
+    protocol: ProtocolVersion,
+) -> Result<UpstreamFrame, UpstreamError> {
     if data.is_empty() {
         return Err(UpstreamError::FrameTooShort(0));
     }
@@ -316,5 +399,6 @@ fn decode_frame(data: &[u8], expected: Compression) -> Result<UpstreamFrame, Ups
     }
     Ok(UpstreamFrame {
         bsatn: Bytes::copy_from_slice(&data[1..]),
+        protocol,
     })
 }

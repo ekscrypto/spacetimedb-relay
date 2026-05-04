@@ -21,3 +21,6 @@ serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+spacetimedb-client-api-messages-v1.workspace = true
+spacetimedb-lib-v1.workspace = true

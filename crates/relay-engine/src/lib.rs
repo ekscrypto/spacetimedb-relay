@@ -36,7 +36,7 @@ mod query;
 mod registry;
 
 pub use predicate::{Literal, LogicOp, Predicate, PredicateOp};
-pub use query::{compile, compile_for_sender, CompiledQuery, CompileError, Projection};
+pub use query::{compile, compile_for_sender, CompileError, CompiledQuery, Projection};
 pub use registry::{ClientId, QuerySetId};
 pub use spacetimedb_lib::Identity;
 
@@ -192,7 +192,9 @@ impl Engine {
             .schema
             .tables
             .get(query.table_idx)
-            .ok_or(EngineError::Internal("compiled query references missing table"))?;
+            .ok_or(EngineError::Internal(
+                "compiled query references missing table",
+            ))?;
         let fields = self
             .schema
             .table_product(table)
@@ -307,16 +309,30 @@ mod tests {
         ]));
         let engine = Engine::new(schema);
 
-        let a = engine.compile("SELECT * FROM thing WHERE kind = 'sword'").unwrap();
+        let a = engine
+            .compile("SELECT * FROM thing WHERE kind = 'sword'")
+            .unwrap();
         let b = engine.compile("SELECT * FROM thing WHERE qty = 4").unwrap();
         engine.subscribe(ClientId(1), QuerySetId(1), a);
         engine.subscribe(ClientId(2), QuerySetId(1), b);
 
         let inserts = vec![
-            row(vec![Cell::Text(Some("sword".into())), Cell::Integer(Some(4))], 1),
-            row(vec![Cell::Text(Some("shield".into())), Cell::Integer(Some(4))], 2),
-            row(vec![Cell::Text(Some("sword".into())), Cell::Integer(Some(7))], 3),
-            row(vec![Cell::Text(Some("potion".into())), Cell::Integer(Some(9))], 4),
+            row(
+                vec![Cell::Text(Some("sword".into())), Cell::Integer(Some(4))],
+                1,
+            ),
+            row(
+                vec![Cell::Text(Some("shield".into())), Cell::Integer(Some(4))],
+                2,
+            ),
+            row(
+                vec![Cell::Text(Some("sword".into())), Cell::Integer(Some(7))],
+                3,
+            ),
+            row(
+                vec![Cell::Text(Some("potion".into())), Cell::Integer(Some(9))],
+                4,
+            ),
         ];
         let routed = engine.route_table_diff("thing", &[], &inserts);
         assert_eq!(routed.len(), 2);
@@ -362,7 +378,9 @@ mod tests {
             ty: MirroredType::String,
         }]));
         let engine = Engine::new(schema);
-        let q = engine.compile("SELECT * FROM thing WHERE kind = 'sword'").unwrap();
+        let q = engine
+            .compile("SELECT * FROM thing WHERE kind = 'sword'")
+            .unwrap();
         engine.subscribe(ClientId(1), QuerySetId(1), q);
         let inserts = vec![row(vec![Cell::Text(Some("shield".into()))], 1)];
         let routed = engine.route_table_diff("thing", &[], &inserts);
@@ -391,8 +409,12 @@ mod tests {
             ty: MirroredType::String,
         }]));
         let engine = Engine::new(schema);
-        let q1 = engine.compile("SELECT * FROM thing WHERE kind = 'a'").unwrap();
-        let q2 = engine.compile("SELECT * FROM thing WHERE kind = 'b'").unwrap();
+        let q1 = engine
+            .compile("SELECT * FROM thing WHERE kind = 'a'")
+            .unwrap();
+        let q2 = engine
+            .compile("SELECT * FROM thing WHERE kind = 'b'")
+            .unwrap();
         engine.subscribe(ClientId(1), QuerySetId(1), q1);
         engine.subscribe(ClientId(1), QuerySetId(2), q2);
         engine.unsubscribe(ClientId(1), QuerySetId(1));

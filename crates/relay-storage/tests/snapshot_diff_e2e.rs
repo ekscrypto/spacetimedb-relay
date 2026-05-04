@@ -61,7 +61,11 @@ fn row(id: i32, payload: &str, fields: &[MirroredField], schema: &MirroredSchema
     DecodedRow { cells, bsatn }
 }
 
-fn extract_id_payload(row_bytes: &[u8], fields: &[MirroredField], schema: &MirroredSchema) -> (i32, String) {
+fn extract_id_payload(
+    row_bytes: &[u8],
+    fields: &[MirroredField],
+    schema: &MirroredSchema,
+) -> (i32, String) {
     let cells = decode_row(row_bytes, fields, schema).expect("decode stored row");
     let id = match &cells[0] {
         Cell::Integer(Some(v)) => *v,
@@ -85,13 +89,12 @@ async fn cleanup(storage: &Storage, upstream_database: &str) {
     let pool = storage.pool().clone();
     // Drop the actual mirror tables first; `relay_meta_database`
     // CASCADEs `relay_meta_table` rows but never the data tables.
-    let postgres_tables: Vec<(String,)> = sqlx::query_as(
-        "SELECT postgres_table FROM relay_meta_table WHERE upstream_database = $1",
-    )
-    .bind(upstream_database)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+    let postgres_tables: Vec<(String,)> =
+        sqlx::query_as("SELECT postgres_table FROM relay_meta_table WHERE upstream_database = $1")
+            .bind(upstream_database)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
     for (pt,) in postgres_tables {
         let _ = sqlx::query(&format!("DROP TABLE IF EXISTS \"{pt}\" CASCADE"))
             .execute(&pool)
@@ -127,7 +130,10 @@ async fn snapshot_diff_reconciles_gap_against_real_postgres() {
     storage.sync_schema(&schema).await.expect("sync_schema");
 
     let table = &schema.tables[0];
-    let fields = schema.table_product(table).expect("product fields").to_vec();
+    let fields = schema
+        .table_product(table)
+        .expect("product fields")
+        .to_vec();
 
     // ---- Phase 1: initial snapshot, PG empty ----
     let phase1 = vec![
@@ -194,11 +200,7 @@ async fn snapshot_diff_reconciles_gap_against_real_postgres() {
     state.sort();
     assert_eq!(
         state,
-        vec![
-            (1, "a-v1".into()),
-            (2, "b-v2".into()),
-            (4, "d-v1".into())
-        ],
+        vec![(1, "a-v1".into()), (2, "b-v2".into()), (4, "d-v1".into())],
         "row 3 should be gone, row 2 updated, row 4 inserted"
     );
 

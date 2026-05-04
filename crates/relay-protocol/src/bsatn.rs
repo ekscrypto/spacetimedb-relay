@@ -125,7 +125,9 @@ fn decode_cell(
         MirroredType::U8 => Ok(Cell::Smallint(Some(read_u8(bytes, "u8")? as i16))),
         MirroredType::U16 => Ok(Cell::Integer(Some(read_u16_le(bytes)? as i32))),
         MirroredType::U32 => Ok(Cell::Bigint(Some(read_u32_le(bytes)? as i64))),
-        MirroredType::F32 => Ok(Cell::Real(Some(f32::from_le_bytes(read_array::<4>(bytes, "f32")?)))),
+        MirroredType::F32 => Ok(Cell::Real(Some(f32::from_le_bytes(read_array::<4>(
+            bytes, "f32",
+        )?)))),
         MirroredType::F64 => Ok(Cell::DoublePrecision(Some(f64::from_le_bytes(
             read_array::<8>(bytes, "f64")?,
         )))),
@@ -182,7 +184,7 @@ fn decode_optional(
         // none variant has a Product{} payload — zero bytes, but we
         // still descend through resolve to stay correct if the
         // payload type isn't trivial.
-        let _ = decode_value_to_skip(bytes, &variant.ty, schema)?;
+        decode_value_to_skip(bytes, &variant.ty, schema)?;
         return Ok(null_cell_for(variants));
     }
     decode_cell(bytes, &variant.ty, schema)
@@ -262,10 +264,7 @@ fn decode_json(
                     len: variants.len(),
                 })?;
             let inner = decode_json(bytes, &variant.ty, schema)?;
-            let key = variant
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("_{tag}"));
+            let key = variant.name.clone().unwrap_or_else(|| format!("_{tag}"));
             let mut obj = serde_json::Map::new();
             obj.insert(key, inner);
             Ok(Value::Object(obj))
@@ -286,17 +285,17 @@ fn decode_json(
 
 fn read_u8(bytes: &mut &[u8], context: &str) -> Result<u8, BsatnError> {
     let mut buf = [0u8; 1];
-    bytes
-        .read_exact(&mut buf)
-        .map_err(|_| BsatnError::Eof { context: context.into() })?;
+    bytes.read_exact(&mut buf).map_err(|_| BsatnError::Eof {
+        context: context.into(),
+    })?;
     Ok(buf[0])
 }
 
 fn read_array<const N: usize>(bytes: &mut &[u8], context: &str) -> Result<[u8; N], BsatnError> {
     let mut buf = [0u8; N];
-    bytes
-        .read_exact(&mut buf)
-        .map_err(|_| BsatnError::Eof { context: context.into() })?;
+    bytes.read_exact(&mut buf).map_err(|_| BsatnError::Eof {
+        context: context.into(),
+    })?;
     Ok(buf)
 }
 

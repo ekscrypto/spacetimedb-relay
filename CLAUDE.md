@@ -82,6 +82,42 @@ These shape every change in this codebase. Don't break them without explicit ins
    Anything authoritative (current row state, per-client subscription
    queries, identity tokens) lives in Postgres.
 
+## Upstream protocol versions
+
+The relay defaults to the **`v2.bsatn.spacetimedb`** subprotocol — the
+current stable. Pre-2.0 SpacetimeDB servers (≤ v1.12.x, before the
+v2.0 release on 2026-02-20) only accept `v1.bsatn.spacetimedb`. Pass
+`--upstream-protocol v1` (or set `RELAY_UPSTREAM_PROTOCOL=v1`) to
+target one of those.
+
+When the upstream protocol is v1:
+
+- The handshake offers `v1.bsatn.spacetimedb`.
+- Decoded v1 `ServerMessage`s are translated to the v2 shape inside
+  `relay-upstream::v1_compat`, so the rest of the codebase
+  (`relay-engine`, `relay-storage`, `relay-server`) stays v2-only.
+- Outbound `Subscribe` is encoded as v1's set-replace
+  `Subscribe { query_strings, request_id }` (no `QuerySetId`).
+- Per-table compression (`CompressableQueryUpdate::Brotli`/`Gzip`) is
+  ignored. The relay always asks the server for `?compression=None`.
+  If a server compresses anyway, those updates are dropped with a
+  warning. Don't add Brotli/Gzip handling on the v1 path unless a real
+  deployment forces our hand.
+- `IdentityToken` (v1) maps to v2's `InitialConnection`.
+  `InitialSubscription` (v1) maps to v2's `SubscribeApplied` with
+  synthetic `request_id = 1` and `query_set_id = 1`.
+- v1 reducer-status fields (`status`, `caller_identity`, `timestamp`,
+  `energy_quanta_used`) are dropped — the relay does not surface
+  reducer outcomes to downstream.
+- The test harness's writer (the C role from the architecture diagram)
+  still speaks v2 directly. That's a test-scaffold limitation, not a
+  relay limitation; downstream clients always see v2.
+
+Reference: `crates/client-api-messages/src/websocket.rs` in
+clockworklabs/SpacetimeDB at tag `v1.12.0` is the canonical v1 source
+of truth — we pin that version of `spacetimedb-client-api-messages`
+as a separately-named workspace dep.
+
 ## Wire protocol — v2 message tags
 
 ```

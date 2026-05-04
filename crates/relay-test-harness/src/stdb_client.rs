@@ -21,8 +21,8 @@ use url::Url;
 
 use spacetimedb_client_api_messages::websocket::common::QuerySetId;
 use spacetimedb_client_api_messages::websocket::v2::{
-    CallReducer, CallReducerFlags, ClientMessage, InitialConnection, ServerMessage,
-    SubscribeApplied, Subscribe,
+    CallReducer, CallReducerFlags, ClientMessage, InitialConnection, ServerMessage, Subscribe,
+    SubscribeApplied,
 };
 use spacetimedb_sats::bsatn;
 
@@ -35,8 +35,12 @@ pub async fn open_connection(host: &Url, database: &str) -> Result<Conn> {
     let mut url = host.clone();
     match url.scheme() {
         "ws" | "wss" => {}
-        "http" => url.set_scheme("ws").map_err(|_| anyhow!("scheme rewrite failed"))?,
-        "https" => url.set_scheme("wss").map_err(|_| anyhow!("scheme rewrite failed"))?,
+        "http" => url
+            .set_scheme("ws")
+            .map_err(|_| anyhow!("scheme rewrite failed"))?,
+        "https" => url
+            .set_scheme("wss")
+            .map_err(|_| anyhow!("scheme rewrite failed"))?,
         other => bail!("unsupported scheme: {other}"),
     }
     {
@@ -55,12 +59,10 @@ pub async fn open_connection(host: &Url, database: &str) -> Result<Conn> {
         .headers_mut()
         .insert(SEC_WEBSOCKET_PROTOCOL, SUBPROTOCOL.parse()?);
 
-    let (stream, _resp) = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(request),
-    )
-    .await
-    .map_err(|_| anyhow!("connect timeout"))??;
+    let (stream, _resp) =
+        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+            .await
+            .map_err(|_| anyhow!("connect timeout"))??;
     Ok(stream)
 }
 

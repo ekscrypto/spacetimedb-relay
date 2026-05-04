@@ -80,10 +80,7 @@ impl Storage {
     /// Compare the schema fingerprint to what we have stored. On
     /// first-ever sync or drift, drop existing mirrored tables for
     /// this upstream and CREATE TABLE for each new one.
-    pub async fn sync_schema(
-        &self,
-        schema: &MirroredSchema,
-    ) -> Result<SyncOutcome, StorageError> {
+    pub async fn sync_schema(&self, schema: &MirroredSchema) -> Result<SyncOutcome, StorageError> {
         let table_specs = ddl::build_table_specs(schema, &self.upstream_database)?;
         let outcome = meta::sync_schema(
             &self.pool,
@@ -186,10 +183,7 @@ impl Storage {
     /// Fetch the raw BSATN bytes of every row in the given upstream
     /// table. Used by the downstream server to send a snapshot to a
     /// newly-subscribed client without re-encoding.
-    pub async fn fetch_all_bsatn(
-        &self,
-        upstream_table: &str,
-    ) -> Result<Vec<Bytes>, StorageError> {
+    pub async fn fetch_all_bsatn(&self, upstream_table: &str) -> Result<Vec<Bytes>, StorageError> {
         let spec = self
             .table_spec(upstream_table)
             .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;

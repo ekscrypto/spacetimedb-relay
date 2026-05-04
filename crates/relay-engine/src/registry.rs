@@ -63,18 +63,12 @@ impl Registry {
         if let Some(prior) = prior {
             remove_from_table_index(&mut g.by_table, &prior.table, client, qset);
         }
-        g.by_table
-            .entry(table)
-            .or_default()
-            .push((client, qset));
+        g.by_table.entry(table).or_default().push((client, qset));
     }
 
     pub fn remove_qset(&self, client: ClientId, qset: QuerySetId) {
         let mut g = self.inner.write();
-        let removed = g
-            .clients
-            .get_mut(&client)
-            .and_then(|m| m.remove(&qset));
+        let removed = g.clients.get_mut(&client).and_then(|m| m.remove(&qset));
         if let Some(q) = removed {
             remove_from_table_index(&mut g.by_table, &q.table, client, qset);
         }
@@ -92,11 +86,7 @@ impl Registry {
 
     /// Walk every (client, qset, query) registered for a table.
     /// The closure runs under the read lock; keep it cheap.
-    pub fn for_table<F: FnMut(ClientId, QuerySetId, &CompiledQuery)>(
-        &self,
-        table: &str,
-        mut f: F,
-    ) {
+    pub fn for_table<F: FnMut(ClientId, QuerySetId, &CompiledQuery)>(&self, table: &str, mut f: F) {
         let g = self.inner.read();
         let Some(entries) = g.by_table.get(table) else {
             return;

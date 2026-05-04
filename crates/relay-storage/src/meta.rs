@@ -16,9 +16,7 @@ pub enum SyncOutcome {
     /// The schema fingerprint matched what we already had.
     Unchanged,
     /// First time we've ever mirrored this upstream database.
-    CreatedFresh {
-        created: Vec<String>,
-    },
+    CreatedFresh { created: Vec<String> },
     /// The schema fingerprint changed since the last sync.
     DriftWiped {
         wiped: Vec<String>,

@@ -16,8 +16,8 @@ use relay_protocol::{decode_row, parse_schema, DecodedRow, MirroredSchema, Mirro
 use relay_server::ServerHandle;
 use relay_storage::{Storage, StorageConfig};
 use relay_upstream::{
-    connect_and_run, fetch_schema, server_tag_name, Compression, UpstreamCommand, UpstreamConfig,
-    UpstreamEvent,
+    connect_and_run, fetch_schema, server_tag_name, Compression, ProtocolVersion, UpstreamCommand,
+    UpstreamConfig, UpstreamEvent,
 };
 
 #[derive(Debug, Parser)]
@@ -49,19 +49,31 @@ struct Args {
 
     /// Tables to subscribe to upstream (`SELECT * FROM <table>`).
     /// Repeatable: `--subscribe-table message --subscribe-table user`
-    #[arg(long = "subscribe-table", env = "RELAY_SUBSCRIBE_TABLES", value_delimiter = ',')]
+    #[arg(
+        long = "subscribe-table",
+        env = "RELAY_SUBSCRIBE_TABLES",
+        value_delimiter = ','
+    )]
     subscribe_tables: Vec<String>,
 
     /// Stop after N upstream frames (useful for smoke-testing)
     #[arg(long, env = "RELAY_FRAME_LIMIT")]
     frame_limit: Option<u64>,
+
+    /// SpacetimeDB WebSocket subprotocol version of the upstream.
+    /// `v2` (default) targets current SpacetimeDB. `v1` targets pre-2.0
+    /// servers still on `v1.bsatn.spacetimedb`; v1 messages are
+    /// translated to v2 internally.
+    #[arg(long = "upstream-protocol", env = "RELAY_UPSTREAM_PROTOCOL", default_value_t = ProtocolVersion::V2)]
+    upstream_protocol: ProtocolVersion,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,relay=debug")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,relay=debug")),
         )
         .init();
 
@@ -71,6 +83,7 @@ async fn main() -> Result<()> {
         upstream = %args.upstream,
         database = %args.database,
         bind = %args.bind,
+        protocol = %args.upstream_protocol,
         subscribe_tables = ?args.subscribe_tables,
         "spacetimedb-relay starting"
     );
@@ -130,6 +143,7 @@ async fn main() -> Result<()> {
         auth_token: args.upstream_token,
         compression: Compression::None,
         connect_timeout: Duration::from_secs(10),
+        protocol: args.upstream_protocol,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -149,6 +163,7 @@ async fn main() -> Result<()> {
             UpstreamEvent::Frame(frame) => {
                 frames += 1;
                 let tag = frame.server_tag();
+                let protocol = frame.protocol;
                 match frame.decode() {
                     Ok(message) => {
                         handle_server_message(
@@ -165,7 +180,7 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!(
                         target: "relay",
                         tag,
-                        kind = server_tag_name(tag),
+                        kind = server_tag_name(tag, protocol),
                         error = %e,
                         "failed to decode ServerMessage"
                     ),
@@ -217,13 +232,17 @@ async fn apply_transaction_update(
                         for r in p.deletes.into_iter() {
                             match decode_row(&r, fields, schema) {
                                 Ok(cells) => deletes.push(DecodedRow { cells, bsatn: r }),
-                                Err(e) => tracing::warn!(target: "relay", error = %e, "delete decode failed"),
+                                Err(e) => {
+                                    tracing::warn!(target: "relay", error = %e, "delete decode failed")
+                                }
                             }
                         }
                         for r in p.inserts.into_iter() {
                             match decode_row(&r, fields, schema) {
                                 Ok(cells) => inserts_rows.push(DecodedRow { cells, bsatn: r }),
-                                Err(e) => tracing::warn!(target: "relay", error = %e, "insert decode failed"),
+                                Err(e) => {
+                                    tracing::warn!(target: "relay", error = %e, "insert decode failed")
+                                }
                             }
                         }
                     }
@@ -231,7 +250,9 @@ async fn apply_transaction_update(
                         for r in e.events.into_iter() {
                             match decode_row(&r, fields, schema) {
                                 Ok(cells) => inserts_rows.push(DecodedRow { cells, bsatn: r }),
-                                Err(e) => tracing::warn!(target: "relay", error = %e, "event decode failed"),
+                                Err(e) => {
+                                    tracing::warn!(target: "relay", error = %e, "event decode failed")
+                                }
                             }
                         }
                     }
