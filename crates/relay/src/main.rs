@@ -70,6 +70,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Required for `wss://` upstreams: rustls 0.23 makes the
+    // CryptoProvider an explicit choice, and tokio-tungstenite panics
+    // on the first TLS handshake if no provider has been installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()

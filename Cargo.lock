@@ -1946,6 +1946,7 @@ dependencies = [
  "relay-server",
  "relay-storage",
  "relay-upstream",
+ "rustls",
  "tokio",
  "tracing",
  "tracing-subscriber",
