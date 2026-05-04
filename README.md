@@ -8,6 +8,13 @@ Downstream clients speak the **unmodified** SpacetimeDB v2 WebSocket
 protocol, so existing SDKs work without changes — they just point at
 the relay's URL instead of the game server.
 
+The upstream side can speak either **`v2.bsatn.spacetimedb`** (default,
+SpacetimeDB ≥ 2.0) or **`v1.bsatn.spacetimedb`** (pre-2.0 deployments,
+opt-in via `--upstream-protocol v1`). v1 messages are translated to v2
+internally, so the asymmetry is invisible to downstream clients —
+**downstream is always v2 regardless of which protocol the upstream
+speaks**. v3 is not currently supported.
+
 > **Community project — not affiliated with Clockwork Labs.**
 > SpacetimeDB™ is a trademark of [Clockwork Labs](https://clockworklabs.io/).
 > This project is an independent, community-maintained tool that speaks
