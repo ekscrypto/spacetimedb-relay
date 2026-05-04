@@ -8,6 +8,12 @@ Downstream clients speak the **unmodified** SpacetimeDB v2 WebSocket
 protocol, so existing SDKs work without changes — they just point at
 the relay's URL instead of the game server.
 
+> **Community project — not affiliated with Clockwork Labs.**
+> SpacetimeDB™ is a trademark of [Clockwork Labs](https://clockworklabs.io/).
+> This project is an independent, community-maintained tool that speaks
+> the public SpacetimeDB v2 WebSocket protocol; it is not endorsed by,
+> sponsored by, or otherwise associated with Clockwork Labs.
+
 ## Why
 
 Public SpacetimeDB games (BitCraft, etc.) are rate-limited: studios
