@@ -1,0 +1,25 @@
+[package]
+name = "relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[dependencies]
+relay-protocol.workspace = true
+relay-upstream.workspace = true
+relay-storage.workspace = true
+relay-engine.workspace = true
+relay-server.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+url.workspace = true
+bytes.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,16 @@
+/target
+/test-module/target
+/test-module/Cargo.lock
+**/*.rs.bk
+Cargo.lock.bak
+.env
+.env.local
+.DS_Store
+.vscode/
+.idea/
+*.swp
+/tmp/
+/.spacetimedb-relay-data/
+
+# Local-only Claude notes (host names, account specifics, etc.)
+CLAUDE.local.md

@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/relay",
+    "crates/relay-protocol",
+    "crates/relay-upstream",
+    "crates/relay-storage",
+    "crates/relay-engine",
+    "crates/relay-server",
+    "crates/relay-test-harness",
+]
+exclude = ["test-module"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ekscrypto/spacetimedb-relay"
+
+[workspace.dependencies]
+relay-protocol = { path = "crates/relay-protocol" }
+relay-upstream = { path = "crates/relay-upstream" }
+relay-storage  = { path = "crates/relay-storage" }
+relay-engine   = { path = "crates/relay-engine" }
+relay-server   = { path = "crates/relay-server" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+futures-util = "0.3"
+bytes = "1"
+http = "1"
+url = "2"
+
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+anyhow = "1"
+thiserror = "2"
+
+clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+
+# SpacetimeDB internal crates. Pinned to a known-good version; revisit if wire format changes.
+# If these are not on crates.io we will switch to a git dep on clockworklabs/SpacetimeDB.
+spacetimedb-sats = "2.2"
+spacetimedb-client-api-messages = "2.2"
+spacetimedb-lib = "2.2"
+spacetimedb-sql-parser = "2.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

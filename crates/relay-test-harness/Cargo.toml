@@ -1,0 +1,35 @@
+[package]
+name = "relay-test-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "relay-test-harness"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally NOT depending on relay-upstream — this harness is the
+# C and D clients in the architecture diagram, not the R-to-S code.
+# It speaks v2.bsatn.spacetimedb directly using the upstream protocol
+# crates.
+spacetimedb-sats.workspace = true
+spacetimedb-client-api-messages.workspace = true
+spacetimedb-lib.workspace = true
+
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+http.workspace = true
+url.workspace = true
+bytes.workspace = true
+rustls = { version = "0.23", features = ["ring"] }
+
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+hex.workspace = true
