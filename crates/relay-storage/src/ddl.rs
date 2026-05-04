@@ -56,7 +56,7 @@ pub fn build_table_specs(
     schema: &MirroredSchema,
     upstream_database: &str,
 ) -> Result<Vec<TableSpec>, StorageError> {
-    let prefix = sanitize_ident(upstream_database)?;
+    let prefix = database_prefix(upstream_database)?;
     let mut specs = Vec::new();
     for table in &schema.tables {
         if !matches!(table.kind, relay_protocol::TableKind::User) {
@@ -190,6 +190,25 @@ fn optional_inner(variants: &[relay_protocol::MirroredVariant]) -> Option<&Mirro
 /// Sanitize an upstream identifier to a Postgres identifier: lower-
 /// cased, only `[a-z0-9_]`, must not start with a digit. Returns an
 /// error on empty input or after sanitization yielding nothing.
+/// Postgres caps identifier names at 63 bytes. Our mirrored-table
+/// names follow `relay_<prefix>_<table>`, so the prefix has to leave
+/// room for `relay_` + `_` + the table name. SpacetimeDB database
+/// identities are up to ~60 chars and would shadow the table name
+/// entirely under Postgres' silent truncation, collapsing every
+/// mirrored table for that database into a single name. Cap the
+/// readable form and fall back to a stable 16-hex-char hash beyond
+/// that.
+const MAX_READABLE_PREFIX: usize = 24;
+
+pub fn database_prefix(upstream_database: &str) -> Result<String, StorageError> {
+    let sanitized = sanitize_ident(upstream_database)?;
+    if sanitized.len() <= MAX_READABLE_PREFIX {
+        return Ok(sanitized);
+    }
+    let hash = relay_protocol::sats::hash::hash_bytes(upstream_database.as_bytes());
+    Ok(hex::encode(&hash.data[..8]))
+}
+
 pub fn sanitize_ident(name: &str) -> Result<String, StorageError> {
     let mut s = String::with_capacity(name.len());
     for c in name.chars() {
@@ -244,4 +263,40 @@ pub fn create_table_sql(spec: &TableSpec) -> String {
 
 pub fn drop_table_sql(postgres_name: &str) -> String {
     format!("DROP TABLE IF EXISTS \"{postgres_name}\" CASCADE")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_database_keeps_readable_prefix() {
+        let p = database_prefix("test").unwrap();
+        assert_eq!(p, "test");
+    }
+
+    #[test]
+    fn hyphenated_short_database_kept_readable() {
+        let p = database_prefix("relay-905cb325").unwrap();
+        assert_eq!(p, "relay_905cb325");
+    }
+
+    #[test]
+    fn long_database_falls_back_to_stable_hash() {
+        let id = "spacetimedb-relay-5cdba495-301b-46b6-bc7a-89a7774347d2-wvz0s";
+        let p = database_prefix(id).unwrap();
+        assert_eq!(p.len(), 16);
+        assert!(p.chars().all(|c| c.is_ascii_hexdigit()));
+        // stable across runs
+        assert_eq!(p, database_prefix(id).unwrap());
+    }
+
+    #[test]
+    fn full_postgres_name_fits_within_63_bytes_for_long_id() {
+        let id = "spacetimedb-relay-5cdba495-301b-46b6-bc7a-89a7774347d2-wvz0s";
+        let prefix = database_prefix(id).unwrap();
+        let table = "user_account";
+        let full = format!("relay_{prefix}_{table}");
+        assert!(full.len() <= 63, "name `{full}` is {} bytes", full.len());
+    }
 }
