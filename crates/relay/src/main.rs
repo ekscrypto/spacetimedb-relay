@@ -37,14 +37,6 @@ struct Args {
     #[arg(long, env = "RELAY_UPSTREAM_TOKEN")]
     upstream_token: Option<String>,
 
-    /// Postgres connection URL
-    #[arg(
-        long,
-        env = "DATABASE_URL",
-        default_value = "postgres://relay:relay@localhost:5432/relay"
-    )]
-    database_url: String,
-
     /// Filesystem directory for in-memory mirror snapshots. The relay
     /// writes a per-table file under `<data-dir>/<db_prefix>/` every
     /// `--snapshot-interval` and on graceful shutdown, then reloads
@@ -116,13 +108,11 @@ async fn main() -> Result<()> {
     let schema = parse_schema(&raw_schema)?;
     log_schema(&schema);
 
-    let storage = Storage::connect(StorageConfig {
-        database_url: args.database_url.clone(),
+    let storage = Storage::new(StorageConfig {
         upstream_host: args.upstream.to_string(),
         upstream_database: args.database.clone(),
-    })
-    .await?;
-    storage.sync_schema(&schema).await?;
+    });
+    storage.sync_schema(&schema)?;
     match storage.load_snapshots(&args.data_dir) {
         Ok(stats) if stats.tables_loaded > 0 => tracing::info!(
             target: "relay",
@@ -419,10 +409,7 @@ async fn apply_transaction_update(
                 continue;
             }
             upstream_metrics.record_rows(inserts_rows.len() as u64, deletes.len() as u64);
-            match storage
-                .apply_diff(upstream_name, &deletes, &inserts_rows)
-                .await
-            {
+            match storage.apply_diff(upstream_name, &deletes, &inserts_rows) {
                 Ok(o) => tracing::info!(
                     target: "relay",
                     table = %upstream_name,
@@ -484,9 +471,7 @@ async fn reconcile_table_snapshot(
         }
     }
 
-    let diff = storage
-        .apply_snapshot_diff(upstream_table, &decoded, fields, schema)
-        .await?;
+    let diff = storage.apply_snapshot_diff(upstream_table, &decoded, fields, schema)?;
     upstream_metrics.record_rows(diff.inserts.len() as u64, diff.deletes.len() as u64);
     tracing::info!(
         target: "relay",

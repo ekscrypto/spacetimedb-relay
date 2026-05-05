@@ -50,7 +50,7 @@ SpacetimeDB game server (S)
 │  spacetimedb-relay (R)                  │
 │  ─ upstream client (BSATN over WS)      │
 │  ─ schema cache (HTTP /schema endpoint) │
-│  ─ Postgres mirror (per-table DDL)      │
+│  ─ in-memory mirror, snapshot to disk   │
 │  ─ SQL evaluator (SpacetimeDB SQL)      │
 │  ─ downstream WS server (mimics v2)     │
 └─────────────────────────────────────────┘
@@ -66,21 +66,18 @@ relay's job is read-only fan-out.
 ## Status
 
 Active development. The relay runs end-to-end against maincloud:
-fetches schema, mirrors rows into Postgres, and serves v2 subscribers
-on a downstream port. Wire-protocol coverage of v2 is partial —
-expect rough edges around less common message types.
+fetches schema, mirrors rows in memory (with periodic on-disk
+snapshots), and serves v2 subscribers on a downstream port.
+Wire-protocol coverage of v2 is partial — expect rough edges around
+less common message types.
 
 ## Prerequisites
 
 - **Rust toolchain** — pinned to 1.93 by `rust-toolchain.toml`. If
   you have `rustup`, no install step is needed; `cargo` will fetch
   the right toolchain on first build.
-- **Docker** — for the local Postgres mirror via `docker compose`.
-  Alternatively, point `DATABASE_URL` at any Postgres 14+ instance
-  and any writable database within it. The role/database/host in
-  the URL are not hardcoded; the `relay` shown in the default URL
-  (`postgres://relay:relay@localhost:5432/relay`) is just what
-  `docker-compose.yml` provisions.
+- **A writable directory for snapshots** — defaults to `./data`.
+  Override with `--data-dir` or `RELAY_DATA_DIR`.
 - **An upstream SpacetimeDB database** — any deployed SpacetimeDB
   module on a host you can reach. Pass its name or identity to the
   relay via `--database` (or `RELAY_DATABASE`). For local
@@ -90,13 +87,10 @@ expect rough edges around less common message types.
 ## Quick start
 
 ```sh
-# 1. Bring up the local Postgres mirror.
-docker compose up -d postgres
-
-# 2. Build the workspace (downloads the pinned toolchain on first run).
+# 1. Build the workspace (downloads the pinned toolchain on first run).
 cargo build
 
-# 3. Run the relay. Substitute your upstream host and database identity.
+# 2. Run the relay. Substitute your upstream host and database identity.
 cargo run -p relay -- \
     --upstream wss://maincloud.spacetimedb.com \
     --database <your-database-name-or-identity> \
@@ -131,7 +125,8 @@ matching environment variable. Flags win.
 | `--upstream`          | `RELAY_UPSTREAM`         | _required_                                       | e.g. `wss://maincloud.spacetimedb.com`                    |
 | `--database`          | `RELAY_DATABASE`         | _required_                                       | Database name or identity on the upstream                 |
 | `--upstream-token`    | `RELAY_UPSTREAM_TOKEN`   | none                                             | Bearer token for upstream auth (private DBs)              |
-| `--database-url`      | `DATABASE_URL`           | `postgres://relay:relay@localhost:5432/relay`    | Postgres connection string for the mirror                 |
+| `--data-dir`          | `RELAY_DATA_DIR`         | `data`                                           | Directory under which per-table snapshot files live       |
+| `--snapshot-interval` | `RELAY_SNAPSHOT_INTERVAL`| `60`                                             | Seconds between background snapshots; one final snapshot also fires on graceful shutdown |
 | `--bind`              | `RELAY_BIND`             | `0.0.0.0:3001`                                   | Address for the downstream WS server                      |
 | `--subscribe-table`   | `RELAY_SUBSCRIBE_TABLES` | all `User` tables with `Public` access           | Repeatable. Comma-separated when set via env              |
 | `--frame-limit`       | `RELAY_FRAME_LIMIT`      | unlimited                                        | Stop after N upstream frames — useful for smoke tests     |
@@ -146,7 +141,7 @@ example, `RUST_LOG=relay=trace,relay_storage=debug cargo run -p relay …`.
 |----------------------|------------------------------------------------------------------------------------------|
 | `relay-protocol`     | Wire types, BSATN, schema definitions (re-exports `spacetimedb-sats`).                   |
 | `relay-upstream`     | Owns the single upstream WebSocket; emits decoded `ServerMessage` events.                |
-| `relay-storage`      | Postgres mirror — dynamic per-table DDL, schema-drift detection.                         |
+| `relay-storage`      | In-memory mirror, per-table snapshot files, schema-drift detection.                      |
 | `relay-engine`       | SpacetimeDB SQL parsing, per-client query state, diff routing.                           |
 | `relay-server`       | Downstream `axum` WS server. Speaks v2 `ClientMessage`/`ServerMessage`.                  |
 | `relay`              | Binary that wires the components together under tokio.                                   |

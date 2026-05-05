@@ -1,134 +1,89 @@
 // SPDX-License-Identifier: MIT
 
-//! PostgreSQL mirror of upstream tables.
+//! In-memory mirror of upstream tables, persisted to disk via
+//! per-table snapshots.
 //!
-//! - One Postgres table per upstream table, columns mirroring the
-//!   SpacetimeDB column types as closely as the SQL type system
-//!   allows.
-//! - DDL is issued at runtime when we first observe a database's
-//!   schema.
-//! - On schema drift we drop the mirrored tables for that database
-//!   and re-fetch from upstream. We do not attempt to migrate row
-//!   data — the upstream module may have applied a transformation we
-//!   cannot replicate.
+//! Replaces the previous Postgres mirror. The relay holds the entire
+//! current state of every subscribed table in memory; the
+//! [`crate::snapshot`] module persists it to disk on a timer and on
+//! shutdown so a restart doesn't have to refetch the whole dataset.
+//!
+//! Schema-drift handling is implicit: snapshot files carry the
+//! schema's fingerprint as a header, so a relay that comes back up
+//! against a changed upstream schema simply ignores files from the
+//! old layout and lets `SubscribeApplied` repopulate the tables.
 
 mod ddl;
-mod insert;
 mod memstore;
-mod meta;
 pub mod snapshot;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
-use sqlx::postgres::{PgPoolOptions, Postgres};
-use sqlx::Pool;
-use thiserror::Error;
-use tracing::{info, warn};
-
 use bytes::Bytes;
+use parking_lot::RwLock;
+use thiserror::Error;
+use tracing::info;
+
 use relay_protocol::{DecodedRow, MirroredField, MirroredSchema};
 
 pub use ddl::{build_table_specs, database_prefix, ColumnSpec, TableSpec};
 pub use memstore::{MemStore, SnapshotStats};
-pub use meta::SyncOutcome;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("sqlx: {0}")]
-    Sqlx(#[from] sqlx::Error),
     #[error("invalid identifier: {0}")]
     Identifier(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
-    pub database_url: String,
     pub upstream_host: String,
     pub upstream_database: String,
 }
 
+#[derive(Debug)]
+pub enum SyncOutcome {
+    /// First time we've ever applied this schema in the current
+    /// process. Snapshots from previous runs may still load if their
+    /// fingerprint matches.
+    Applied { tables: Vec<String> },
+    /// Same fingerprint as the previously-applied schema — no-op.
+    Unchanged,
+    /// Different fingerprint than the previously-applied schema. The
+    /// in-memory tables have been recreated empty; on-disk snapshots
+    /// from the old fingerprint will be ignored on the next load.
+    Drifted { tables: Vec<String> },
+}
+
 pub struct Storage {
-    pool: Pool<Postgres>,
     upstream_host: String,
     upstream_database: String,
     table_specs: Arc<RwLock<HashMap<String, TableSpec>>>,
+    last_fingerprint: Arc<RwLock<Option<String>>>,
     mem: Arc<MemStore>,
 }
 
 impl Storage {
-    pub async fn connect(config: StorageConfig) -> Result<Self, StorageError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .connect(&config.database_url)
-            .await?;
-
-        meta::run_initial_migrations(&pool).await?;
-
+    pub fn new(config: StorageConfig) -> Self {
         info!(
             target: "relay::storage",
             upstream_host = %config.upstream_host,
             upstream_database = %config.upstream_database,
-            "connected to postgres"
+            "in-memory storage initialised"
         );
-
-        Ok(Self {
-            pool,
+        Self {
             upstream_host: config.upstream_host,
             upstream_database: config.upstream_database,
             table_specs: Arc::new(RwLock::new(HashMap::new())),
+            last_fingerprint: Arc::new(RwLock::new(None)),
             mem: Arc::new(MemStore::new()),
-        })
+        }
     }
 
-    /// Compare the schema fingerprint to what we have stored. On
-    /// first-ever sync or drift, drop existing mirrored tables for
-    /// this upstream and CREATE TABLE for each new one.
-    pub async fn sync_schema(&self, schema: &MirroredSchema) -> Result<SyncOutcome, StorageError> {
-        let table_specs = ddl::build_table_specs(schema, &self.upstream_database)?;
-        let outcome = meta::sync_schema(
-            &self.pool,
-            &self.upstream_host,
-            &self.upstream_database,
-            schema,
-            &table_specs,
-        )
-        .await?;
-        self.mem.sync_schema(Arc::new(schema.clone()), &table_specs);
-        match &outcome {
-            SyncOutcome::Unchanged => {
-                info!(target: "relay::storage", "schema unchanged");
-            }
-            SyncOutcome::CreatedFresh { created } => {
-                info!(
-                    target: "relay::storage",
-                    n_tables = created.len(),
-                    tables = ?created,
-                    "schema mirrored for the first time"
-                );
-            }
-            SyncOutcome::DriftWiped { wiped, created } => {
-                warn!(
-                    target: "relay::storage",
-                    n_wiped = wiped.len(),
-                    n_created = created.len(),
-                    wiped = ?wiped,
-                    "schema drift — dropped mirror tables and recreated"
-                );
-            }
-        }
-
-        let mut map = self.table_specs.write();
-        map.clear();
-        for spec in table_specs {
-            map.insert(spec.upstream_name.clone(), spec);
-        }
-        Ok(outcome)
-    }
-
-    pub fn pool(&self) -> &Pool<Postgres> {
-        &self.pool
+    pub fn upstream_host(&self) -> &str {
+        &self.upstream_host
     }
 
     pub fn upstream_database(&self) -> &str {
@@ -143,116 +98,105 @@ impl Storage {
         &self.mem
     }
 
+    /// Apply a parsed upstream schema. Builds per-table specs, sets
+    /// them on the in-memory store, and surfaces whether the schema
+    /// is unchanged, brand-new for this process, or drifted from what
+    /// was previously applied.
+    pub fn sync_schema(&self, schema: &MirroredSchema) -> Result<SyncOutcome, StorageError> {
+        let table_specs = ddl::build_table_specs(schema, &self.upstream_database)?;
+        let new_fp = schema.fingerprint_hex();
+
+        let mut last_fp = self.last_fingerprint.write();
+        let outcome = match last_fp.as_deref() {
+            Some(prev) if prev == new_fp => SyncOutcome::Unchanged,
+            Some(_) => SyncOutcome::Drifted {
+                tables: table_specs
+                    .iter()
+                    .map(|s| s.upstream_name.clone())
+                    .collect(),
+            },
+            None => SyncOutcome::Applied {
+                tables: table_specs
+                    .iter()
+                    .map(|s| s.upstream_name.clone())
+                    .collect(),
+            },
+        };
+        *last_fp = Some(new_fp);
+        drop(last_fp);
+
+        self.mem.sync_schema(Arc::new(schema.clone()), &table_specs);
+
+        let mut map = self.table_specs.write();
+        map.clear();
+        for spec in table_specs {
+            map.insert(spec.upstream_name.clone(), spec);
+        }
+
+        Ok(outcome)
+    }
+
     /// Compute the per-database directory under `data_dir` where
-    /// snapshot files live. Resolves the upstream identifier through
-    /// the same sanitizer the PG mirror uses, so snapshot files line
-    /// up with their PG counterparts.
-    pub fn snapshot_dir(&self, data_dir: &std::path::Path) -> std::path::PathBuf {
+    /// snapshot files live.
+    pub fn snapshot_dir(&self, data_dir: &Path) -> PathBuf {
         let prefix =
             ddl::database_prefix(&self.upstream_database).unwrap_or_else(|_| "default".into());
         data_dir.join(prefix)
     }
 
-    /// Walk the in-memory store and write every table to disk under
-    /// [`Storage::snapshot_dir`]. Synchronous: callers wanting to
-    /// avoid blocking the runtime should wrap in `spawn_blocking`.
-    pub fn write_snapshots(&self, data_dir: &std::path::Path) -> std::io::Result<SnapshotStats> {
+    /// Walk the in-memory store and write every table to disk.
+    pub fn write_snapshots(&self, data_dir: &Path) -> std::io::Result<SnapshotStats> {
         let dir = self.snapshot_dir(data_dir);
         self.mem.write_snapshots(&dir)
     }
 
-    /// Restore mem from snapshots written under [`Storage::snapshot_dir`].
-    /// Files whose schema hash doesn't match the current schema are
-    /// skipped. Caller must have invoked [`Storage::sync_schema`] first.
-    pub fn load_snapshots(&self, data_dir: &std::path::Path) -> std::io::Result<SnapshotStats> {
+    /// Restore mem from snapshots in `data_dir`. Files whose schema
+    /// fingerprint doesn't match the current schema are skipped. Must
+    /// be called after [`Storage::sync_schema`].
+    pub fn load_snapshots(&self, data_dir: &Path) -> std::io::Result<SnapshotStats> {
         let dir = self.snapshot_dir(data_dir);
         self.mem.load_snapshots(&dir)
     }
 
     /// Insert the given decoded rows into the named upstream table.
-    /// Returns the number of rows inserted. Uses a single transaction.
-    pub async fn insert_rows(
+    /// Returns the number of rows inserted.
+    pub fn insert_rows(
         &self,
         upstream_table: &str,
         rows: &[DecodedRow],
     ) -> Result<u64, StorageError> {
-        let spec = self
-            .table_spec(upstream_table)
-            .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
-        let count = insert::insert_rows(&self.pool, &spec, rows).await?;
-        self.mem.insert_rows(upstream_table, rows)?;
-        Ok(count)
+        self.mem.insert_rows(upstream_table, rows)
     }
 
     /// Apply a `TransactionUpdate` diff for one table: delete rows
     /// matching the given delete-rows by primary key, then insert the
-    /// given insert-rows. All in a single transaction.
-    pub async fn apply_diff(
+    /// given insert-rows.
+    pub fn apply_diff(
         &self,
         upstream_table: &str,
         deletes: &[DecodedRow],
         inserts_rows: &[DecodedRow],
     ) -> Result<DiffOutcome, StorageError> {
-        let spec = self
-            .table_spec(upstream_table)
-            .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
-        let outcome = insert::apply_diff(&self.pool, &spec, deletes, inserts_rows).await?;
-        self.mem.apply_diff(upstream_table, deletes, inserts_rows)?;
-        Ok(outcome)
+        self.mem.apply_diff(upstream_table, deletes, inserts_rows)
     }
 
-    /// Reconcile the current PG mirror against an upstream snapshot
-    /// (typically the rows in a fresh `SubscribeApplied` after the
-    /// upstream WS reconnects). Inserts new rows, updates changed
-    /// rows, deletes rows the snapshot dropped, and leaves identical
-    /// rows untouched. Returns the resulting diff so the caller can
-    /// fan it out to already-subscribed downstream clients.
-    pub async fn apply_snapshot_diff(
+    /// Reconcile the current mirror against an upstream snapshot. The
+    /// returned diff is what the caller fans out to already-subscribed
+    /// downstream clients.
+    pub fn apply_snapshot_diff(
         &self,
         upstream_table: &str,
         incoming: &[DecodedRow],
         _fields: &[MirroredField],
         _schema: &MirroredSchema,
     ) -> Result<SnapshotDiff, StorageError> {
-        let spec = self
-            .table_spec(upstream_table)
-            .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
-        // Stage 2: compute the diff against the in-memory store
-        // (sub-second even on million-row tables) and apply just that
-        // delta to Postgres. The previous implementation read every
-        // row in the PG mirror to compute the diff, which on
-        // BitCraft-scale databases took ~10 minutes.
-        let diff = self.mem.apply_snapshot_diff(upstream_table, incoming)?;
-        if !diff.deletes.is_empty() || !diff.inserts.is_empty() {
-            insert::apply_diff(&self.pool, &spec, &diff.deletes, &diff.inserts).await?;
-        }
-        Ok(diff)
+        self.mem.apply_snapshot_diff(upstream_table, incoming)
     }
 
     /// Fetch the raw BSATN bytes of every row in the given upstream
-    /// table. Reads from the in-memory store; the PG mirror is kept in
-    /// sync as a paranoid checker but no longer on the hot path for
-    /// downstream snapshots.
+    /// table.
     pub fn fetch_all_bsatn(&self, upstream_table: &str) -> Result<Vec<Bytes>, StorageError> {
         self.mem.fetch_all_bsatn(upstream_table)
-    }
-
-    /// Read every row directly from the Postgres mirror. Used by the
-    /// parity test to confirm the in-memory store has not diverged.
-    pub async fn fetch_all_bsatn_pg(
-        &self,
-        upstream_table: &str,
-    ) -> Result<Vec<Bytes>, StorageError> {
-        let spec = self
-            .table_spec(upstream_table)
-            .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
-        let sql = format!(
-            "SELECT \"{}\" FROM \"{}\"",
-            ddl::BSATN_COLUMN,
-            spec.postgres_name
-        );
-        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(&sql).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(b,)| Bytes::from(b)).collect())
     }
 }
 

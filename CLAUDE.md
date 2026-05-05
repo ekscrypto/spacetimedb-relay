@@ -5,7 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project: spacetimedb-relay
 
 A Rust relay/proxy for SpacetimeDB. One upstream subscription fans out
-to many downstream clients while mirroring state to PostgreSQL.
+to many downstream clients while mirroring state in memory and
+periodically snapshotting it to disk (per-table files under
+`<data-dir>/<db_prefix>/`).
 
 ## Common commands
 
@@ -27,10 +29,8 @@ cargo test -p relay-upstream -- bsatn_row_list
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 
-# Bring up the local Postgres mirror (creates relay/relay/relay db)
-docker compose up -d postgres
-
-# Run the binary against the test database (identity in CLAUDE.local.md)
+# Run the binary against the test database (identity in CLAUDE.local.md).
+# Snapshots default to ./data; override with --data-dir.
 cargo run -p relay -- \
   --upstream wss://maincloud.spacetimedb.com \
   --database <see-CLAUDE.local.md> \
@@ -75,12 +75,17 @@ These shape every change in this codebase. Don't break them without explicit ins
    tags 0x00–0x07 must match `Tags.swift` / clockworklabs's
    `client-api-messages` v2.
 4. **Schema drift = wipe**: on detecting that an upstream table's
-   schema differs from what we have stored, drop the mirrored Postgres
-   table and re-fetch from scratch. We cannot replay row migrations
-   the upstream may have applied.
-5. **Postgres = canonical state**: in-memory caches are derivable.
-   Anything authoritative (current row state, per-client subscription
-   queries, identity tokens) lives in Postgres.
+   schema differs from what we have stored, drop the mirrored rows
+   and re-fetch from scratch. On-disk snapshot files carry a schema
+   fingerprint; mismatched files are silently skipped on load. We
+   cannot replay row migrations the upstream may have applied.
+5. **In-memory + snapshot file = canonical state**: the entire
+   subscribed dataset lives in `relay-storage::MemStore`; on-disk
+   snapshots under `<data-dir>/<db_prefix>/<table>.snapshot` are the
+   only durable copy. A relay restart loads matching snapshots and
+   gap-fills via the next `SubscribeApplied`. Per-client subscription
+   state and identity tokens are not persisted (recreated on
+   reconnect).
 
 ## Upstream protocol versions
 
@@ -170,7 +175,7 @@ cross-checking encoding decisions. Particularly:
 |--------------------|----------------------------------------------------------------------|
 | `relay-protocol`   | Re-exports / wraps `spacetimedb-sats` + `spacetimedb-client-api-messages`. Wire types only — no I/O. |
 | `relay-upstream`   | Owns the single upstream WebSocket. Decodes ServerMessages, exposes a stream of structured events. |
-| `relay-storage`    | Postgres mirror. Dynamic per-table DDL. Schema-drift detection + wipe. |
+| `relay-storage`    | In-memory row mirror keyed by primary key. Per-table snapshot files on disk, schema-drift detection. |
 | `relay-engine`     | SpacetimeDB SQL parsing (via `spacetimedb-sql-parser`), per-client query state, diff computation. |
 | `relay-server`     | Downstream `axum` WS server. Speaks v2 ClientMessage/ServerMessage. |
 | `relay`            | Binary. CLI args, wires the pieces together, runs them under tokio. |
@@ -189,8 +194,9 @@ cross-checking encoding decisions. Particularly:
 - **Tracing**: instrument every async entry point. Use the `relay`
   target prefix (e.g. `tracing::info!(target = "relay::upstream", …)`).
 - **Tests**: each library crate gets unit tests for pure logic + an
-  integration test against a Postgres test container or the live
-  test database (see `CLAUDE.local.md`) for wire-format checks.
+  integration test against the live test database (see
+  `CLAUDE.local.md`) for wire-format checks. `relay-storage` also has
+  per-table snapshot round-trip tests against a tempdir.
 - **Workspace deps**: every external dep goes in the root `Cargo.toml`
   `[workspace.dependencies]` table. Crates pull them via
   `dep.workspace = true`. Don't pin versions in individual crates.
@@ -222,9 +228,9 @@ General rules regardless of host:
   carry over.
 - Never log production identity tokens — they're long-lived bearer
   credentials.
-- Provision a dedicated `relay` Postgres role/database. Don't assume
-  an empty cluster — production hosts often have other services on
-  the same Postgres instance.
+- Provision a writable directory for `--data-dir`. Snapshots can be
+  large (~3× the raw BSATN size of the subscribed dataset); on
+  BitCraft-scale databases that's ~2-3 GB.
 
 ## Wire framing — what we send and receive
 
