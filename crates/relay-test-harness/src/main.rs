@@ -59,13 +59,21 @@ struct Args {
     #[arg(long, env = "TEST_DATABASE")]
     database: String,
 
-    /// SpacetimeDB table to assert propagation through.
+    /// SpacetimeDB table to assert propagation through. Comma-separated
+    /// for multiple tables (subscribe-only mode only).
     #[arg(long, env = "TEST_TABLE", default_value = "user_account")]
     table: String,
 
     /// Reducer to invoke on the upstream.
     #[arg(long, env = "TEST_REDUCER", default_value = "set_name")]
     reducer: String,
+
+    /// Skip the upstream writer and just connect a subscriber to the
+    /// relay. Prints the per-table row counts seen in SubscribeApplied
+    /// and exits. Useful for confirming an end-to-end relay path
+    /// without firing a reducer.
+    #[arg(long, env = "TEST_SUBSCRIBE_ONLY")]
+    subscribe_only: bool,
 
     /// Optional fixed test name. If omitted, generates a random one
     /// per run so concurrent harness runs don't collide.
@@ -112,6 +120,15 @@ async fn main() -> Result<()> {
     let reducer = args.reducer.clone();
     let expected = name.clone();
 
+    if args.subscribe_only {
+        let tables: Vec<String> = table
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        return run_subscribe_only(relay_url, database, tables, timeout).await;
+    }
+
     let subscriber = tokio::spawn(async move {
         run_subscriber(relay_url, database.clone(), table, expected, timeout).await
     });
@@ -145,6 +162,92 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+async fn run_subscribe_only(
+    relay: Url,
+    database: String,
+    tables: Vec<String>,
+    timeout: Duration,
+) -> Result<()> {
+    use spacetimedb_client_api_messages::websocket::common::RowListLen;
+
+    if tables.is_empty() {
+        bail!("--subscribe-only requires at least one table in --table");
+    }
+    tracing::info!(
+        target: "harness::subscribe-only",
+        ?tables,
+        "connecting to relay as downstream client"
+    );
+    let mut conn = open_connection(&relay, &database).await?;
+    let initial = expect_initial_connection(&mut conn).await?;
+    tracing::info!(
+        target: "harness::subscribe-only",
+        identity = %initial.identity.to_hex().as_str(),
+        "got InitialConnection"
+    );
+
+    let queries: Vec<String> = tables
+        .iter()
+        .map(|t| format!("SELECT * FROM {t}"))
+        .collect();
+    let n_queries = queries.len();
+    send_subscribe(&mut conn, 100, 100, queries).await?;
+
+    // The relay sends one SubscribeApplied per query string. Collect
+    // them all (or until timeout) before reporting.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut applieds = Vec::new();
+    while applieds.len() < n_queries {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, recv_server_message(&mut conn)).await {
+            Ok(Ok(ServerMessage::SubscribeApplied(sa))) => applieds.push(sa),
+            Ok(Ok(ServerMessage::SubscriptionError(err))) => {
+                bail!("subscription error: {}", err.error)
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(?other, "ignoring frame while waiting for SubscribeApplied")
+            }
+            Ok(Err(e)) => return Err(anyhow!("recv error: {e}")),
+            Err(_) => break,
+        }
+    }
+    if applieds.is_empty() {
+        bail!("no SubscribeApplied received within timeout");
+    }
+
+    let mut total_rows: usize = 0;
+    let mut total_bytes: usize = 0;
+    let mut total_tables: usize = 0;
+    for (i, applied) in applieds.iter().enumerate() {
+        println!(
+            "SubscribeApplied #{}: request_id={} query_set_id={} tables={}",
+            i + 1,
+            applied.request_id,
+            applied.query_set_id.id,
+            applied.rows.tables.len(),
+        );
+        for t in applied.rows.tables.iter() {
+            let n = t.rows.len();
+            let b: usize = (0..n).filter_map(|i| t.rows.get(i).map(|r| r.len())).sum();
+            total_rows += n;
+            total_bytes += b;
+            total_tables += 1;
+            println!("  {:<48} rows={:<6} bytes={}", &*t.table, n, b);
+        }
+    }
+    println!(
+        "TOTAL frames={} tables={} rows={} bytes={}",
+        applieds.len(),
+        total_tables,
+        total_rows,
+        total_bytes,
+    );
+    Ok(())
 }
 
 async fn run_writer(upstream: Url, database: String, reducer: String, name: String) -> Result<()> {

@@ -5,55 +5,58 @@ hostnames, and table layouts can change without notice.
 
 ## Architecture
 
-The Early Access 1 host is *still* the meta surface in EA2:
+Everything — meta and gameplay — runs on the same SpacetimeDB host:
 
 ```
 https://bitcraft-early-access.spacetimedb.com
 ```
 
-It exposes two long-lived modules from EA1:
+EA2 modules use the `bitcraft-live-*` naming, **not** the EA1
+`bitcraft-{N}` / `bitcraft-global` names:
 
-- **`bitcraft-global`** (412 public-user tables) — game description /
-  reference data (items, recipes, biomes, etc.). Schema is fetchable
-  unauthenticated; live subscribes need a token.
-- **`bitcraft-3`** (446 public-user tables) — account & region
-  routing, including the `region_connection_info` table.
+- **`bitcraft-live-global`** — game description / reference data
+  (items, recipes, biomes, etc.) and the meta `region_connection_info`
+  table. Replaces EA1's `bitcraft-global` and `bitcraft-3`.
+- **`bitcraft-live-{region_id}`** — per-region gameplay shard. The
+  region ID in the module name matches the in-game region ID directly
+  (e.g. region 14 → `bitcraft-live-14`).
 
-Actual EA2 *gameplay* shards live on per-region SpacetimeDB hosts whose
-addresses aren't published anywhere. The only way to find them is to
-subscribe to `bitcraft-3 / region_connection_info` with a real game
-account and read the `host` + `module` columns per row. EA1 module
-numbering (`bitcraft-1`..`bitcraft-9`) does **not** correspond to EA2
-region IDs.
+The EA1 names (`bitcraft-3`, `bitcraft-global`, `bitcraft-1`..`9`)
+still resolve a `/v1/database/<name>/schema` HTTP response out of
+cache, but their WebSocket subscribe endpoint accepts the upgrade and
+then immediately TCP-resets — they're effectively decommissioned. The
+HTTP success is misleading; don't infer "module is alive" from it.
+
+There are **no per-region hostnames**. The Unity client opens both
+`bitcraft-live-global` and `bitcraft-live-{N}` against the same
+`bitcraft-early-access.spacetimedb.com` host (verified by reading
+`Player.log` while the game runs).
 
 Active region IDs as of 2026-05 (from Bitjita's public
 `https://bitjita.com/api/status`):
 
-| ID | Name      |
-|----|-----------|
-|  7 | Virexal   |
-|  8 | Solmere   |
-|  9 | Marowik   |
-| 12 | Elyndor   |
-| 13 | Hexalis   |
-| 14 | Lumethis  |
-| 17 | Draxen    |
-| 18 | Oryxen    |
-| 19 | Zephra    |
+| ID | Name      | Module                |
+|----|-----------|-----------------------|
+|  7 | Virexal   | `bitcraft-live-7`     |
+|  8 | Solmere   | `bitcraft-live-8`     |
+|  9 | Marowik   | `bitcraft-live-9`     |
+| 12 | Elyndor   | `bitcraft-live-12`    |
+| 13 | Hexalis   | `bitcraft-live-13`    |
+| 14 | Lumethis  | `bitcraft-live-14`    |
+| 17 | Draxen    | `bitcraft-live-17`    |
+| 18 | Oryxen    | `bitcraft-live-18`    |
+| 19 | Zephra    | `bitcraft-live-19`    |
 
-IDs are non-contiguous and likely game-internal — module names
-themselves are whatever `region_connection_info[N].module` says.
+## Bootstrap: discovering active modules
 
-## Bootstrap: discovering a region's host + module
+If you don't already know which region you want, subscribe to
+`bitcraft-live-global / region_connection_info` with a real
+game-account JWT. Each row has `host` and `module` columns; `host` is
+the SpacetimeDB URL (currently always the EA host) and `module` is
+the `bitcraft-live-{N}` name.
 
-```python
-# adapted from raffiandev/bitcraft-stdb
-res = dump_tables(meta_host, 'bitcraft-3', 'region_connection_info', auth)
-host, module = res['region_connection_info'][REGION_ID]
-```
-
-Anonymous identities are not authorized for that table; the JWT must
-be from an actual game account.
+Anonymous identities are not authorized to read that table; the JWT
+must be from an actual game account.
 
 ## Auth flow
 
@@ -101,24 +104,28 @@ Consume it via the existing `RELAY_UPSTREAM_TOKEN` env var:
 ```sh
 RELAY_UPSTREAM_TOKEN=$(cat .bitcraft-token) cargo run -p relay -- \
   --upstream wss://bitcraft-early-access.spacetimedb.com \
-  --database bitcraft-3 \
+  --database bitcraft-live-14 \
   --upstream-protocol v1 \
-  --subscribe-table region_connection_info \
   ...
 ```
 
-## Open: wire format
+## Wire format
 
-Every public BitCraft scraper (Bitjita's reference Python,
-`raffiandev/bitcraft-stdb`, `BitCraftToolBox/automata`) negotiates
-`v1.json.spacetimedb`. Our relay only speaks `v1.bsatn.spacetimedb`
-and `v2.bsatn.spacetimedb`. With the BSATN subprotocol the EA host
-returns 101 (Switching Protocols) but immediately resets the
-connection. Cause is unconfirmed: could be auth (we tested with an
-anonymous identity) or wire format (BitCraft's deployed SpacetimeDB
-build may be JSON-only). Once a real game-account JWT is wired in, if
-the reset persists we'll need a v1-JSON path in `relay-upstream`
-alongside the existing v1-BSATN one in `v1_compat`.
+The EA host accepts both `v1.bsatn.spacetimedb` and
+`v1.json.spacetimedb` interchangeably on `bitcraft-live-*` modules.
+The relay's existing v1-BSATN path (`v1_compat`) works as-is — no
+v1-JSON support needed.
+
+Public scrapers (`raffiandev/bitcraft-stdb`,
+`BitCraftToolBox/automata`, Bitjita) historically negotiated
+`v1.json.spacetimedb` because the JSON shape is easier to debug from
+Python. That's a convention, not a server requirement.
+
+> **Historical note.** Earlier rounds of this investigation thought
+> the EA host was rejecting BSATN — really it was the EA1 module
+> names (`bitcraft-3`, `bitcraft-global`) that no longer accept
+> subscribes in EA2. With the right `bitcraft-live-*` module name,
+> BSATN works on the first try.
 
 ## Caveats
 
@@ -126,9 +133,10 @@ alongside the existing v1-BSATN one in `v1_compat`.
   warns the JWT may disconnect the running game client when re-used
   by another subscriber. Don't run the relay with a game-account
   token while you're logged in playing.
-- **First-run schema sync is heavy.** `bitcraft-3` has 446 public-user
-  tables; the relay creates a Postgres table per public-user table on
-  first connect regardless of the `--subscribe-table` filter.
+- **First-run schema sync is heavy.** `bitcraft-live-{N}` modules
+  have hundreds of public-user tables; the relay creates a Postgres
+  table per public-user table on first connect regardless of the
+  `--subscribe-table` filter.
 - **Tokens are long-lived.** Re-running the email/access-code flow
   invalidates earlier tokens; until then a leaked JWT is full account
   access.
