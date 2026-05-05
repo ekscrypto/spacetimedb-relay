@@ -146,6 +146,15 @@ any test or republish command.
 The module source itself lives in `test-module/` (excluded from the
 workspace).
 
+## Reference: BitCraft live game server (EA2)
+
+Fan-research on connecting the relay to BitCraft Online (Early Access
+2): meta host, region-routing bootstrap via `bitcraft-3 /
+region_connection_info`, the `api.bitcraftonline.com` auth flow, the
+on-disk JWT in Unity's PlayerPrefs, the `.bitcraft-token` convention,
+and the open BSATN-vs-JSON wire-format question. See
+**`BITCRAFT.md`**.
+
 ## Reference: Swift SDK
 
 `../spacetimedb-swift-sdk/` — same wire protocol, useful for
