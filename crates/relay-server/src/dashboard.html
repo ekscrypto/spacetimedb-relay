@@ -109,36 +109,43 @@ function renderUpstream(u, nowMs) {
   `;
 }
 
-function totalsAcrossClients(clients, key) {
-  return {
-    last_1m: clients.reduce((a, c) => a + (c[key].last_1m || 0), 0),
-    last_5m: clients.reduce((a, c) => a + (c[key].last_5m || 0), 0),
-    last_30m: clients.reduce((a, c) => a + (c[key].last_30m || 0), 0),
-  };
-}
-
 function renderDownstream(snap, nowMs) {
   const clients = snap.clients;
-  if (clients.length === 0) {
-    return `<div>${snap.n_clients} client(s) connected</div>
-      <div class="empty">no clients connected</div>`;
-  }
-  const tot_b = totalsAcrossClients(clients, "bytes_out");
-  const tot_i = totalsAcrossClients(clients, "rows_inserted");
-  const tot_d = totalsAcrossClients(clients, "rows_deleted");
+  const ds = snap.downstream || {
+    clients_seen: 0,
+    bytes_out: { last_1m: 0, last_5m: 0, last_30m: 0 },
+    rows_inserted: { last_1m: 0, last_5m: 0, last_30m: 0 },
+    rows_deleted: { last_1m: 0, last_5m: 0, last_30m: 0 },
+    oneoff_queries: { last_1m: 0, last_5m: 0, last_30m: 0 },
+  };
   const totalsRows = [
     ["bytes sent",
-      fmtBytes(tot_b.last_1m), fmtBytes(tot_b.last_5m), fmtBytes(tot_b.last_30m)],
+      fmtBytes(ds.bytes_out.last_1m), fmtBytes(ds.bytes_out.last_5m), fmtBytes(ds.bytes_out.last_30m)],
     ["avg bps",
-      fmtBps(tot_b.last_1m, 60), fmtBps(tot_b.last_5m, 300), fmtBps(tot_b.last_30m, 1800)],
+      fmtBps(ds.bytes_out.last_1m, 60), fmtBps(ds.bytes_out.last_5m, 300), fmtBps(ds.bytes_out.last_30m, 1800)],
     ["rows inserted (sent)",
-      num(tot_i.last_1m), num(tot_i.last_5m), num(tot_i.last_30m)],
+      num(ds.rows_inserted.last_1m), num(ds.rows_inserted.last_5m), num(ds.rows_inserted.last_30m)],
     ["rows deleted (sent)",
-      num(tot_d.last_1m), num(tot_d.last_5m), num(tot_d.last_30m)],
+      num(ds.rows_deleted.last_1m), num(ds.rows_deleted.last_5m), num(ds.rows_deleted.last_30m)],
+    ["oneoff queries",
+      num(ds.oneoff_queries.last_1m), num(ds.oneoff_queries.last_5m), num(ds.oneoff_queries.last_30m)],
   ];
   const totalsBody = totalsRows.map(r =>
     `<tr><td>${escape(r[0])}</td><td class="num">${r[1]}</td><td class="num">${r[2]}</td><td class="num">${r[3]}</td></tr>`
   ).join("");
+
+  const header = `
+    <div>${snap.n_clients} client(s) connected
+      <span class="dim">// ${num(ds.clients_seen)} total since startup</span></div>
+    <table>
+      <thead><tr><th>totals</th><th class="num">1m</th><th class="num">5m</th><th class="num">30m</th></tr></thead>
+      <tbody>${totalsBody}</tbody>
+    </table>
+  `;
+
+  if (clients.length === 0) {
+    return header + `<div class="empty">no clients currently connected</div>`;
+  }
 
   const perClient = clients.map(c => {
     const id = "client-" + String(c.client_id).padStart(4, "0");
@@ -155,12 +162,7 @@ function renderDownstream(snap, nowMs) {
       </tr>`;
   }).join("");
 
-  return `
-    <div>${snap.n_clients} client(s) connected</div>
-    <table>
-      <thead><tr><th>totals</th><th class="num">1m</th><th class="num">5m</th><th class="num">30m</th></tr></thead>
-      <tbody>${totalsBody}</tbody>
-    </table>
+  return header + `
     <table style="margin-top: 12px;">
       <thead>
         <tr>
@@ -179,18 +181,24 @@ function renderDownstream(snap, nowMs) {
   `;
 }
 
+let lastGoodAt = null;
 async function tick() {
   try {
     const r = await fetch("/dashboard.json", { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const snap = await r.json();
     const now = snap.now_ms;
+    lastGoodAt = now;
     document.getElementById("meta").textContent =
       "refreshed " + new Date(now).toLocaleTimeString() + " // window: 1m / 5m / 30m";
     document.getElementById("upstream").innerHTML = renderUpstream(snap.upstream, now);
     document.getElementById("downstream").innerHTML = renderDownstream(snap, now);
   } catch (e) {
-    document.getElementById("meta").innerHTML = `<span class="down">fetch failed: ${escape(e.message)}</span>`;
+    const stale = lastGoodAt
+      ? `last good ${fmtAge(lastGoodAt, Date.now())}`
+      : "no successful fetch yet";
+    document.getElementById("meta").innerHTML =
+      `<span class="down">fetch failed: ${escape(e.message)}</span> &nbsp; <span class="dim">${stale}; auto-retrying every 2s</span>`;
   }
 }
 tick();

@@ -134,7 +134,40 @@ impl UpstreamMetrics {
     }
 }
 
+/// Aggregate downstream counters that survive client disconnect. The
+/// dashboard shows these regardless of how many clients are currently
+/// connected, so a hit-and-run subscriber's traffic is still visible.
 #[derive(Default)]
+pub struct DownstreamMetrics {
+    clients_seen: AtomicU64,
+    bytes_out: WindowedCounter,
+    rows_inserted: WindowedCounter,
+    rows_deleted: WindowedCounter,
+    oneoff_queries: WindowedCounter,
+}
+
+impl DownstreamMetrics {
+    fn record_outbound(&self, bytes: u64, inserted: u64, deleted: u64) {
+        self.bytes_out.record(bytes);
+        self.rows_inserted.record(inserted);
+        self.rows_deleted.record(deleted);
+    }
+
+    fn record_oneoff(&self) {
+        self.oneoff_queries.record(1);
+    }
+
+    fn snapshot(&self) -> DownstreamSnapshot {
+        DownstreamSnapshot {
+            clients_seen: self.clients_seen.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.windows(),
+            rows_inserted: self.rows_inserted.windows(),
+            rows_deleted: self.rows_deleted.windows(),
+            oneoff_queries: self.oneoff_queries.windows(),
+        }
+    }
+}
+
 pub struct ClientMetrics {
     pub addr: String,
     connected_since_ms: AtomicU64,
@@ -143,14 +176,20 @@ pub struct ClientMetrics {
     rows_inserted: WindowedCounter,
     rows_deleted: WindowedCounter,
     oneoff_queries: WindowedCounter,
+    downstream: Arc<DownstreamMetrics>,
 }
 
 impl ClientMetrics {
-    fn new(addr: String) -> Self {
+    fn new(addr: String, downstream: Arc<DownstreamMetrics>) -> Self {
         Self {
             addr,
             connected_since_ms: AtomicU64::new(now_millis()),
-            ..Self::default()
+            subscriptions: AtomicUsize::default(),
+            bytes_out: WindowedCounter::default(),
+            rows_inserted: WindowedCounter::default(),
+            rows_deleted: WindowedCounter::default(),
+            oneoff_queries: WindowedCounter::default(),
+            downstream,
         }
     }
 
@@ -158,10 +197,12 @@ impl ClientMetrics {
         self.bytes_out.record(bytes);
         self.rows_inserted.record(inserted);
         self.rows_deleted.record(deleted);
+        self.downstream.record_outbound(bytes, inserted, deleted);
     }
 
     pub fn record_oneoff(&self) {
         self.oneoff_queries.record(1);
+        self.downstream.record_oneoff();
     }
 
     pub fn set_subscriptions(&self, n: usize) {
@@ -185,6 +226,7 @@ impl ClientMetrics {
 #[derive(Default)]
 pub struct Metrics {
     pub upstream: UpstreamMetrics,
+    pub downstream: Arc<DownstreamMetrics>,
     clients: DashMap<ClientId, Arc<ClientMetrics>>,
 }
 
@@ -194,7 +236,8 @@ impl Metrics {
     }
 
     pub fn register_client(&self, id: ClientId, addr: String) -> Arc<ClientMetrics> {
-        let m = Arc::new(ClientMetrics::new(addr));
+        self.downstream.clients_seen.fetch_add(1, Ordering::Relaxed);
+        let m = Arc::new(ClientMetrics::new(addr, self.downstream.clone()));
         self.clients.insert(id, m.clone());
         m
     }
@@ -213,6 +256,7 @@ impl Metrics {
         MetricsSnapshot {
             now_ms: now_millis(),
             upstream: self.upstream.snapshot(),
+            downstream: self.downstream.snapshot(),
             n_clients: clients.len(),
             clients,
         }
@@ -232,6 +276,15 @@ pub struct UpstreamSnapshot {
 }
 
 #[derive(serde::Serialize)]
+pub struct DownstreamSnapshot {
+    pub clients_seen: u64,
+    pub bytes_out: WindowSnapshot,
+    pub rows_inserted: WindowSnapshot,
+    pub rows_deleted: WindowSnapshot,
+    pub oneoff_queries: WindowSnapshot,
+}
+
+#[derive(serde::Serialize)]
 pub struct ClientSnapshot {
     pub client_id: u64,
     pub addr: String,
@@ -247,6 +300,7 @@ pub struct ClientSnapshot {
 pub struct MetricsSnapshot {
     pub now_ms: u64,
     pub upstream: UpstreamSnapshot,
+    pub downstream: DownstreamSnapshot,
     pub n_clients: usize,
     pub clients: Vec<ClientSnapshot>,
 }
@@ -332,5 +386,28 @@ mod tests {
         assert!(json.contains("\"connected\":true"));
         assert!(json.contains("\"n_clients\":1"));
         assert!(json.contains("\"bytes_out\""));
+        assert!(json.contains("\"downstream\""));
+    }
+
+    #[test]
+    fn downstream_totals_survive_client_disconnect() {
+        let m = Metrics::new();
+        let cm = m.register_client(ClientId(1), "1.2.3.4:1".into());
+        cm.record_outbound(120, 4, 1);
+        cm.record_oneoff();
+
+        let cm2 = m.register_client(ClientId(2), "1.2.3.4:2".into());
+        cm2.record_outbound(80, 2, 0);
+
+        m.deregister_client(ClientId(1));
+        m.deregister_client(ClientId(2));
+
+        let s = m.snapshot();
+        assert_eq!(s.n_clients, 0);
+        assert_eq!(s.downstream.clients_seen, 2);
+        assert_eq!(s.downstream.bytes_out.last_1m, 200);
+        assert_eq!(s.downstream.rows_inserted.last_1m, 6);
+        assert_eq!(s.downstream.rows_deleted.last_1m, 1);
+        assert_eq!(s.downstream.oneoff_queries.last_1m, 1);
     }
 }
