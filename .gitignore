@@ -11,6 +11,7 @@ Cargo.lock.bak
 *.swp
 /tmp/
 /.spacetimedb-relay-data/
+/data/
 
 # Local-only Claude notes (host names, account specifics, etc.)
 CLAUDE.local.md

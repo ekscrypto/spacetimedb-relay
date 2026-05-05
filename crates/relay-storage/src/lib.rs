@@ -16,6 +16,7 @@ mod ddl;
 mod insert;
 mod memstore;
 mod meta;
+pub mod snapshot;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,8 +30,8 @@ use tracing::{info, warn};
 use bytes::Bytes;
 use relay_protocol::{DecodedRow, MirroredField, MirroredSchema};
 
-pub use ddl::{ColumnSpec, TableSpec};
-pub use memstore::MemStore;
+pub use ddl::{build_table_specs, database_prefix, ColumnSpec, TableSpec};
+pub use memstore::{MemStore, SnapshotStats};
 pub use meta::SyncOutcome;
 
 #[derive(Debug, Error)]
@@ -140,6 +141,32 @@ impl Storage {
 
     pub fn mem(&self) -> &Arc<MemStore> {
         &self.mem
+    }
+
+    /// Compute the per-database directory under `data_dir` where
+    /// snapshot files live. Resolves the upstream identifier through
+    /// the same sanitizer the PG mirror uses, so snapshot files line
+    /// up with their PG counterparts.
+    pub fn snapshot_dir(&self, data_dir: &std::path::Path) -> std::path::PathBuf {
+        let prefix =
+            ddl::database_prefix(&self.upstream_database).unwrap_or_else(|_| "default".into());
+        data_dir.join(prefix)
+    }
+
+    /// Walk the in-memory store and write every table to disk under
+    /// [`Storage::snapshot_dir`]. Synchronous: callers wanting to
+    /// avoid blocking the runtime should wrap in `spawn_blocking`.
+    pub fn write_snapshots(&self, data_dir: &std::path::Path) -> std::io::Result<SnapshotStats> {
+        let dir = self.snapshot_dir(data_dir);
+        self.mem.write_snapshots(&dir)
+    }
+
+    /// Restore mem from snapshots written under [`Storage::snapshot_dir`].
+    /// Files whose schema hash doesn't match the current schema are
+    /// skipped. Caller must have invoked [`Storage::sync_schema`] first.
+    pub fn load_snapshots(&self, data_dir: &std::path::Path) -> std::io::Result<SnapshotStats> {
+        let dir = self.snapshot_dir(data_dir);
+        self.mem.load_snapshots(&dir)
     }
 
     /// Insert the given decoded rows into the named upstream table.

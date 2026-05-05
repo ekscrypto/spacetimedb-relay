@@ -14,18 +14,20 @@
 //! upstream.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::RwLock;
-use tracing::warn;
+use tracing::{info, warn};
 
 use relay_protocol::{
     decode_row, field_byte_ranges, BsatnError, DecodedRow, MirroredField, MirroredSchema,
     MirroredTable,
 };
 
-use crate::ddl::TableSpec;
+use crate::ddl::{sanitize_ident, TableSpec};
+use crate::snapshot;
 use crate::{DiffOutcome, SnapshotDiff, StorageError};
 
 pub(crate) type Pk = Vec<u8>;
@@ -263,6 +265,84 @@ impl MemStore {
             .get(upstream_table)
             .map(|t| t.rows.len())
     }
+
+    /// Persist every table in the store to `<dir>/<sanitized_name>.snapshot`.
+    /// Returns the number of tables written. Each file's header carries
+    /// the current schema's fingerprint hex; mismatched files are
+    /// rejected on the next load.
+    pub fn write_snapshots(&self, dir: &Path) -> std::io::Result<SnapshotStats> {
+        let inner = self.inner.read();
+        let Some(schema) = &inner.schema else {
+            return Ok(SnapshotStats::default());
+        };
+        let hash = schema.fingerprint_hex();
+        let mut stats = SnapshotStats::default();
+        for (upstream_name, table) in inner.tables.iter() {
+            let sanitized = sanitize_ident(upstream_name).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}"))
+            })?;
+            let path = snapshot::table_path(dir, &sanitized);
+            let rows: Vec<(Vec<u8>, Bytes)> = table
+                .rows
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let n = rows.len();
+            snapshot::write_table(&path, &hash, n, rows)?;
+            stats.tables_written += 1;
+            stats.rows_written += n as u64;
+        }
+        Ok(stats)
+    }
+
+    /// Restore rows from `<dir>` for tables that match the current
+    /// schema fingerprint. Files whose header hash doesn't match (i.e.
+    /// produced under a previous schema) are skipped — the relay's
+    /// next `SubscribeApplied` will gap-fill those.
+    ///
+    /// Must be called after [`MemStore::sync_schema`] so we know the
+    /// expected fingerprint and the table topology.
+    pub fn load_snapshots(&self, dir: &Path) -> std::io::Result<SnapshotStats> {
+        let mut inner = self.inner.write();
+        let Some(schema) = inner.schema.clone() else {
+            return Ok(SnapshotStats::default());
+        };
+        let expected_hash = schema.fingerprint_hex();
+        let mut stats = SnapshotStats::default();
+        for (upstream_name, table) in inner.tables.iter_mut() {
+            let sanitized = sanitize_ident(upstream_name).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}"))
+            })?;
+            let path = snapshot::table_path(dir, &sanitized);
+            let rows = match snapshot::read_table(&path, &expected_hash) {
+                Ok(Some(rows)) => rows,
+                Ok(None) => {
+                    info!(
+                        target: "relay::memstore",
+                        table = %upstream_name,
+                        "snapshot found but schema hash mismatched; skipping"
+                    );
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for (key, bsatn) in rows {
+                table.rows.insert(key, bsatn);
+            }
+            stats.tables_loaded += 1;
+            stats.rows_loaded += table.rows.len() as u64;
+        }
+        Ok(stats)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SnapshotStats {
+    pub tables_written: usize,
+    pub rows_written: u64,
+    pub tables_loaded: usize,
+    pub rows_loaded: u64,
 }
 
 pub(crate) fn pk_key(
