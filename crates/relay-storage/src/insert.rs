@@ -46,7 +46,7 @@ async fn batched_insert(
     }
     let params_per_row = spec.columns.len() + 1;
     let max_rows_by_params = (u16::MAX as usize) / params_per_row.max(1);
-    let chunk = max_rows_by_params.min(1000).max(1);
+    let chunk = max_rows_by_params.clamp(1, 1000);
 
     let mut count = 0u64;
     for batch in rows.chunks(chunk) {
