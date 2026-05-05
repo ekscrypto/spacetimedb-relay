@@ -175,6 +175,12 @@ async fn subscribe_handler(
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
     ws.protocols(["v2.bsatn.spacetimedb"])
+        // Per-table SubscribeApplied frames can exceed axum's 64 MiB
+        // default on busy databases (BitCraft regions etc.). Disable
+        // the cap for parity with the upstream client; operators
+        // throttle fan-out by choosing which tables to subscribe to.
+        .max_message_size(usize::MAX)
+        .max_frame_size(usize::MAX)
         .on_upgrade(move |socket| {
             connection::run(
                 socket,

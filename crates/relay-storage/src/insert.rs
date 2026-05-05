@@ -12,9 +12,13 @@ use relay_protocol::{
 use crate::ddl::{TableSpec, BSATN_COLUMN};
 use crate::{DiffOutcome, SnapshotDiff, StorageError};
 
-/// Build and execute a parameterized `INSERT INTO ... VALUES (...)`
-/// for each row, all in a single transaction. The `_bsatn` column is
-/// populated with the raw row bytes for fast downstream forwarding.
+/// Build and execute parameterized multi-row `INSERT INTO ... VALUES
+/// (...), (...), ...` batches in a single transaction. The `_bsatn`
+/// column is populated with the raw row bytes for fast downstream
+/// forwarding. Batching is necessary because per-row inserts blow up
+/// snapshot reconcile time on tables like BitCraft's
+/// `footprint_tile_state` (millions of rows) — every insert is a
+/// network round-trip.
 pub async fn insert_rows(
     pool: &Pool<Postgres>,
     spec: &TableSpec,
@@ -23,45 +27,70 @@ pub async fn insert_rows(
     if rows.is_empty() {
         return Ok(0);
     }
-
-    let sql = build_insert_sql(spec);
-    debug!(
-        target: "relay::storage",
-        n_rows = rows.len(),
-        sql,
-        "insert"
-    );
-
     let mut tx = pool.begin().await?;
-    let mut count = 0u64;
-    for row in rows {
-        let mut q = sqlx::query(&sql);
-        for cell in &row.cells {
-            q = bind_cell(q, cell);
-        }
-        let raw = row.bsatn.as_ref();
-        q = q.bind(raw);
-        let res = q.execute(&mut *tx).await?;
-        count += res.rows_affected();
-    }
+    let count = batched_insert(&mut tx, spec, rows).await?;
     tx.commit().await?;
     Ok(count)
 }
 
-fn build_insert_sql(spec: &TableSpec) -> String {
-    let n = spec.columns.len() + 1;
-    let placeholders: Vec<String> = (1..=n).map(|i| format!("${i}")).collect();
+/// Execute the parameterized multi-row INSERT in chunks small enough
+/// to stay under Postgres' 65535-bind-parameter ceiling, against a
+/// caller-managed transaction.
+async fn batched_insert(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    spec: &TableSpec,
+    rows: &[DecodedRow],
+) -> Result<u64, StorageError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let params_per_row = spec.columns.len() + 1;
+    let max_rows_by_params = (u16::MAX as usize) / params_per_row.max(1);
+    let chunk = max_rows_by_params.min(1000).max(1);
+
+    let mut count = 0u64;
+    for batch in rows.chunks(chunk) {
+        let sql = build_insert_sql(spec, batch.len());
+        debug!(
+            target: "relay::storage",
+            n_rows = batch.len(),
+            params_per_row,
+            "insert batch"
+        );
+        let mut q = sqlx::query(&sql);
+        for row in batch {
+            for cell in &row.cells {
+                q = bind_cell(q, cell);
+            }
+            q = q.bind(row.bsatn.as_ref());
+        }
+        let res = q.execute(&mut **tx).await?;
+        count += res.rows_affected();
+    }
+    Ok(count)
+}
+
+fn build_insert_sql(spec: &TableSpec, n_rows: usize) -> String {
+    debug_assert!(n_rows >= 1);
+    let cols_per_row = spec.columns.len() + 1;
     let mut cols: Vec<String> = spec
         .columns
         .iter()
         .map(|c| format!("\"{}\"", c.postgres_name))
         .collect();
     cols.push(format!("\"{BSATN_COLUMN}\""));
+    let mut rows_sql: Vec<String> = Vec::with_capacity(n_rows);
+    for r in 0..n_rows {
+        let placeholders: Vec<String> = (1..=cols_per_row)
+            .map(|i| format!("${}", r * cols_per_row + i))
+            .collect();
+        rows_sql.push(format!("({})", placeholders.join(", ")));
+    }
     let base = format!(
-        "INSERT INTO \"{}\" ({}) VALUES ({})",
+        "INSERT INTO \"{}\" ({}) VALUES {}",
         spec.postgres_name,
         cols.join(", "),
-        placeholders.join(", ")
+        rows_sql.join(", ")
     );
     if spec.primary_key_columns.is_empty() {
         return base;
@@ -136,23 +165,7 @@ pub async fn apply_diff(
     }
 
     if !inserts_rows.is_empty() {
-        let sql = build_insert_sql(spec);
-        debug!(
-            target: "relay::storage",
-            n_rows = inserts_rows.len(),
-            sql,
-            "insert (diff)"
-        );
-        for row in inserts_rows {
-            let mut q = sqlx::query(&sql);
-            for cell in &row.cells {
-                q = bind_cell(q, cell);
-            }
-            let raw = row.bsatn.as_ref();
-            q = q.bind(raw);
-            let res = q.execute(&mut *tx).await?;
-            outcome.inserted += res.rows_affected();
-        }
+        outcome.inserted += batched_insert(&mut tx, spec, inserts_rows).await?;
     }
 
     tx.commit().await?;
@@ -299,7 +312,16 @@ fn bind_cell<'q>(
         Cell::Real(v) => q.bind(v),
         Cell::DoublePrecision(v) => q.bind(v),
         Cell::Bytea(v) => q.bind(v.as_deref()),
-        Cell::Text(v) => q.bind(v.as_deref()),
+        Cell::Text(v) => match v {
+            // Postgres TEXT can't store 0x00 (NUL) even though it's
+            // valid UTF-8; binding such a string makes the whole
+            // INSERT fail. SpacetimeDB strings carry whatever the
+            // module wrote, including NULs (BitCraft's
+            // `prospecting_desc` is one example). Replace NULs with
+            // the Unicode replacement character so the row lands.
+            Some(s) if s.contains('\0') => q.bind(s.replace('\0', "\u{FFFD}")),
+            _ => q.bind(v.as_deref()),
+        },
         Cell::Jsonb(v) => q.bind(v),
     }
 }

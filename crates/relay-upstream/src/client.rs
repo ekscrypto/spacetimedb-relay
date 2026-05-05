@@ -223,7 +223,21 @@ pub async fn connect_and_run(
         "connecting to upstream"
     );
 
-    let connect_fut = tokio_tungstenite::connect_async(request);
+    // SpacetimeDB v1's `InitialSubscription` carries the entire snapshot
+    // for every subscribed table in a single frame. On large databases
+    // (e.g. BitCraft's `bitcraft-live-{N}` modules with 250 public-user
+    // tables and tens of thousands of rows) that one frame can exceed
+    // tungstenite's 64 MiB default and abort the connection. Disable
+    // the cap — operators control memory pressure by choosing which
+    // tables to subscribe to via `--subscribe-table`. The server side
+    // has no chunking story for v1 InitialSubscription.
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: None,
+        max_frame_size: None,
+        ..Default::default()
+    };
+    let connect_fut =
+        tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false);
     let (ws_stream, response) = tokio::time::timeout(config.connect_timeout, connect_fut)
         .await
         .map_err(|_| UpstreamError::Connect("connect timeout".into()))?
