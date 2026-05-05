@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +44,23 @@ struct Args {
         default_value = "postgres://relay:relay@localhost:5432/relay"
     )]
     database_url: String,
+
+    /// Filesystem directory for in-memory mirror snapshots. The relay
+    /// writes a per-table file under `<data-dir>/<db_prefix>/` every
+    /// `--snapshot-interval` and on graceful shutdown, then reloads
+    /// them on the next startup so a restart doesn't need to refetch
+    /// the whole dataset.
+    #[arg(long, env = "RELAY_DATA_DIR", default_value = "data")]
+    data_dir: PathBuf,
+
+    /// How often the snapshotter persists the in-memory mirror to
+    /// disk, in seconds. Snapshots also fire once on graceful shutdown.
+    #[arg(
+        long = "snapshot-interval",
+        env = "RELAY_SNAPSHOT_INTERVAL",
+        default_value_t = 60
+    )]
+    snapshot_interval_secs: u64,
 
     /// Address to bind the downstream WebSocket server
     #[arg(long, env = "RELAY_BIND", default_value = "0.0.0.0:3001")]
@@ -105,9 +123,29 @@ async fn main() -> Result<()> {
     })
     .await?;
     storage.sync_schema(&schema).await?;
+    match storage.load_snapshots(&args.data_dir) {
+        Ok(stats) if stats.tables_loaded > 0 => tracing::info!(
+            target: "relay",
+            tables = stats.tables_loaded,
+            rows = stats.rows_loaded,
+            "loaded snapshots from disk"
+        ),
+        Ok(_) => tracing::info!(target: "relay", "no usable snapshots on disk"),
+        Err(e) => tracing::warn!(
+            target: "relay",
+            error = %e,
+            "failed to load snapshots; starting empty"
+        ),
+    }
     let storage = Arc::new(storage);
     let schema = Arc::new(schema);
     let engine = Arc::new(Engine::new(schema.clone()));
+
+    let snapshotter = spawn_snapshotter(
+        storage.clone(),
+        args.data_dir.clone(),
+        Duration::from_secs(args.snapshot_interval_secs),
+    );
 
     let server_handle = ServerHandle::new();
     let metrics = Metrics::new();
@@ -163,8 +201,21 @@ async fn main() -> Result<()> {
         }
     });
 
+    let shutdown = std::pin::pin!(shutdown_signal());
+    let mut shutdown = shutdown;
     let mut frames = 0u64;
-    while let Some(event) = event_rx.recv().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = shutdown.as_mut() => {
+                tracing::info!(target: "relay", "received shutdown signal");
+                break;
+            }
+            event = event_rx.recv() => match event {
+                Some(e) => e,
+                None => break,
+            },
+        };
         match event {
             UpstreamEvent::Connected => {
                 metrics.upstream.set_connected();
@@ -217,7 +268,96 @@ async fn main() -> Result<()> {
     }
 
     upstream_handle.abort();
+    snapshotter.shutdown().await;
     Ok(())
+}
+
+struct SnapshotterHandle {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl SnapshotterHandle {
+    async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.join.await;
+    }
+}
+
+fn spawn_snapshotter(
+    storage: Arc<Storage>,
+    data_dir: PathBuf,
+    interval: Duration,
+) -> SnapshotterHandle {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let join = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    write_snapshots_blocking(&storage, &data_dir).await;
+                }
+                _ = &mut shutdown_rx => {
+                    tracing::info!(target: "relay::storage", "snapshotter: writing final snapshot");
+                    write_snapshots_blocking(&storage, &data_dir).await;
+                    break;
+                }
+            }
+        }
+    });
+    SnapshotterHandle {
+        shutdown: Some(shutdown_tx),
+        join,
+    }
+}
+
+async fn write_snapshots_blocking(storage: &Arc<Storage>, data_dir: &std::path::Path) {
+    let storage = storage.clone();
+    let data_dir = data_dir.to_path_buf();
+    let res = tokio::task::spawn_blocking(move || storage.write_snapshots(&data_dir)).await;
+    match res {
+        Ok(Ok(stats)) => {
+            if stats.tables_written > 0 {
+                tracing::info!(
+                    target: "relay::storage",
+                    tables = stats.tables_written,
+                    rows = stats.rows_written,
+                    "snapshot written"
+                );
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(target: "relay::storage", error = %e, "snapshot write failed"),
+        Err(e) => tracing::error!(target: "relay::storage", error = %e, "snapshot task panicked"),
+    }
+}
+
+/// Resolve the first SIGINT or SIGTERM into a future the main loop can
+/// `.await`. Falls back to ctrl_c-only on non-Unix.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "relay", error = %e, "SIGTERM listener failed; using ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn apply_transaction_update(
