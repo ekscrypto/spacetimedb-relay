@@ -6,9 +6,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use mimalloc::MiMalloc;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use url::Url;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use relay_engine::Engine;
 use relay_protocol::api_messages::websocket::common::{ByteListLen, RowListLen};
@@ -88,8 +92,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,relay=debug")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -183,81 +186,142 @@ async fn main() -> Result<()> {
         protocol: args.upstream_protocol,
     };
 
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (cmd_tx, cmd_rx) = mpsc::channel(32);
-    let upstream_handle = tokio::spawn(async move {
-        if let Err(e) = connect_and_run(cfg, event_tx, cmd_rx).await {
-            tracing::error!(target: "relay::upstream", error = %e, "upstream task ended with error");
-        }
-    });
-
     let shutdown = std::pin::pin!(shutdown_signal());
     let mut shutdown = shutdown;
     let mut frames = 0u64;
-    loop {
-        let event = tokio::select! {
-            biased;
-            _ = shutdown.as_mut() => {
-                tracing::info!(target: "relay", "received shutdown signal");
-                break;
+
+    // Reconnect with exponential backoff. The in-memory mirror, engine
+    // state, and snapshotter all outlive a single upstream session, so
+    // the dashboard keeps serving the last known data while we're
+    // disconnected. Re-Subscribe is automatic: the upstream sends a
+    // fresh InitialConnection on reconnect and handle_server_message
+    // replies with Subscribe.
+    //
+    // Backoff resets only when a session stayed up for STABLE_THRESHOLD.
+    // BitCraft's "accept-then-RST" auth-rejection takes <1s — treating
+    // such flaps as success would hammer the upstream forever.
+    //
+    // Note: we don't refetch the schema across reconnects. The engine
+    // captured an Arc<MirroredSchema> at construction; live reload
+    // would need a bigger refactor. Mid-run schema drift will surface
+    // as decode warnings; restart the relay to pick up the new shape.
+    const BACKOFF_MAX_SECS: u64 = 30;
+    const STABLE_THRESHOLD: Duration = Duration::from_secs(5);
+    let mut backoff_secs: u64 = 1;
+
+    enum InnerExit {
+        Shutdown,
+        UpstreamGone,
+        FrameLimitReached,
+    }
+
+    'reconnect: loop {
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let attempt_cfg = cfg.clone();
+        let upstream_handle = tokio::spawn(async move {
+            if let Err(e) = connect_and_run(attempt_cfg, event_tx, cmd_rx).await {
+                tracing::error!(target: "relay::upstream", error = %e, "upstream task ended with error");
             }
-            event = event_rx.recv() => match event {
-                Some(e) => e,
-                None => break,
-            },
+        });
+
+        let mut connected_at: Option<std::time::Instant> = None;
+        let exit_reason = loop {
+            let event = tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => break InnerExit::Shutdown,
+                event = event_rx.recv() => match event {
+                    Some(e) => e,
+                    None => break InnerExit::UpstreamGone,
+                },
+            };
+            match event {
+                UpstreamEvent::Connected => {
+                    metrics.upstream.set_connected();
+                    connected_at = Some(std::time::Instant::now());
+                    tracing::info!(target: "relay", "upstream connected");
+                }
+                UpstreamEvent::Frame(frame) => {
+                    frames += 1;
+                    metrics.upstream.record_frame(frame.bsatn.len() as u64);
+                    let tag = frame.server_tag();
+                    let protocol = frame.protocol;
+                    match frame.decode() {
+                        Ok(message) => {
+                            handle_server_message(
+                                message,
+                                &subscribe_tables,
+                                &cmd_tx,
+                                &storage,
+                                &schema,
+                                &engine,
+                                &server_handle,
+                                &metrics.upstream,
+                            )
+                            .await?
+                        }
+                        Err(e) => tracing::warn!(
+                            target: "relay",
+                            tag,
+                            kind = server_tag_name(tag, protocol),
+                            error = %e,
+                            "failed to decode ServerMessage"
+                        ),
+                    }
+                    if let Some(limit) = frame_limit {
+                        if frames >= limit {
+                            tracing::info!(target: "relay", frames, "frame limit reached, exiting");
+                            let _ = cmd_tx.send(UpstreamCommand::Shutdown).await;
+                            break InnerExit::FrameLimitReached;
+                        }
+                    }
+                }
+                UpstreamEvent::Ping => {
+                    metrics.upstream.record_ping();
+                }
+                UpstreamEvent::Disconnected { reason } => {
+                    metrics.upstream.set_disconnected();
+                    tracing::warn!(target: "relay", %reason, "upstream disconnected");
+                    break InnerExit::UpstreamGone;
+                }
+            }
         };
-        match event {
-            UpstreamEvent::Connected => {
-                metrics.upstream.set_connected();
-                tracing::info!(target: "relay", "upstream connected");
+
+        metrics.upstream.set_disconnected();
+        let _ = cmd_tx.send(UpstreamCommand::Shutdown).await;
+        drop(cmd_tx);
+        let _ = upstream_handle.await;
+
+        match exit_reason {
+            InnerExit::Shutdown => {
+                tracing::info!(target: "relay", "received shutdown signal");
+                break 'reconnect;
             }
-            UpstreamEvent::Frame(frame) => {
-                frames += 1;
-                metrics.upstream.record_frame(frame.bsatn.len() as u64);
-                let tag = frame.server_tag();
-                let protocol = frame.protocol;
-                match frame.decode() {
-                    Ok(message) => {
-                        handle_server_message(
-                            message,
-                            &subscribe_tables,
-                            &cmd_tx,
-                            &storage,
-                            &schema,
-                            &engine,
-                            &server_handle,
-                            &metrics.upstream,
-                        )
-                        .await?
-                    }
-                    Err(e) => tracing::warn!(
-                        target: "relay",
-                        tag,
-                        kind = server_tag_name(tag, protocol),
-                        error = %e,
-                        "failed to decode ServerMessage"
-                    ),
+            InnerExit::FrameLimitReached => break 'reconnect,
+            InnerExit::UpstreamGone => {
+                let stayed_up = connected_at.map(|t| t.elapsed()).unwrap_or_default();
+                if stayed_up >= STABLE_THRESHOLD {
+                    backoff_secs = 1;
                 }
-                if let Some(limit) = frame_limit {
-                    if frames >= limit {
-                        tracing::info!(target: "relay", frames, "frame limit reached, exiting");
-                        let _ = cmd_tx.send(UpstreamCommand::Shutdown).await;
-                        break;
+                let sleep_for = Duration::from_secs(backoff_secs);
+                backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+                tracing::warn!(
+                    target: "relay",
+                    backoff_secs = sleep_for.as_secs(),
+                    stayed_up_ms = stayed_up.as_millis() as u64,
+                    "upstream gone — reconnecting after backoff"
+                );
+                tokio::select! {
+                    _ = shutdown.as_mut() => {
+                        tracing::info!(target: "relay", "received shutdown signal during backoff");
+                        break 'reconnect;
                     }
+                    _ = tokio::time::sleep(sleep_for) => {}
                 }
-            }
-            UpstreamEvent::Ping => {
-                metrics.upstream.record_ping();
-            }
-            UpstreamEvent::Disconnected { reason } => {
-                metrics.upstream.set_disconnected();
-                tracing::warn!(target: "relay", %reason, "upstream disconnected");
-                break;
             }
         }
     }
 
-    upstream_handle.abort();
     snapshotter.shutdown().await;
     Ok(())
 }
@@ -371,36 +435,38 @@ async fn apply_transaction_update(
                 continue;
             };
 
+            // Cells are only read by `engine.route_table_diff`. If no
+            // downstream client subscribes to this table, skip the
+            // BSATN→Cell decode entirely — storage's `pk_key` walks
+            // raw bytes. Big CPU win on high-churn tables nobody
+            // currently watches (typical for a freshly-started relay).
+            let decode_cells = engine.has_table_subscribers(upstream_name);
+            let decode_or_empty = |r: &bytes::Bytes| -> Vec<relay_protocol::Cell> {
+                if decode_cells {
+                    decode_row(r, fields, schema).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
+
             let mut deletes: Vec<DecodedRow> = Vec::new();
             let mut inserts_rows: Vec<DecodedRow> = Vec::new();
             for rows in table.rows.iter() {
                 match rows {
                     TableUpdateRows::PersistentTable(p) => {
                         for r in p.deletes.into_iter() {
-                            match decode_row(&r, fields, schema) {
-                                Ok(cells) => deletes.push(DecodedRow { cells, bsatn: r }),
-                                Err(e) => {
-                                    tracing::warn!(target: "relay", error = %e, "delete decode failed")
-                                }
-                            }
+                            let cells = decode_or_empty(&r);
+                            deletes.push(DecodedRow { cells, bsatn: r });
                         }
                         for r in p.inserts.into_iter() {
-                            match decode_row(&r, fields, schema) {
-                                Ok(cells) => inserts_rows.push(DecodedRow { cells, bsatn: r }),
-                                Err(e) => {
-                                    tracing::warn!(target: "relay", error = %e, "insert decode failed")
-                                }
-                            }
+                            let cells = decode_or_empty(&r);
+                            inserts_rows.push(DecodedRow { cells, bsatn: r });
                         }
                     }
                     TableUpdateRows::EventTable(e) => {
                         for r in e.events.into_iter() {
-                            match decode_row(&r, fields, schema) {
-                                Ok(cells) => inserts_rows.push(DecodedRow { cells, bsatn: r }),
-                                Err(e) => {
-                                    tracing::warn!(target: "relay", error = %e, "event decode failed")
-                                }
-                            }
+                            let cells = decode_or_empty(&r);
+                            inserts_rows.push(DecodedRow { cells, bsatn: r });
                         }
                     }
                 }
@@ -410,7 +476,7 @@ async fn apply_transaction_update(
             }
             upstream_metrics.record_rows(inserts_rows.len() as u64, deletes.len() as u64);
             match storage.apply_diff(upstream_name, &deletes, &inserts_rows) {
-                Ok(o) => tracing::info!(
+                Ok(o) => tracing::debug!(
                     target: "relay",
                     table = %upstream_name,
                     deleted = o.deleted,
@@ -645,7 +711,7 @@ async fn handle_server_message(
             }
         }
         ServerMessage::TransactionUpdate(tu) => {
-            tracing::info!(
+            tracing::debug!(
                 target: "relay",
                 n_query_sets = tu.query_sets.len(),
                 "TransactionUpdate"

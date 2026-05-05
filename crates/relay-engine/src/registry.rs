@@ -102,6 +102,16 @@ impl Registry {
         self.inner.read().clients.len()
     }
 
+    /// Cheap check used by the per-tx hot path to skip BSATN row
+    /// decoding when no client cares about this table.
+    pub fn has_table_subscribers(&self, table: &str) -> bool {
+        self.inner
+            .read()
+            .by_table
+            .get(table)
+            .is_some_and(|v| !v.is_empty())
+    }
+
     pub fn n_qsets(&self, client: ClientId) -> usize {
         self.inner
             .read()
