@@ -124,6 +124,12 @@ impl Engine {
         self.registry.n_qsets(client)
     }
 
+    /// Per-tx hot-path predicate: if false, the caller can skip
+    /// decoding row cells since the engine will route nothing.
+    pub fn has_table_subscribers(&self, table: &str) -> bool {
+        self.registry.has_table_subscribers(table)
+    }
+
     /// Hot path: turn one upstream table update into the per-client
     /// filtered diffs to forward downstream.
     ///
