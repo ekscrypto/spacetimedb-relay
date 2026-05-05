@@ -59,10 +59,20 @@ pub async fn open_connection(host: &Url, database: &str) -> Result<Conn> {
         .headers_mut()
         .insert(SEC_WEBSOCKET_PROTOCOL, SUBPROTOCOL.parse()?);
 
-    let (stream, _resp) =
-        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
-            .await
-            .map_err(|_| anyhow!("connect timeout"))??;
+    // Match the relay-upstream client: the v1 InitialSubscription path
+    // can produce per-table snapshots that comfortably exceed
+    // tungstenite's 64 MiB default on busy databases.
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: None,
+        max_frame_size: None,
+        ..Default::default()
+    };
+    let (stream, _resp) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false),
+    )
+    .await
+    .map_err(|_| anyhow!("connect timeout"))??;
     Ok(stream)
 }
 
