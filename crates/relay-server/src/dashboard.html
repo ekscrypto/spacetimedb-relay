@@ -181,28 +181,52 @@ function renderDownstream(snap, nowMs) {
   `;
 }
 
+const POLL_MS = 2000;
 let lastGoodAt = null;
+let lostAt = null;
+let lastError = null;
+let nextTickAt = 0;
+
+function paintFailure() {
+  if (lostAt === null) return;
+  const lostStr = new Date(lostAt).toLocaleTimeString();
+  const retryIn = Math.max(0, Math.ceil((nextTickAt - Date.now()) / 1000));
+  const since = lastGoodAt
+    ? `last reached ${fmtAge(lastGoodAt, Date.now())}`
+    : "never reached since page load";
+  document.getElementById("meta").innerHTML =
+    `<span class="down">Lost connectivity to relay at ${escape(lostStr)}</span> — ` +
+    `retrying in ${retryIn}s` +
+    `<br><span class="dim">${since} // ${escape(lastError || "")}</span>`;
+}
+
 async function tick() {
   try {
     const r = await fetch("/dashboard.json", { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const snap = await r.json();
     const now = snap.now_ms;
+    lostAt = null;
+    lastError = null;
     lastGoodAt = now;
     document.getElementById("meta").textContent =
       "refreshed " + new Date(now).toLocaleTimeString() + " // window: 1m / 5m / 30m";
     document.getElementById("upstream").innerHTML = renderUpstream(snap.upstream, now);
     document.getElementById("downstream").innerHTML = renderDownstream(snap, now);
   } catch (e) {
-    const stale = lastGoodAt
-      ? `last good ${fmtAge(lastGoodAt, Date.now())}`
-      : "no successful fetch yet";
-    document.getElementById("meta").innerHTML =
-      `<span class="down">fetch failed: ${escape(e.message)}</span> &nbsp; <span class="dim">${stale}; auto-retrying every 2s</span>`;
+    if (lostAt === null) lostAt = Date.now();
+    lastError = e.message;
+    paintFailure();
+  } finally {
+    nextTickAt = Date.now() + POLL_MS;
+    setTimeout(tick, POLL_MS);
   }
 }
 tick();
-setInterval(tick, 2000);
+
+// While the relay is unreachable, tick down the "retrying in Ns" line
+// once a second so the countdown is honest. No-op while connected.
+setInterval(paintFailure, 1000);
 </script>
 </body>
 </html>
