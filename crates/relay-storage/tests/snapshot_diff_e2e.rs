@@ -156,7 +156,7 @@ async fn snapshot_diff_reconciles_gap_against_real_postgres() {
         "first snapshot should insert all 3 rows"
     );
 
-    let stored = storage.fetch_all_bsatn("thing").await.unwrap();
+    let stored = storage.fetch_all_bsatn("thing").unwrap();
     assert_eq!(stored.len(), 3, "PG should have 3 rows after phase 1");
 
     // ---- Phase 2: simulated gap — relay was disconnected, upstream
@@ -192,7 +192,7 @@ async fn snapshot_diff_reconciles_gap_against_real_postgres() {
     );
 
     // PG state should reflect the merged snapshot.
-    let stored = storage.fetch_all_bsatn("thing").await.unwrap();
+    let stored = storage.fetch_all_bsatn("thing").unwrap();
     let mut state: Vec<(i32, String)> = stored
         .iter()
         .map(|b| extract_id_payload(b, &fields, &schema))
