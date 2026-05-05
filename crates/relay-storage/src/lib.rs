@@ -14,6 +14,7 @@
 
 mod ddl;
 mod insert;
+mod memstore;
 mod meta;
 
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ use bytes::Bytes;
 use relay_protocol::{DecodedRow, MirroredField, MirroredSchema};
 
 pub use ddl::{ColumnSpec, TableSpec};
+pub use memstore::MemStore;
 pub use meta::SyncOutcome;
 
 #[derive(Debug, Error)]
@@ -51,6 +53,7 @@ pub struct Storage {
     upstream_host: String,
     upstream_database: String,
     table_specs: Arc<RwLock<HashMap<String, TableSpec>>>,
+    mem: Arc<MemStore>,
 }
 
 impl Storage {
@@ -74,6 +77,7 @@ impl Storage {
             upstream_host: config.upstream_host,
             upstream_database: config.upstream_database,
             table_specs: Arc::new(RwLock::new(HashMap::new())),
+            mem: Arc::new(MemStore::new()),
         })
     }
 
@@ -90,6 +94,7 @@ impl Storage {
             &table_specs,
         )
         .await?;
+        self.mem.sync_schema(Arc::new(schema.clone()), &table_specs);
         match &outcome {
             SyncOutcome::Unchanged => {
                 info!(target: "relay::storage", "schema unchanged");
@@ -133,6 +138,10 @@ impl Storage {
         self.table_specs.read().get(upstream_table).cloned()
     }
 
+    pub fn mem(&self) -> &Arc<MemStore> {
+        &self.mem
+    }
+
     /// Insert the given decoded rows into the named upstream table.
     /// Returns the number of rows inserted. Uses a single transaction.
     pub async fn insert_rows(
@@ -143,7 +152,9 @@ impl Storage {
         let spec = self
             .table_spec(upstream_table)
             .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
-        insert::insert_rows(&self.pool, &spec, rows).await
+        let count = insert::insert_rows(&self.pool, &spec, rows).await?;
+        self.mem.insert_rows(upstream_table, rows)?;
+        Ok(count)
     }
 
     /// Apply a `TransactionUpdate` diff for one table: delete rows
@@ -158,7 +169,9 @@ impl Storage {
         let spec = self
             .table_spec(upstream_table)
             .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
-        insert::apply_diff(&self.pool, &spec, deletes, inserts_rows).await
+        let outcome = insert::apply_diff(&self.pool, &spec, deletes, inserts_rows).await?;
+        self.mem.apply_diff(upstream_table, deletes, inserts_rows)?;
+        Ok(outcome)
     }
 
     /// Reconcile the current PG mirror against an upstream snapshot
@@ -177,7 +190,10 @@ impl Storage {
         let spec = self
             .table_spec(upstream_table)
             .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
-        insert::apply_snapshot_diff(&self.pool, &spec, incoming, fields, schema).await
+        let pg_diff =
+            insert::apply_snapshot_diff(&self.pool, &spec, incoming, fields, schema).await?;
+        self.mem.apply_snapshot_diff(upstream_table, incoming)?;
+        Ok(pg_diff)
     }
 
     /// Fetch the raw BSATN bytes of every row in the given upstream
