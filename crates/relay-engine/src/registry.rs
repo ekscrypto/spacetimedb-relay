@@ -101,6 +101,15 @@ impl Registry {
     pub fn n_clients(&self) -> usize {
         self.inner.read().clients.len()
     }
+
+    pub fn n_qsets(&self, client: ClientId) -> usize {
+        self.inner
+            .read()
+            .clients
+            .get(&client)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
 }
 
 fn remove_from_table_index(

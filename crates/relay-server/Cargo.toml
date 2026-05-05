@@ -17,6 +17,7 @@ futures-util.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 http.workspace = true
+parking_lot.workspace = true
 rand.workspace = true
 
 serde.workspace = true

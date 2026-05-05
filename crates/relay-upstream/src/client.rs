@@ -133,7 +133,13 @@ impl UpstreamFrame {
 pub enum UpstreamEvent {
     Connected,
     Frame(UpstreamFrame),
-    Disconnected { reason: String },
+    /// Inbound WS Ping or Pong (keep-alive). Tungstenite still answers
+    /// Pings automatically; we only surface them so the relay can
+    /// expose "last keep-alive" on the dashboard.
+    Ping,
+    Disconnected {
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -311,7 +317,10 @@ pub async fn connect_and_run(
                         info!(target: "relay::upstream", %reason, "upstream closed");
                         return Ok(());
                     }
-                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                    Message::Ping(_) | Message::Pong(_) => {
+                        let _ = events_tx.send(UpstreamEvent::Ping).await;
+                    }
+                    Message::Frame(_) => {}
                 }
             }
         }

@@ -120,6 +120,10 @@ impl Engine {
         &self.schema
     }
 
+    pub fn client_qset_count(&self, client: ClientId) -> usize {
+        self.registry.n_qsets(client)
+    }
+
     /// Hot path: turn one upstream table update into the per-client
     /// filtered diffs to forward downstream.
     ///

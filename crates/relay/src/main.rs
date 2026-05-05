@@ -13,6 +13,7 @@ use relay_engine::Engine;
 use relay_protocol::api_messages::websocket::common::{ByteListLen, RowListLen};
 use relay_protocol::api_messages::websocket::v2::ServerMessage;
 use relay_protocol::{decode_row, parse_schema, DecodedRow, MirroredSchema, MirroredType};
+use relay_server::metrics::{Metrics, UpstreamMetrics};
 use relay_server::ServerHandle;
 use relay_storage::{Storage, StorageConfig};
 use relay_upstream::{
@@ -109,6 +110,7 @@ async fn main() -> Result<()> {
     let engine = Arc::new(Engine::new(schema.clone()));
 
     let server_handle = ServerHandle::new();
+    let metrics = Metrics::new();
     let bind_addr: std::net::SocketAddr = args
         .bind
         .parse()
@@ -118,8 +120,10 @@ async fn main() -> Result<()> {
         let engine = engine.clone();
         let database = args.database.clone();
         let handle = server_handle.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
-            if let Err(e) = relay_server::serve(bind_addr, storage, engine, database, handle).await
+            if let Err(e) =
+                relay_server::serve(bind_addr, storage, engine, database, handle, metrics).await
             {
                 tracing::error!(target: "relay::server", error = %e, "downstream server exited");
             }
@@ -163,10 +167,12 @@ async fn main() -> Result<()> {
     while let Some(event) = event_rx.recv().await {
         match event {
             UpstreamEvent::Connected => {
+                metrics.upstream.set_connected();
                 tracing::info!(target: "relay", "upstream connected");
             }
             UpstreamEvent::Frame(frame) => {
                 frames += 1;
+                metrics.upstream.record_frame(frame.bsatn.len() as u64);
                 let tag = frame.server_tag();
                 let protocol = frame.protocol;
                 match frame.decode() {
@@ -179,6 +185,7 @@ async fn main() -> Result<()> {
                             &schema,
                             &engine,
                             &server_handle,
+                            &metrics.upstream,
                         )
                         .await?
                     }
@@ -198,7 +205,11 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            UpstreamEvent::Ping => {
+                metrics.upstream.record_ping();
+            }
             UpstreamEvent::Disconnected { reason } => {
+                metrics.upstream.set_disconnected();
                 tracing::warn!(target: "relay", %reason, "upstream disconnected");
                 break;
             }
@@ -215,6 +226,7 @@ async fn apply_transaction_update(
     schema: &Arc<MirroredSchema>,
     engine: &Arc<Engine>,
     server_handle: &ServerHandle,
+    upstream_metrics: &UpstreamMetrics,
 ) {
     use relay_protocol::api_messages::websocket::v2::TableUpdateRows;
 
@@ -266,6 +278,7 @@ async fn apply_transaction_update(
             if deletes.is_empty() && inserts_rows.is_empty() {
                 continue;
             }
+            upstream_metrics.record_rows(inserts_rows.len() as u64, deletes.len() as u64);
             match storage
                 .apply_diff(upstream_name, &deletes, &inserts_rows)
                 .await
@@ -300,6 +313,7 @@ async fn reconcile_table_snapshot(
     schema: &std::sync::Arc<MirroredSchema>,
     engine: &std::sync::Arc<Engine>,
     server_handle: &ServerHandle,
+    upstream_metrics: &UpstreamMetrics,
 ) -> Result<()> {
     let table_meta = schema
         .tables
@@ -333,6 +347,7 @@ async fn reconcile_table_snapshot(
     let diff = storage
         .apply_snapshot_diff(upstream_table, &decoded, fields, schema)
         .await?;
+    upstream_metrics.record_rows(diff.inserts.len() as u64, diff.deletes.len() as u64);
     tracing::info!(
         target: "relay",
         table = %upstream_table,
@@ -431,6 +446,7 @@ fn describe_type(ty: &MirroredType, schema: &MirroredSchema) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_server_message(
     message: ServerMessage,
     subscribe_tables: &[String],
@@ -439,6 +455,7 @@ async fn handle_server_message(
     schema: &Arc<MirroredSchema>,
     engine: &Arc<Engine>,
     server_handle: &ServerHandle,
+    upstream_metrics: &UpstreamMetrics,
 ) -> Result<()> {
     match message {
         ServerMessage::InitialConnection(ic) => {
@@ -489,6 +506,7 @@ async fn handle_server_message(
                     schema,
                     engine,
                     server_handle,
+                    upstream_metrics,
                 )
                 .await
                 {
@@ -507,7 +525,15 @@ async fn handle_server_message(
                 n_query_sets = tu.query_sets.len(),
                 "TransactionUpdate"
             );
-            apply_transaction_update(&tu, storage, schema, engine, server_handle).await;
+            apply_transaction_update(
+                &tu,
+                storage,
+                schema,
+                engine,
+                server_handle,
+                upstream_metrics,
+            )
+            .await;
         }
         ServerMessage::ReducerResult(rr) => {
             tracing::info!(

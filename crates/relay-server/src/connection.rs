@@ -15,6 +15,7 @@ use relay_protocol::sats::bsatn;
 use relay_storage::Storage;
 
 use crate::bsatn_emit;
+use crate::metrics::{ClientMetrics, Metrics};
 use crate::ServerHandle;
 
 pub async fn run(
@@ -23,13 +24,16 @@ pub async fn run(
     storage: Arc<Storage>,
     engine: Arc<Engine>,
     handle: ServerHandle,
+    metrics: Arc<Metrics>,
 ) {
     let (mut tx, mut rx) = socket.split();
     let (identity, connection_id) = bsatn_emit::random_identity_and_connection();
     let (client_id, mut frames) = handle.register();
+    let client_metrics = metrics.register_client(client_id, addr.to_string());
     let _guard = ConnectionGuard {
         engine: engine.clone(),
         handle: handle.clone(),
+        metrics: metrics.clone(),
         client_id,
     };
     let downstream_identity = identity;
@@ -44,7 +48,7 @@ pub async fn run(
     );
 
     let initial = bsatn_emit::initial_connection(identity, connection_id, "");
-    if let Err(e) = send(&mut tx, &initial).await {
+    if let Err(e) = send(&mut tx, &initial, &client_metrics, 0, 0).await {
         warn!(target: "relay::server", error = %e, client = %addr, "send InitialConnection failed");
         return;
     }
@@ -70,11 +74,14 @@ pub async fn run(
                             client_id,
                             downstream_identity,
                             &mut tx,
+                            &client_metrics,
                         )
                         .await
                         {
                             warn!(target: "relay::server", error = %e, client = %addr, "handle frame failed");
                         }
+                        client_metrics
+                            .set_subscriptions(engine.client_qset_count(client_id));
                     }
                     Message::Close(_) => {
                         info!(target: "relay::server", client = %addr, "client closed");
@@ -85,13 +92,15 @@ pub async fn run(
             }
             frame = frames.recv() => {
                 let Some(frame) = frame else { break };
+                let inserts = frame.inserts.len() as u64;
+                let deletes = frame.deletes.len() as u64;
                 let msg = bsatn_emit::transaction_update_for_table(
                     frame.qset.0,
                     frame.table.as_ref(),
                     &frame.deletes,
                     &frame.inserts,
                 );
-                if let Err(e) = send(&mut tx, &msg).await {
+                if let Err(e) = send(&mut tx, &msg, &client_metrics, inserts, deletes).await {
                     warn!(target: "relay::server", error = %e, client = %addr, "send TransactionUpdate failed");
                     break;
                 }
@@ -109,6 +118,7 @@ async fn handle_client_frame(
     client_id: relay_engine::ClientId,
     sender: relay_engine::Identity,
     tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    client_metrics: &Arc<ClientMetrics>,
 ) -> Result<(), HandleError> {
     if data.is_empty() {
         return Err(HandleError::Empty);
@@ -135,7 +145,7 @@ async fn handle_client_frame(
                             sub.query_set_id.id,
                             &compile_error_message(&e),
                         );
-                        send(tx, &err).await?;
+                        send(tx, &err, client_metrics, 0, 0).await?;
                         return Ok(());
                     }
                 };
@@ -146,27 +156,35 @@ async fn handle_client_frame(
                     .map_err(|e| HandleError::Engine(e.to_string()))?;
                 let qset = QuerySetId(sub.query_set_id.id);
                 engine.subscribe(client_id, qset, compiled);
+                let snapshot_rows = snapshot.len() as u64;
                 let applied = bsatn_emit::subscribe_applied(
                     sub.request_id,
                     sub.query_set_id.id,
                     table_name.as_ref(),
                     &snapshot,
                 );
-                send(tx, &applied).await?;
+                send(tx, &applied, client_metrics, snapshot_rows, 0).await?;
             }
         }
         ClientMessage::Unsubscribe(unsub) => {
             engine.unsubscribe(client_id, QuerySetId(unsub.query_set_id.id));
         }
-        ClientMessage::OneOffQuery(_)
-        | ClientMessage::CallReducer(_)
-        | ClientMessage::CallProcedure(_) => {
+        ClientMessage::OneOffQuery(_) => {
+            client_metrics.record_oneoff();
             let err = bsatn_emit::subscription_error(
                 None,
                 0,
                 "the relay only supports Subscribe/Unsubscribe; call reducers directly on SpacetimeDB",
             );
-            send(tx, &err).await?;
+            send(tx, &err, client_metrics, 0, 0).await?;
+        }
+        ClientMessage::CallReducer(_) | ClientMessage::CallProcedure(_) => {
+            let err = bsatn_emit::subscription_error(
+                None,
+                0,
+                "the relay only supports Subscribe/Unsubscribe; call reducers directly on SpacetimeDB",
+            );
+            send(tx, &err, client_metrics, 0, 0).await?;
         }
     }
     Ok(())
@@ -175,11 +193,16 @@ async fn handle_client_frame(
 async fn send(
     tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     msg: &ServerMessage,
+    metrics: &Arc<ClientMetrics>,
+    rows_inserted: u64,
+    rows_deleted: u64,
 ) -> Result<(), HandleError> {
     let bytes = bsatn_emit::frame(msg).map_err(|e| HandleError::Encode(e.to_string()))?;
+    let len = bytes.len() as u64;
     tx.send(Message::Binary(bytes))
         .await
         .map_err(|e| HandleError::Send(e.to_string()))?;
+    metrics.record_outbound(len, rows_inserted, rows_deleted);
     Ok(())
 }
 
@@ -215,6 +238,7 @@ fn compile_error_message(err: &CompileError) -> String {
 struct ConnectionGuard {
     engine: Arc<Engine>,
     handle: ServerHandle,
+    metrics: Arc<Metrics>,
     client_id: relay_engine::ClientId,
 }
 
@@ -222,5 +246,6 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.engine.drop_client(self.client_id);
         self.handle.deregister(self.client_id);
+        self.metrics.deregister_client(self.client_id);
     }
 }

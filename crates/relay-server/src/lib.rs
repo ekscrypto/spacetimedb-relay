@@ -11,6 +11,8 @@
 
 mod bsatn_emit;
 mod connection;
+mod dashboard;
+pub mod metrics;
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
@@ -28,6 +30,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use relay_engine::{ClientId, ClientTableDiff, Engine, QuerySetId};
+
+use crate::metrics::Metrics;
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -122,6 +126,7 @@ struct AppState {
     engine: Arc<Engine>,
     handle: ServerHandle,
     upstream_database: String,
+    metrics: Arc<Metrics>,
 }
 
 pub async fn serve(
@@ -130,15 +135,19 @@ pub async fn serve(
     engine: Arc<Engine>,
     upstream_database: String,
     handle: ServerHandle,
+    metrics: Arc<Metrics>,
 ) -> Result<(), ServerError> {
     let state = AppState {
         storage,
         engine,
         handle,
         upstream_database,
+        metrics,
     };
     let app = Router::new()
         .route("/v1/database/:name/subscribe", get(subscribe_handler))
+        .route("/dashboard", get(dashboard::page))
+        .route("/dashboard.json", get(dashboard::data))
         .with_state(state);
     let listener = TcpListener::bind(bind).await?;
     info!(target: "relay::server", %bind, "downstream server listening");
@@ -167,6 +176,13 @@ async fn subscribe_handler(
     }
     ws.protocols(["v2.bsatn.spacetimedb"])
         .on_upgrade(move |socket| {
-            connection::run(socket, addr, state.storage, state.engine, state.handle)
+            connection::run(
+                socket,
+                addr,
+                state.storage,
+                state.engine,
+                state.handle,
+                state.metrics,
+            )
         })
 }

@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>spacetimedb-relay :: dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 16px;
+    max-width: 1100px;
+  }
+  h1 { font-size: 14px; margin: 0 0 4px 0; }
+  h2 { font-size: 13px; margin: 16px 0 4px 0; border-top: 1px solid; padding-top: 4px; }
+  .meta { opacity: 0.65; margin-bottom: 8px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td {
+    text-align: left;
+    padding: 2px 10px 2px 0;
+    white-space: nowrap;
+    vertical-align: top;
+  }
+  th { font-weight: normal; opacity: 0.65; border-bottom: 1px solid; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th.num { text-align: right; }
+  .ok   { color: #1a7f1a; }
+  .down { color: #c33; }
+  .dim  { opacity: 0.55; }
+  .empty { opacity: 0.55; padding: 6px 0; }
+  pre { margin: 0; }
+</style>
+</head>
+<body>
+<h1>spacetimedb-relay // dashboard</h1>
+<div class="meta" id="meta">loading&hellip;</div>
+
+<h2>UPSTREAM</h2>
+<div id="upstream"></div>
+
+<h2>DOWNSTREAM</h2>
+<div id="downstream"></div>
+
+<script>
+const fmtBytes = (n) => {
+  if (n < 1024) return n + " B";
+  const u = ["KB","MB","GB","TB"];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2) + " " + u[i];
+};
+const fmtBps = (bytesInSecs, secs) => {
+  if (secs <= 0) return "—";
+  const bps = (bytesInSecs * 8) / secs;
+  if (bps < 1000) return bps.toFixed(0) + " bps";
+  if (bps < 1_000_000) return (bps / 1000).toFixed(1) + " kbps";
+  if (bps < 1_000_000_000) return (bps / 1_000_000).toFixed(2) + " Mbps";
+  return (bps / 1_000_000_000).toFixed(2) + " Gbps";
+};
+const fmtAge = (ms, nowMs) => {
+  if (!ms) return "—";
+  const s = Math.max(0, Math.round((nowMs - ms) / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60) + "s ago";
+  return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m ago";
+};
+const fmtUptime = (sinceMs, nowMs) => {
+  if (!sinceMs) return "—";
+  const s = Math.max(0, Math.floor((nowMs - sinceMs) / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return (h ? h + "h " : "") + (h || m ? m + "m " : "") + sec + "s";
+};
+const escape = (s) => String(s).replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+}[c]));
+
+const num = (n) => (n || 0).toLocaleString();
+
+function renderUpstream(u, nowMs) {
+  const status = u.connected
+    ? `<span class="ok">CONNECTED</span> &nbsp; uptime ${fmtUptime(u.connected_since_ms, nowMs)}`
+    : `<span class="down">DISCONNECTED</span>`;
+  const rows = [
+    ["bytes received",
+      fmtBytes(u.bytes_in.last_1m), fmtBytes(u.bytes_in.last_5m), fmtBytes(u.bytes_in.last_30m)],
+    ["avg bps",
+      fmtBps(u.bytes_in.last_1m, 60), fmtBps(u.bytes_in.last_5m, 300), fmtBps(u.bytes_in.last_30m, 1800)],
+    ["frames",
+      num(u.frames_in.last_1m), num(u.frames_in.last_5m), num(u.frames_in.last_30m)],
+    ["rows inserted",
+      num(u.rows_inserted.last_1m), num(u.rows_inserted.last_5m), num(u.rows_inserted.last_30m)],
+    ["rows deleted",
+      num(u.rows_deleted.last_1m), num(u.rows_deleted.last_5m), num(u.rows_deleted.last_30m)],
+  ];
+  const body = rows.map(r =>
+    `<tr><td>${escape(r[0])}</td><td class="num">${r[1]}</td><td class="num">${r[2]}</td><td class="num">${r[3]}</td></tr>`
+  ).join("");
+  return `
+    <div>${status}</div>
+    <div class="dim">last frame ${fmtAge(u.last_frame_ms, nowMs)} &nbsp; last ping/pong ${fmtAge(u.last_ping_ms, nowMs)}</div>
+    <table>
+      <thead><tr><th></th><th class="num">1m</th><th class="num">5m</th><th class="num">30m</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table>
+    <div class="dim">rows update vs insert: SpacetimeDB transmits diffs as (delete, insert) — an update appears once in each.</div>
+  `;
+}
+
+function totalsAcrossClients(clients, key) {
+  return {
+    last_1m: clients.reduce((a, c) => a + (c[key].last_1m || 0), 0),
+    last_5m: clients.reduce((a, c) => a + (c[key].last_5m || 0), 0),
+    last_30m: clients.reduce((a, c) => a + (c[key].last_30m || 0), 0),
+  };
+}
+
+function renderDownstream(snap, nowMs) {
+  const clients = snap.clients;
+  if (clients.length === 0) {
+    return `<div>${snap.n_clients} client(s) connected</div>
+      <div class="empty">no clients connected</div>`;
+  }
+  const tot_b = totalsAcrossClients(clients, "bytes_out");
+  const tot_i = totalsAcrossClients(clients, "rows_inserted");
+  const tot_d = totalsAcrossClients(clients, "rows_deleted");
+  const totalsRows = [
+    ["bytes sent",
+      fmtBytes(tot_b.last_1m), fmtBytes(tot_b.last_5m), fmtBytes(tot_b.last_30m)],
+    ["avg bps",
+      fmtBps(tot_b.last_1m, 60), fmtBps(tot_b.last_5m, 300), fmtBps(tot_b.last_30m, 1800)],
+    ["rows inserted (sent)",
+      num(tot_i.last_1m), num(tot_i.last_5m), num(tot_i.last_30m)],
+    ["rows deleted (sent)",
+      num(tot_d.last_1m), num(tot_d.last_5m), num(tot_d.last_30m)],
+  ];
+  const totalsBody = totalsRows.map(r =>
+    `<tr><td>${escape(r[0])}</td><td class="num">${r[1]}</td><td class="num">${r[2]}</td><td class="num">${r[3]}</td></tr>`
+  ).join("");
+
+  const perClient = clients.map(c => {
+    const id = "client-" + String(c.client_id).padStart(4, "0");
+    return `
+      <tr>
+        <td>${escape(id)}</td>
+        <td class="num">${c.subscriptions}</td>
+        <td class="num">${num(c.oneoff_queries.last_1m)}/${num(c.oneoff_queries.last_5m)}/${num(c.oneoff_queries.last_30m)}</td>
+        <td class="num">${num(c.rows_inserted.last_1m)}/${num(c.rows_inserted.last_5m)}/${num(c.rows_inserted.last_30m)}</td>
+        <td class="num">${num(c.rows_deleted.last_1m)}/${num(c.rows_deleted.last_5m)}/${num(c.rows_deleted.last_30m)}</td>
+        <td class="num">${fmtBytes(c.bytes_out.last_1m)}/${fmtBytes(c.bytes_out.last_5m)}/${fmtBytes(c.bytes_out.last_30m)}</td>
+        <td class="num">${fmtBps(c.bytes_out.last_1m, 60)}</td>
+        <td class="num dim">${fmtUptime(c.connected_since_ms, nowMs)}</td>
+      </tr>`;
+  }).join("");
+
+  return `
+    <div>${snap.n_clients} client(s) connected</div>
+    <table>
+      <thead><tr><th>totals</th><th class="num">1m</th><th class="num">5m</th><th class="num">30m</th></tr></thead>
+      <tbody>${totalsBody}</tbody>
+    </table>
+    <table style="margin-top: 12px;">
+      <thead>
+        <tr>
+          <th>client</th>
+          <th class="num">subs</th>
+          <th class="num">oneoff 1/5/30m</th>
+          <th class="num">ins 1/5/30m</th>
+          <th class="num">del 1/5/30m</th>
+          <th class="num">bytes 1/5/30m</th>
+          <th class="num">bps 1m</th>
+          <th class="num">uptime</th>
+        </tr>
+      </thead>
+      <tbody>${perClient}</tbody>
+    </table>
+  `;
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/dashboard.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const snap = await r.json();
+    const now = snap.now_ms;
+    document.getElementById("meta").textContent =
+      "refreshed " + new Date(now).toLocaleTimeString() + " // window: 1m / 5m / 30m";
+    document.getElementById("upstream").innerHTML = renderUpstream(snap.upstream, now);
+    document.getElementById("downstream").innerHTML = renderDownstream(snap, now);
+  } catch (e) {
+    document.getElementById("meta").innerHTML = `<span class="down">fetch failed: ${escape(e.message)}</span>`;
+  }
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
