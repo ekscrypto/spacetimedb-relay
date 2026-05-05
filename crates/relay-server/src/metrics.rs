@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use relay_engine::ClientId;
 
@@ -223,16 +224,21 @@ impl ClientMetrics {
     }
 }
 
-#[derive(Default)]
 pub struct Metrics {
     pub upstream: UpstreamMetrics,
     pub downstream: Arc<DownstreamMetrics>,
     clients: DashMap<ClientId, Arc<ClientMetrics>>,
+    system: SystemMetrics,
 }
 
 impl Metrics {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(Self {
+            upstream: UpstreamMetrics::default(),
+            downstream: Arc::new(DownstreamMetrics::default()),
+            clients: DashMap::new(),
+            system: SystemMetrics::new(),
+        })
     }
 
     pub fn register_client(&self, id: ClientId, addr: String) -> Arc<ClientMetrics> {
@@ -257,8 +263,52 @@ impl Metrics {
             now_ms: now_millis(),
             upstream: self.upstream.snapshot(),
             downstream: self.downstream.snapshot(),
+            system: self.system.snapshot(),
             n_clients: clients.len(),
             clients,
+        }
+    }
+}
+
+struct SystemMetrics {
+    pid: Pid,
+    sys: Mutex<System>,
+}
+
+impl SystemMetrics {
+    fn new() -> Self {
+        let pid = Pid::from_u32(std::process::id());
+        let mut sys = System::new();
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        Self {
+            pid,
+            sys: Mutex::new(sys),
+        }
+    }
+
+    fn snapshot(&self) -> SystemSnapshot {
+        let mut sys = self.sys.lock();
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[self.pid]), true);
+
+        let load = System::load_average();
+        let (relay_memory_bytes, relay_cpu_percent) = sys
+            .process(self.pid)
+            .map(|p| (p.memory(), p.cpu_usage()))
+            .unwrap_or((0, 0.0));
+
+        SystemSnapshot {
+            host_cpu_percent: sys.global_cpu_usage(),
+            host_memory_total: sys.total_memory(),
+            host_memory_used: sys.used_memory(),
+            host_load_avg_1m: load.one,
+            host_load_avg_5m: load.five,
+            host_load_avg_15m: load.fifteen,
+            relay_memory_bytes,
+            relay_cpu_percent,
         }
     }
 }
@@ -297,10 +347,23 @@ pub struct ClientSnapshot {
 }
 
 #[derive(serde::Serialize)]
+pub struct SystemSnapshot {
+    pub host_cpu_percent: f32,
+    pub host_memory_total: u64,
+    pub host_memory_used: u64,
+    pub host_load_avg_1m: f64,
+    pub host_load_avg_5m: f64,
+    pub host_load_avg_15m: f64,
+    pub relay_memory_bytes: u64,
+    pub relay_cpu_percent: f32,
+}
+
+#[derive(serde::Serialize)]
 pub struct MetricsSnapshot {
     pub now_ms: u64,
     pub upstream: UpstreamSnapshot,
     pub downstream: DownstreamSnapshot,
+    pub system: SystemSnapshot,
     pub n_clients: usize,
     pub clients: Vec<ClientSnapshot>,
 }
@@ -387,6 +450,20 @@ mod tests {
         assert!(json.contains("\"n_clients\":1"));
         assert!(json.contains("\"bytes_out\""));
         assert!(json.contains("\"downstream\""));
+        assert!(json.contains("\"system\""));
+        assert!(json.contains("\"host_cpu_percent\""));
+        assert!(json.contains("\"relay_memory_bytes\""));
+    }
+
+    #[test]
+    fn system_snapshot_reports_relay_process_memory() {
+        let m = Metrics::new();
+        let s = m.snapshot();
+        assert!(
+            s.system.relay_memory_bytes > 0,
+            "relay process RSS should be reported"
+        );
+        assert!(s.system.host_memory_total >= s.system.host_memory_used);
     }
 
     #[test]

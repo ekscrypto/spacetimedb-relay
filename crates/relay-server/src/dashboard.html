@@ -36,6 +36,9 @@
 <h1>spacetimedb-relay // dashboard</h1>
 <div class="meta" id="meta">loading&hellip;</div>
 
+<h2>SYSTEM</h2>
+<div id="system"></div>
+
 <h2>UPSTREAM</h2>
 <div id="upstream"></div>
 
@@ -78,6 +81,28 @@ const escape = (s) => String(s).replace(/[&<>"']/g, (c) => ({
 }[c]));
 
 const num = (n) => (n || 0).toLocaleString();
+const fmtPercent = (v) => (Number.isFinite(v) ? v.toFixed(1) : "0.0") + "%";
+const fmtLoad = (v) => (Number.isFinite(v) ? v.toFixed(2) : "—");
+
+function renderSystem(s) {
+  if (!s) return `<div class="dim">unavailable</div>`;
+  const memTotal = s.host_memory_total || 0;
+  const memUsed = s.host_memory_used || 0;
+  const memPct = memTotal > 0 ? (memUsed * 100) / memTotal : 0;
+  const rows = [
+    ["host CPU", fmtPercent(s.host_cpu_percent)],
+    ["host load avg (1/5/15m)",
+      `${fmtLoad(s.host_load_avg_1m)} / ${fmtLoad(s.host_load_avg_5m)} / ${fmtLoad(s.host_load_avg_15m)}`],
+    ["host memory",
+      `${fmtBytes(memUsed)} / ${fmtBytes(memTotal)} (${fmtPercent(memPct)})`],
+    ["relay process CPU", fmtPercent(s.relay_cpu_percent)],
+    ["relay process memory", fmtBytes(s.relay_memory_bytes || 0)],
+  ];
+  const body = rows.map(r =>
+    `<tr><td>${escape(r[0])}</td><td class="num">${r[1]}</td></tr>`
+  ).join("");
+  return `<table><tbody>${body}</tbody></table>`;
+}
 
 function renderUpstream(u, nowMs) {
   const status = u.connected
@@ -211,6 +236,7 @@ async function tick() {
     lastGoodAt = now;
     document.getElementById("meta").textContent =
       "refreshed " + new Date(now).toLocaleTimeString() + " // window: 1m / 5m / 30m";
+    document.getElementById("system").innerHTML = renderSystem(snap.system);
     document.getElementById("upstream").innerHTML = renderUpstream(snap.upstream, now);
     document.getElementById("downstream").innerHTML = renderDownstream(snap, now);
   } catch (e) {
