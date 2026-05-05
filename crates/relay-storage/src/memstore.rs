@@ -21,7 +21,8 @@ use parking_lot::RwLock;
 use tracing::warn;
 
 use relay_protocol::{
-    field_byte_ranges, BsatnError, DecodedRow, MirroredField, MirroredSchema, MirroredTable,
+    decode_row, field_byte_ranges, BsatnError, DecodedRow, MirroredField, MirroredSchema,
+    MirroredTable,
 };
 
 use crate::ddl::TableSpec;
@@ -214,11 +215,12 @@ impl MemStore {
             match table.rows.remove(&key) {
                 None => inserts.push(row.clone()),
                 Some(existing_bytes) if existing_bytes != row.bsatn => {
-                    let existing = DecodedRow {
-                        cells: row.cells.clone(),
+                    let cells =
+                        decode_row(&existing_bytes, &table.fields, &schema).map_err(map_bsatn)?;
+                    deletes.push(DecodedRow {
+                        cells,
                         bsatn: existing_bytes,
-                    };
-                    deletes.push(existing);
+                    });
                     inserts.push(row.clone());
                 }
                 Some(_) => {}
@@ -227,10 +229,12 @@ impl MemStore {
         }
 
         // Anything left in `table.rows` is missing from the incoming
-        // snapshot — emit as a delete.
+        // snapshot — emit as a delete. Decode bsatn so callers that
+        // need typed PK cells (Postgres delete-by-PK) can use it.
         for (_key, bytes) in table.rows.iter() {
+            let cells = decode_row(bytes, &table.fields, &schema).map_err(map_bsatn)?;
             deletes.push(DecodedRow {
-                cells: Vec::new(),
+                cells,
                 bsatn: bytes.clone(),
             });
         }
@@ -285,4 +289,165 @@ fn map_bsatn(e: BsatnError) -> StorageError {
 #[allow(dead_code)]
 fn _table_meta<'a>(schema: &'a MirroredSchema, name: &str) -> Option<&'a MirroredTable> {
     schema.tables.iter().find(|t| t.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{BufMut, BytesMut};
+    use relay_protocol::{
+        decode_row, MirroredField, MirroredTable, MirroredType, TableAccess, TableKind,
+    };
+
+    use crate::ddl::build_table_specs;
+
+    fn schema() -> Arc<MirroredSchema> {
+        Arc::new(MirroredSchema {
+            typespace: vec![MirroredType::Product(vec![
+                MirroredField {
+                    name: Some("id".into()),
+                    ty: MirroredType::I32,
+                },
+                MirroredField {
+                    name: Some("payload".into()),
+                    ty: MirroredType::String,
+                },
+            ])],
+            tables: vec![MirroredTable {
+                name: "thing".into(),
+                product_type_ref: 0,
+                primary_key: vec![0],
+                access: TableAccess::Public,
+                kind: TableKind::User,
+            }],
+        })
+    }
+
+    fn row(id: i32, payload: &str, schema: &MirroredSchema) -> DecodedRow {
+        let mut buf = BytesMut::new();
+        buf.put_i32_le(id);
+        buf.put_u32_le(payload.len() as u32);
+        buf.put_slice(payload.as_bytes());
+        let bsatn = buf.freeze();
+        let fields = schema
+            .table_product(&schema.tables[0])
+            .expect("product fields");
+        let cells = decode_row(&bsatn, fields, schema).expect("decode");
+        DecodedRow { cells, bsatn }
+    }
+
+    fn fresh_store() -> MemStore {
+        let store = MemStore::new();
+        let s = schema();
+        let specs = build_table_specs(&s, "test_db").expect("specs");
+        store.sync_schema(s, &specs);
+        store
+    }
+
+    fn payloads_from_bytes(bytes: &[Bytes]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in bytes {
+            // After 4 bytes for id and 4 for length, the rest is the
+            // string. The schema is fixed in the helper.
+            let len = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+            out.push(String::from_utf8(b[8..8 + len].to_vec()).unwrap());
+        }
+        out.sort();
+        out
+    }
+
+    fn payloads_from_rows(rows: &[DecodedRow]) -> Vec<String> {
+        let raw: Vec<Bytes> = rows.iter().map(|r| r.bsatn.clone()).collect();
+        payloads_from_bytes(&raw)
+    }
+
+    #[test]
+    fn empty_current_yields_pure_inserts() {
+        let store = fresh_store();
+        let s = schema();
+        let incoming = vec![row(1, "a-v1", &s), row(2, "b-v1", &s), row(3, "c-v1", &s)];
+        let diff = store.apply_snapshot_diff("thing", &incoming).unwrap();
+        assert!(diff.deletes.is_empty());
+        assert_eq!(
+            payloads_from_rows(&diff.inserts),
+            vec!["a-v1".to_string(), "b-v1".to_string(), "c-v1".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_row_during_outage_is_emitted_as_delete() {
+        let store = fresh_store();
+        let s = schema();
+        let phase1 = vec![row(1, "a", &s), row(2, "b", &s), row(3, "c", &s)];
+        store.apply_snapshot_diff("thing", &phase1).unwrap();
+        let phase2 = vec![row(1, "a", &s), row(3, "c", &s)];
+        let diff = store.apply_snapshot_diff("thing", &phase2).unwrap();
+        assert!(diff.inserts.is_empty(), "inserts: {:?}", diff.inserts);
+        assert_eq!(payloads_from_rows(&diff.deletes), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn changed_payload_for_same_pk_is_delete_then_insert() {
+        let store = fresh_store();
+        let s = schema();
+        store
+            .apply_snapshot_diff("thing", &[row(1, "a-v1", &s)])
+            .unwrap();
+        let diff = store
+            .apply_snapshot_diff("thing", &[row(1, "a-v2", &s)])
+            .unwrap();
+        assert_eq!(payloads_from_rows(&diff.deletes), vec!["a-v1".to_string()]);
+        assert_eq!(payloads_from_rows(&diff.inserts), vec!["a-v2".to_string()]);
+    }
+
+    #[test]
+    fn replay_same_snapshot_is_noop() {
+        let store = fresh_store();
+        let s = schema();
+        let phase = vec![row(1, "a", &s), row(2, "b", &s)];
+        store.apply_snapshot_diff("thing", &phase).unwrap();
+        let diff = store.apply_snapshot_diff("thing", &phase).unwrap();
+        assert!(diff.deletes.is_empty());
+        assert!(diff.inserts.is_empty());
+    }
+
+    #[test]
+    fn apply_diff_inserts_and_deletes_by_pk() {
+        let store = fresh_store();
+        let s = schema();
+        let initial = vec![row(1, "a", &s), row(2, "b", &s), row(3, "c", &s)];
+        store.insert_rows("thing", &initial).unwrap();
+
+        let outcome = store
+            .apply_diff(
+                "thing",
+                &[row(2, "b", &s)],
+                &[row(4, "d", &s), row(5, "e", &s)],
+            )
+            .unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.inserted, 2);
+
+        let final_rows = store.fetch_all_bsatn("thing").unwrap();
+        assert_eq!(
+            payloads_from_bytes(&final_rows),
+            vec![
+                "a".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_all_returns_inserted_rows() {
+        let store = fresh_store();
+        let s = schema();
+        store
+            .insert_rows("thing", &[row(1, "a", &s), row(2, "b", &s)])
+            .unwrap();
+        let raw = store.fetch_all_bsatn("thing").unwrap();
+        assert_eq!(payloads_from_bytes(&raw), vec!["a", "b"]);
+    }
 }

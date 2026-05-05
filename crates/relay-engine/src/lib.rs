@@ -191,7 +191,7 @@ impl Engine {
         storage: &Storage,
         query: &CompiledQuery,
     ) -> Result<Vec<Bytes>, EngineError> {
-        let raw = storage.fetch_all_bsatn(query.table.as_ref()).await?;
+        let raw = storage.fetch_all_bsatn(query.table.as_ref())?;
         let table = self
             .schema
             .tables

@@ -85,7 +85,7 @@ fn sorted(bytes: &[Bytes]) -> Vec<Vec<u8>> {
 }
 
 async fn assert_parity(storage: &Storage, table: &str) {
-    let pg = storage.fetch_all_bsatn(table).await.expect("pg dump");
+    let pg = storage.fetch_all_bsatn_pg(table).await.expect("pg dump");
     let mem = storage.mem().fetch_all_bsatn(table).expect("mem dump");
     assert_eq!(
         sorted(&pg),

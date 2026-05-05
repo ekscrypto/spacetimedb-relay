@@ -184,22 +184,38 @@ impl Storage {
         &self,
         upstream_table: &str,
         incoming: &[DecodedRow],
-        fields: &[MirroredField],
-        schema: &MirroredSchema,
+        _fields: &[MirroredField],
+        _schema: &MirroredSchema,
     ) -> Result<SnapshotDiff, StorageError> {
         let spec = self
             .table_spec(upstream_table)
             .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
-        let pg_diff =
-            insert::apply_snapshot_diff(&self.pool, &spec, incoming, fields, schema).await?;
-        self.mem.apply_snapshot_diff(upstream_table, incoming)?;
-        Ok(pg_diff)
+        // Stage 2: compute the diff against the in-memory store
+        // (sub-second even on million-row tables) and apply just that
+        // delta to Postgres. The previous implementation read every
+        // row in the PG mirror to compute the diff, which on
+        // BitCraft-scale databases took ~10 minutes.
+        let diff = self.mem.apply_snapshot_diff(upstream_table, incoming)?;
+        if !diff.deletes.is_empty() || !diff.inserts.is_empty() {
+            insert::apply_diff(&self.pool, &spec, &diff.deletes, &diff.inserts).await?;
+        }
+        Ok(diff)
     }
 
     /// Fetch the raw BSATN bytes of every row in the given upstream
-    /// table. Used by the downstream server to send a snapshot to a
-    /// newly-subscribed client without re-encoding.
-    pub async fn fetch_all_bsatn(&self, upstream_table: &str) -> Result<Vec<Bytes>, StorageError> {
+    /// table. Reads from the in-memory store; the PG mirror is kept in
+    /// sync as a paranoid checker but no longer on the hot path for
+    /// downstream snapshots.
+    pub fn fetch_all_bsatn(&self, upstream_table: &str) -> Result<Vec<Bytes>, StorageError> {
+        self.mem.fetch_all_bsatn(upstream_table)
+    }
+
+    /// Read every row directly from the Postgres mirror. Used by the
+    /// parity test to confirm the in-memory store has not diverged.
+    pub async fn fetch_all_bsatn_pg(
+        &self,
+        upstream_table: &str,
+    ) -> Result<Vec<Bytes>, StorageError> {
         let spec = self
             .table_spec(upstream_table)
             .ok_or_else(|| StorageError::Identifier(format!("unknown table {upstream_table}")))?;
