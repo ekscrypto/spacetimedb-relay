@@ -43,7 +43,7 @@ pub struct DecodedRow {
     pub bsatn: Bytes,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
     Bool(Option<bool>),
     Smallint(Option<i16>),
@@ -185,31 +185,48 @@ fn decode_optional(
         // still descend through resolve to stay correct if the
         // payload type isn't trivial.
         decode_value_to_skip(bytes, &variant.ty, schema)?;
-        return Ok(null_cell_for(variants));
+        return Ok(null_cell_for(variants, schema));
     }
     decode_cell(bytes, &variant.ty, schema)
 }
 
-fn null_cell_for(variants: &[MirroredVariant]) -> Cell {
-    let some_ty = variants
+fn null_cell_for(variants: &[MirroredVariant], schema: &MirroredSchema) -> Cell {
+    let Some(some_ty) = variants
         .iter()
         .find(|v| v.name.as_deref() == Some("some"))
-        .map(|v| &v.ty);
-    match some_ty {
-        Some(MirroredType::Bool) => Cell::Bool(None),
-        Some(MirroredType::I8) | Some(MirroredType::I16) | Some(MirroredType::U8) => {
-            Cell::Smallint(None)
+        .map(|v| &v.ty)
+    else {
+        return Cell::Jsonb(Value::Null);
+    };
+    null_cell_for_inner(some_ty, schema)
+}
+
+/// Mirror the DDL layer's type-collapsing rules so the null cell we
+/// emit on the `none` branch matches the Postgres column type chosen
+/// at CREATE TABLE time. In particular, wrapper Products
+/// (e.g. `Timestamp = Product[{__timestamp_micros_since_unix_epoch__: I64}]`)
+/// must unwrap to their inner primitive — otherwise the DDL layer
+/// emits BIGINT NULLABLE while the decoder hands sqlx a `Jsonb(Null)`,
+/// failing the INSERT with "column ... is of type bigint but
+/// expression is of type jsonb".
+fn null_cell_for_inner(ty: &MirroredType, schema: &MirroredSchema) -> Cell {
+    match schema.resolve(ty) {
+        MirroredType::Bool => Cell::Bool(None),
+        MirroredType::I8 | MirroredType::I16 | MirroredType::U8 => Cell::Smallint(None),
+        MirroredType::I32 | MirroredType::U16 => Cell::Integer(None),
+        MirroredType::I64 | MirroredType::U32 => Cell::Bigint(None),
+        MirroredType::F32 => Cell::Real(None),
+        MirroredType::F64 => Cell::DoublePrecision(None),
+        MirroredType::String => Cell::Text(None),
+        MirroredType::U64
+        | MirroredType::U128
+        | MirroredType::U256
+        | MirroredType::I128
+        | MirroredType::I256 => Cell::Bytea(None),
+        MirroredType::Product(fields) if is_wrapper(fields) => {
+            null_cell_for_inner(&fields[0].ty, schema)
         }
-        Some(MirroredType::I32) | Some(MirroredType::U16) => Cell::Integer(None),
-        Some(MirroredType::I64) | Some(MirroredType::U32) => Cell::Bigint(None),
-        Some(MirroredType::F32) => Cell::Real(None),
-        Some(MirroredType::F64) => Cell::DoublePrecision(None),
-        Some(MirroredType::String) => Cell::Text(None),
-        Some(MirroredType::U64)
-        | Some(MirroredType::U128)
-        | Some(MirroredType::U256)
-        | Some(MirroredType::I128)
-        | Some(MirroredType::I256) => Cell::Bytea(None),
+        MirroredType::Sum(variants) if is_optional(variants) => null_cell_for(variants, schema),
         _ => Cell::Jsonb(Value::Null),
     }
 }
@@ -343,4 +360,63 @@ fn is_optional(variants: &[MirroredVariant]) -> bool {
     variants.len() == 2
         && variants.iter().any(|v| v.name.as_deref() == Some("some"))
         && variants.iter().any(|v| v.name.as_deref() == Some("none"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{MirroredField, MirroredSchema, MirroredType, MirroredVariant};
+
+    fn timestamp_field(name: &str) -> MirroredField {
+        // Mirror BitCraft's `Optional<Timestamp>` shape:
+        // Sum<some: Product[{__timestamp_micros_since_unix_epoch__: I64}], none: Product[]>.
+        MirroredField {
+            name: Some(name.to_string()),
+            ty: MirroredType::Sum(vec![
+                MirroredVariant {
+                    name: Some("some".to_string()),
+                    ty: MirroredType::Product(vec![MirroredField {
+                        name: Some("__timestamp_micros_since_unix_epoch__".to_string()),
+                        ty: MirroredType::I64,
+                    }]),
+                },
+                MirroredVariant {
+                    name: Some("none".to_string()),
+                    ty: MirroredType::Product(Vec::new()),
+                },
+            ]),
+        }
+    }
+
+    fn empty_schema() -> MirroredSchema {
+        MirroredSchema {
+            tables: Vec::new(),
+            typespace: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn optional_wrapper_product_decodes_as_typed_null_not_jsonb() {
+        // Regression: `null_cell_for` used to fall through to
+        // Cell::Jsonb(Null) for any non-primitive `some` variant,
+        // even though the DDL layer unwraps wrapper Products to a
+        // primitive Postgres column. INSERT then failed with
+        // `column is of type bigint but expression is of type jsonb`.
+        let fields = vec![timestamp_field("noble")];
+        let schema = empty_schema();
+        let bsatn = [1u8]; // tag 1 = none
+        let cells = decode_row(&bsatn, &fields, &schema).expect("decode");
+        assert_eq!(cells, vec![Cell::Bigint(None)]);
+    }
+
+    #[test]
+    fn optional_wrapper_product_some_decodes_to_inner_primitive() {
+        let fields = vec![timestamp_field("noble")];
+        let schema = empty_schema();
+        // tag 0 = some, then I64 LE = 1234567890i64
+        let mut bsatn = vec![0u8];
+        bsatn.extend_from_slice(&1234567890i64.to_le_bytes());
+        let cells = decode_row(&bsatn, &fields, &schema).expect("decode");
+        assert_eq!(cells, vec![Cell::Bigint(Some(1234567890))]);
+    }
 }
