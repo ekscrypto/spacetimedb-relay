@@ -1,0 +1,21 @@
+[package]
+name = "relay-mirror-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+http.workspace = true
+url.workspace = true
+bytes.workspace = true
+spacetimedb-sats.workspace = true
+spacetimedb-client-api-messages.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

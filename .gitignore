@@ -18,3 +18,13 @@ CLAUDE.local.md
 
 # BitCraft auth token (long-lived bearer credential)
 .bitcraft-token
+
+# Generated mirror module body — Cargo.toml is committed, src/lib.rs is regenerated.
+spike/mirror/src/lib.rs
+spike/mirror/Cargo.lock
+spike/mirror/target/
+spike/mirror/schema.json
+
+# dhat profiler output
+dhat-heap.json
+.claude/

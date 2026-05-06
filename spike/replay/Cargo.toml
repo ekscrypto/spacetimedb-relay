@@ -1,0 +1,24 @@
+[package]
+name = "spike-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spike-replay"
+path = "src/main.rs"
+
+[dependencies]
+spacetimedb-sats.workspace = true
+spacetimedb-client-api-messages.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+http.workspace = true
+url.workspace = true
+bytes.workspace = true
+rustls = { version = "0.23", features = ["ring"] }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

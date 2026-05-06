@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: MIT
+
+//! Replays upstream-decoded TableUpdates onto a local SpacetimeDB by
+//! invoking the codegen'd `relay_apply_<table>(deletes, inserts)` reducers.
+//!
+//! Pairing of deletes with inserts (i.e. emitting an atomic update when
+//! the same primary key appears in both) is performed inside the wasm
+//! module — the driver just hands over the row lists. That keeps the
+//! wire shape symmetric (one `relay_apply` per table per call) and
+//! preserves single-transaction atomicity from the perspective of
+//! downstream subscribers reading the local SpacetimeDB.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use http::header::{HeaderName, HeaderValue, AUTHORIZATION};
+use spacetimedb_client_api_messages::websocket::v2::{CallReducer, CallReducerFlags, ClientMessage};
+use spacetimedb_sats::bsatn;
+use thiserror::Error;
+use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use url::Url;
+
+const SUBPROTOCOL: &str = "v2.bsatn.spacetimedb";
+
+#[derive(Debug, Error)]
+pub enum DriverError {
+    #[error("invalid url: {0}")]
+    Url(String),
+    #[error("connect failed: {0}")]
+    Connect(String),
+    #[error("websocket error: {0}")]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("encode failed: {0}")]
+    Encode(String),
+    #[error("send failed: {0}")]
+    Send(String),
+    #[error("driver shut down")]
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+pub struct DriverConfig {
+    /// Local SpacetimeDB URL (e.g. `ws://127.0.0.1:3000` or `http://...`).
+    pub stdb_url: Url,
+    /// Database name (matches what the publisher used for `spacetime publish`).
+    pub database: String,
+    /// Bearer identity token. Should be the same identity that ran
+    /// `spacetime publish` so the writer-bind in the wasm module
+    /// recognises us. `None` connects anonymously — only useful when the
+    /// module's writer was never bound (first connection wins).
+    pub identity_token: Option<String>,
+    /// Per-call backpressure cap. Server's incoming queue is 16 384;
+    /// keep some headroom.
+    pub max_in_flight: usize,
+    /// Maximum row count (deletes + inserts) per single
+    /// `relay_apply_<table>` call. Larger TableUpdates get split into
+    /// multiple calls. Cross-call atomicity is not guaranteed, but
+    /// pairing within a call still works because we keep paired
+    /// delete+insert within the same chunk.
+    pub max_rows_per_apply: usize,
+}
+
+impl Default for DriverConfig {
+    fn default() -> Self {
+        Self {
+            stdb_url: "ws://127.0.0.1:3000".parse().unwrap(),
+            database: String::new(),
+            identity_token: None,
+            max_in_flight: 8000,
+            max_rows_per_apply: 4096,
+        }
+    }
+}
+
+type Conn = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Sink = SplitSink<Conn, Message>;
+type Stream = SplitStream<Conn>;
+
+pub struct MirrorDriver {
+    sink: Sink,
+    in_flight: Arc<Semaphore>,
+    request_id: AtomicU32,
+    drain_handle: Option<tokio::task::JoinHandle<()>>,
+    max_rows_per_apply: usize,
+}
+
+impl MirrorDriver {
+    pub async fn connect(cfg: DriverConfig) -> Result<Self, DriverError> {
+        let conn = open_ws(&cfg).await?;
+        let (sink, stream) = conn.split();
+        let in_flight = Arc::new(Semaphore::new(cfg.max_in_flight));
+        let drain_handle = Some(tokio::spawn(drain_responses(stream, in_flight.clone())));
+        Ok(Self {
+            sink,
+            in_flight,
+            request_id: AtomicU32::new(1),
+            drain_handle,
+            max_rows_per_apply: cfg.max_rows_per_apply,
+        })
+    }
+
+    /// Idempotent. Calls the module's `relay_bind_writer` reducer, which
+    /// records `ctx.sender()` as the bound writer if no writer is bound
+    /// yet, returns ok if we're already the bound writer, and errors if
+    /// a different identity owns the slot.
+    pub async fn bind_writer(&mut self) -> Result<(), DriverError> {
+        self.send_call("relay_bind_writer", &[]).await
+    }
+
+    /// Apply one TableUpdate's worth of changes for `table`. Splits into
+    /// multiple `relay_apply_<table>` calls when the row count exceeds
+    /// `max_rows_per_apply`; pairing within each chunk still happens
+    /// inside the wasm module, so paired delete+insert across the chunk
+    /// boundary will degrade into separate delete and insert (degraded
+    /// from atomic update to delete-then-insert). Acceptable on the
+    /// initial subscribe-applied firehose where deletes are typically
+    /// empty.
+    pub async fn apply(
+        &mut self,
+        table: &str,
+        deletes: Vec<Bytes>,
+        inserts: Vec<Bytes>,
+    ) -> Result<(), DriverError> {
+        let reducer = format!("relay_apply_{table}");
+        let chunks = chunk_apply(deletes, inserts, self.max_rows_per_apply);
+        for (deletes_chunk, inserts_chunk) in chunks {
+            let args = encode_apply_args(&deletes_chunk, &inserts_chunk);
+            self.send_call(&reducer, &args).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn close(mut self) -> Result<(), DriverError> {
+        let _ = self.sink.close().await;
+        if let Some(h) = self.drain_handle.take() {
+            let _ = h.await;
+        }
+        Ok(())
+    }
+
+    async fn send_call(&mut self, reducer: &str, args: &[u8]) -> Result<(), DriverError> {
+        let permit = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DriverError::Closed)?;
+        permit.forget();
+        let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
+        let msg = ClientMessage::CallReducer(CallReducer {
+            request_id,
+            flags: CallReducerFlags::Default,
+            reducer: reducer.into(),
+            args: Bytes::copy_from_slice(args),
+        });
+        let frame = bsatn::to_vec(&msg).map_err(|e| DriverError::Encode(e.to_string()))?;
+        self.sink
+            .send(Message::Binary(frame))
+            .await
+            .map_err(|e| DriverError::Send(e.to_string()))?;
+        Ok(())
+    }
+}
+
+async fn open_ws(cfg: &DriverConfig) -> Result<Conn, DriverError> {
+    let mut url = cfg.stdb_url.clone();
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        s => s,
+    }
+    .to_string();
+    url.set_scheme(&scheme).map_err(|_| DriverError::Url("bad scheme".into()))?;
+    url.set_path(&format!("/v1/database/{}/subscribe", cfg.database));
+    url.set_query(Some("compression=None"));
+    let mut req = url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| DriverError::Url(e.to_string()))?;
+    req.headers_mut().insert(
+        HeaderName::from_static("sec-websocket-protocol"),
+        HeaderValue::from_static(SUBPROTOCOL),
+    );
+    if let Some(token) = &cfg.identity_token {
+        let v = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| DriverError::Url(format!("invalid identity token: {e}")))?;
+        req.headers_mut().insert(AUTHORIZATION, v);
+    }
+    let (ws, _resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .map_err(|e| DriverError::Connect(e.to_string()))?;
+    Ok(ws)
+}
+
+async fn drain_responses(mut stream: Stream, in_flight: Arc<Semaphore>) {
+    let mut warn_budget = 5u8;
+    while let Some(msg) = stream.next().await {
+        match msg {
+            Ok(Message::Binary(_)) | Ok(Message::Text(_)) => {
+                in_flight.add_permits(1);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if warn_budget > 0 {
+                    tracing::warn!(target: "relay::mirror_driver", "ws recv error: {e}");
+                    warn_budget -= 1;
+                }
+            }
+        }
+    }
+    tracing::debug!(target: "relay::mirror_driver", "drainer task exited");
+}
+
+/// Split the row lists into chunks of at most `max_rows`. Pairing
+/// within a chunk is still possible because `apply()` keeps deletes and
+/// inserts of one chunk together; cross-chunk pairing degrades to
+/// delete-then-insert but the overall outcome is the same (just one
+/// extra notification on the affected row).
+fn chunk_apply(
+    deletes: Vec<Bytes>,
+    inserts: Vec<Bytes>,
+    max_rows: usize,
+) -> Vec<(Vec<Bytes>, Vec<Bytes>)> {
+    if deletes.len() + inserts.len() <= max_rows {
+        return vec![(deletes, inserts)];
+    }
+    // Greedy: emit chunks of paired (deletes, inserts) up to max_rows
+    // each. We do not try to keep paired-by-PK rows together — that
+    // would require decoding PKs here, which we explicitly avoid (the
+    // wasm module owns BSATN decoding).
+    let mut out = Vec::new();
+    let mut d_iter = deletes.into_iter();
+    let mut i_iter = inserts.into_iter();
+    loop {
+        let mut d_chunk = Vec::new();
+        let mut i_chunk = Vec::new();
+        let mut remaining = max_rows;
+        while remaining > 0 {
+            if let Some(d) = d_iter.next() {
+                d_chunk.push(d);
+                remaining -= 1;
+                continue;
+            }
+            if let Some(i) = i_iter.next() {
+                i_chunk.push(i);
+                remaining -= 1;
+                continue;
+            }
+            break;
+        }
+        if d_chunk.is_empty() && i_chunk.is_empty() {
+            break;
+        }
+        out.push((d_chunk, i_chunk));
+    }
+    out
+}
+
+/// Encode the BSATN body for `relay_apply_<table>(deletes: Vec<Vec<u8>>, inserts: Vec<Vec<u8>>)`.
+/// Wire shape: `[u32 deletes_count][per-delete: u32 len, bytes][u32 inserts_count][per-insert: u32 len, bytes]`.
+fn encode_apply_args(deletes: &[Bytes], inserts: &[Bytes]) -> Vec<u8> {
+    let total_inner: usize = deletes.iter().map(|b| b.len()).sum::<usize>()
+        + inserts.iter().map(|b| b.len()).sum::<usize>();
+    let mut buf = Vec::with_capacity(8 + 8 * (deletes.len() + inserts.len()) + total_inner);
+    push_vec_vec_u8(&mut buf, deletes);
+    push_vec_vec_u8(&mut buf, inserts);
+    buf
+}
+
+fn push_vec_vec_u8(buf: &mut Vec<u8>, rows: &[Bytes]) {
+    buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for r in rows {
+        buf.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        buf.extend_from_slice(r);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_returns_single_when_under_limit() {
+        let d = vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")];
+        let i = vec![Bytes::from_static(b"c")];
+        let chunks = chunk_apply(d, i, 100);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0.len(), 2);
+        assert_eq!(chunks[0].1.len(), 1);
+    }
+
+    #[test]
+    fn chunk_splits_when_over_limit() {
+        let d: Vec<Bytes> = (0..3).map(|n| Bytes::from(vec![n as u8])).collect();
+        let i: Vec<Bytes> = (0..5).map(|n| Bytes::from(vec![n as u8 + 100])).collect();
+        let chunks = chunk_apply(d, i, 3);
+        let total_d: usize = chunks.iter().map(|(d, _)| d.len()).sum();
+        let total_i: usize = chunks.iter().map(|(_, i)| i.len()).sum();
+        assert_eq!(total_d, 3);
+        assert_eq!(total_i, 5);
+        for (d, i) in &chunks {
+            assert!(d.len() + i.len() <= 3);
+        }
+    }
+
+    #[test]
+    fn encode_apply_args_format() {
+        // empty lists: two zero-length prefixes
+        let buf = encode_apply_args(&[], &[]);
+        assert_eq!(buf, vec![0, 0, 0, 0, 0, 0, 0, 0]);
+
+        // one delete, one insert with single-byte bodies
+        let buf = encode_apply_args(
+            &[Bytes::from_static(&[0xAA])],
+            &[Bytes::from_static(&[0xBB, 0xCC])],
+        );
+        let expected = vec![
+            // deletes: count=1
+            0x01, 0x00, 0x00, 0x00,
+            // delete[0]: len=1
+            0x01, 0x00, 0x00, 0x00,
+            0xAA,
+            // inserts: count=1
+            0x01, 0x00, 0x00, 0x00,
+            // insert[0]: len=2
+            0x02, 0x00, 0x00, 0x00,
+            0xBB, 0xCC,
+        ];
+        assert_eq!(buf, expected);
+    }
+}
