@@ -5,16 +5,17 @@
 //! counts and on-disk sizes belong to the local SpacetimeDB process —
 //! query it via SQL if you need those.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 const WINDOW_BUCKETS: usize = 30;
@@ -208,6 +209,100 @@ impl PublisherMetrics {
     }
 }
 
+/// Bounded in-process log ring. The `EventLogLayer` (a
+/// `tracing_subscriber::Layer`) pushes structured events here; the
+/// dashboard's `/events` endpoint reads them. Capacity is per-process,
+/// not per-target — events are evicted oldest-first when full.
+pub struct EventRing {
+    capacity: usize,
+    inner: Mutex<EventRingInner>,
+}
+
+struct EventRingInner {
+    /// Monotonic sequence assigned to every pushed event. Lets the
+    /// dashboard poll `/events?since=N` and only fetch new lines.
+    seq: u64,
+    events: VecDeque<LogEvent>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct LogEvent {
+    pub seq: u64,
+    /// Milliseconds since UNIX epoch. Millisecond precision is enough
+    /// to order events that fire within the same second.
+    pub ts_ms: u64,
+    pub level: &'static str,
+    pub target: String,
+    pub message: String,
+    pub fields: Vec<(String, String)>,
+}
+
+impl EventRing {
+    pub fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            inner: Mutex::new(EventRingInner {
+                seq: 0,
+                events: VecDeque::with_capacity(capacity),
+            }),
+        })
+    }
+
+    pub fn push(
+        &self,
+        level: &'static str,
+        target: String,
+        message: String,
+        fields: Vec<(String, String)>,
+    ) {
+        let ts_ms = epoch_millis();
+        let mut inner = self.inner.lock();
+        inner.seq += 1;
+        let event = LogEvent {
+            seq: inner.seq,
+            ts_ms,
+            level,
+            target,
+            message,
+            fields,
+        };
+        if inner.events.len() >= self.capacity {
+            inner.events.pop_front();
+        }
+        inner.events.push_back(event);
+    }
+
+    /// Returns events with `seq > since`, capped at `max`. Used by the
+    /// dashboard's polling tail.
+    pub fn snapshot_since(&self, since: u64, max: usize) -> EventsSnapshot {
+        let inner = self.inner.lock();
+        let events: Vec<LogEvent> = inner
+            .events
+            .iter()
+            .filter(|e| e.seq > since)
+            .take(max)
+            .cloned()
+            .collect();
+        EventsSnapshot {
+            current_seq: inner.seq,
+            events,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct EventsSnapshot {
+    pub current_seq: u64,
+    pub events: Vec<LogEvent>,
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub struct Metrics {
     pub upstream: LinkMetrics,
     pub local_stdb: LinkMetrics,
@@ -217,6 +312,7 @@ pub struct Metrics {
     pub started_at: u64,
     pub upstream_database: String,
     pub mirror_database: String,
+    pub events: Arc<EventRing>,
 }
 
 impl Metrics {
@@ -224,6 +320,7 @@ impl Metrics {
         upstream_database: String,
         mirror_database: String,
         max_in_flight: u64,
+        events: Arc<EventRing>,
     ) -> Arc<Self> {
         Arc::new(Self {
             upstream: LinkMetrics::new(),
@@ -234,6 +331,7 @@ impl Metrics {
             started_at: epoch_secs(),
             upstream_database,
             mirror_database,
+            events,
         })
     }
 
@@ -332,6 +430,7 @@ pub async fn serve(bind: SocketAddr, metrics: Arc<Metrics>) -> anyhow::Result<()
     let app = Router::new()
         .route("/", get(index))
         .route("/metrics", get(metrics_json))
+        .route("/events", get(events_json))
         .with_state(metrics);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -347,8 +446,148 @@ async fn metrics_json(State(metrics): State<Arc<Metrics>>) -> impl IntoResponse 
     Json(metrics.snapshot())
 }
 
+#[derive(Deserialize)]
+pub struct EventsQuery {
+    #[serde(default)]
+    since: u64,
+    #[serde(default = "default_max")]
+    max: usize,
+}
+
+fn default_max() -> usize {
+    200
+}
+
+async fn events_json(
+    State(metrics): State<Arc<Metrics>>,
+    Query(q): Query<EventsQuery>,
+) -> impl IntoResponse {
+    let max = q.max.min(1000);
+    Json(metrics.events.snapshot_since(q.since, max))
+}
+
 async fn index() -> impl IntoResponse {
     Html(INDEX_HTML)
 }
 
 const INDEX_HTML: &str = include_str!("dashboard.html");
+
+/// Custom `tracing_subscriber::Layer` that captures events with target
+/// prefix `relay` and pushes them into the dashboard's event ring.
+///
+/// We capture every `relay::*` event regardless of `RUST_LOG` (the
+/// fmt layer still respects it) so the dashboard can show debug-level
+/// detail without restarting with verbose env. Pair this layer with a
+/// per-layer `EnvFilter` like `EnvFilter::new("relay=debug")` so that
+/// it only sees relay events even when other crates are noisy.
+pub struct EventLogLayer {
+    ring: Arc<EventRing>,
+}
+
+impl EventLogLayer {
+    pub fn new(ring: Arc<EventRing>) -> Self {
+        Self { ring }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for EventLogLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let metadata = event.metadata();
+        let target = metadata.target();
+        if !target.starts_with("relay") {
+            return;
+        }
+        let mut visit = FieldCapture::default();
+        event.record(&mut visit);
+        self.ring.push(
+            metadata.level().as_str(),
+            target.to_string(),
+            visit.message,
+            visit.fields,
+        );
+    }
+}
+
+#[derive(Default)]
+struct FieldCapture {
+    message: String,
+    fields: Vec<(String, String)>,
+}
+
+impl tracing::field::Visit for FieldCapture {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let formatted = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = formatted;
+        } else {
+            self.fields.push((field.name().to_string(), formatted));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+
+    #[test]
+    fn ring_evicts_oldest_when_full() {
+        let ring = EventRing::new(3);
+        for i in 0..5 {
+            ring.push("info", "relay::test".into(), format!("m{i}"), vec![]);
+        }
+        let snap = ring.snapshot_since(0, 100);
+        assert_eq!(snap.current_seq, 5);
+        assert_eq!(snap.events.len(), 3);
+        assert_eq!(snap.events[0].message, "m2");
+        assert_eq!(snap.events[2].message, "m4");
+    }
+
+    #[test]
+    fn snapshot_since_returns_only_new_events() {
+        let ring = EventRing::new(10);
+        ring.push("info", "relay::test".into(), "first".into(), vec![]);
+        let s1 = ring.snapshot_since(0, 100);
+        assert_eq!(s1.current_seq, 1);
+        ring.push("info", "relay::test".into(), "second".into(), vec![]);
+        let s2 = ring.snapshot_since(s1.current_seq, 100);
+        assert_eq!(s2.events.len(), 1);
+        assert_eq!(s2.events[0].message, "second");
+    }
+
+    #[test]
+    fn layer_captures_relay_targets_and_skips_others() {
+        let ring = EventRing::new(50);
+        let layer = EventLogLayer::new(ring.clone())
+            .with_filter(tracing_subscriber::EnvFilter::new("relay=trace,other=trace"));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "relay::test", field_a = "v1", "captured-message");
+            tracing::info!(target: "other::test", "should-not-appear");
+        });
+        let snap = ring.snapshot_since(0, 100);
+        assert_eq!(snap.events.len(), 1);
+        let ev = &snap.events[0];
+        assert_eq!(ev.target, "relay::test");
+        assert_eq!(ev.message, "captured-message");
+        assert_eq!(ev.level, "INFO");
+        assert!(ev.fields.iter().any(|(k, v)| k == "field_a" && v == "v1"));
+    }
+}

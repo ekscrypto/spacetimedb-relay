@@ -80,6 +80,70 @@
   .stale { opacity: 0.5; }
   .footer { margin-top: 24px; color: var(--muted); font-size: 11px; }
   code { background: #0d1117; padding: 1px 4px; border-radius: 3px; }
+  .log-panel { margin-top: 24px; }
+  .log-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+    font-size: 12px;
+  }
+  .log-controls label { color: var(--muted); }
+  .log-controls input[type=text] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    width: 220px;
+  }
+  .log-controls button {
+    background: #21262d;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .log-controls button:hover { background: #30363d; }
+  .log-window {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    height: 360px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .log-row { display: flex; gap: 8px; padding: 1px 0; }
+  .log-ts { color: var(--muted); flex: 0 0 auto; }
+  .log-level {
+    flex: 0 0 auto;
+    width: 44px;
+    text-align: center;
+    border-radius: 3px;
+    font-size: 10px;
+    text-transform: uppercase;
+    padding: 0 4px;
+    align-self: center;
+  }
+  .log-level.error { background: rgba(248, 81, 73, 0.18); color: var(--bad); }
+  .log-level.warn  { background: rgba(210, 153, 34, 0.18); color: var(--warn); }
+  .log-level.info  { background: rgba(63, 185, 80, 0.14); color: var(--good); }
+  .log-level.debug { background: #161b22; color: var(--muted); }
+  .log-level.trace { background: #161b22; color: var(--muted); }
+  .log-target { color: #79c0ff; flex: 0 0 auto; }
+  .log-message { flex: 1 1 auto; }
+  .log-fields { color: var(--muted); }
+  .log-fields .k { color: #d2a8ff; }
+  .log-fields .v { color: var(--text); }
 </style>
 </head>
 <body>
@@ -153,10 +217,23 @@
   </div>
 </div>
 
+<div class="log-panel">
+  <h2 style="margin-top:0">Live log</h2>
+  <div class="log-controls">
+    <label for="log-filter">filter</label>
+    <input type="text" id="log-filter" placeholder="substring, e.g. upstream or Subscribe" />
+    <label><input type="checkbox" id="log-pause" /> pause</label>
+    <label><input type="checkbox" id="log-autoscroll" checked /> autoscroll</label>
+    <button id="log-clear" type="button">clear</button>
+    <span id="log-status" class="pill">—</span>
+  </div>
+  <div id="log-window" class="log-window"></div>
+</div>
+
 <div class="footer">
   <span id="uptime">uptime —</span> &middot;
-  fetched from <code>/metrics</code> &middot;
-  refresh every 5s
+  fetched from <code>/metrics</code> + <code>/events</code> &middot;
+  refresh every 5s (metrics) / 1s (log)
 </div>
 
 <script>
@@ -232,6 +309,115 @@
 
   refresh();
   setInterval(refresh, 5000);
+
+  // ----- live log -----
+  const MAX_LOG_ROWS = 500;
+  const logWindow = document.getElementById('log-window');
+  const logFilter = document.getElementById('log-filter');
+  const logPause = document.getElementById('log-pause');
+  const logAutoscroll = document.getElementById('log-autoscroll');
+  const logClear = document.getElementById('log-clear');
+  const logStatus = document.getElementById('log-status');
+  let lastSeq = 0;
+
+  function fmtTs(ms) {
+    const d = new Date(ms);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    const mmm = String(d.getMilliseconds()).padStart(3, '0');
+    return `${hh}:${mm}:${ss}.${mmm}`;
+  }
+
+  function escapeHtml(s) {
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderRow(ev) {
+    const filterStr = logFilter.value.trim().toLowerCase();
+    if (filterStr) {
+      const haystack = (ev.target + ' ' + ev.message + ' ' +
+        ev.fields.map(([k, v]) => k + '=' + v).join(' ')).toLowerCase();
+      if (!haystack.includes(filterStr)) return null;
+    }
+    const level = (ev.level || 'info').toLowerCase();
+    const fieldsHtml = ev.fields.length
+      ? ' <span class="log-fields">' +
+        ev.fields.map(([k, v]) =>
+          '<span class="k">' + escapeHtml(k) + '</span>=' +
+          '<span class="v">' + escapeHtml(v) + '</span>'
+        ).join(' ') +
+        '</span>'
+      : '';
+    const row = document.createElement('div');
+    row.className = 'log-row';
+    row.innerHTML =
+      '<span class="log-ts">' + fmtTs(ev.ts_ms) + '</span>' +
+      '<span class="log-level ' + level + '">' + level + '</span>' +
+      '<span class="log-target">' + escapeHtml(ev.target) + '</span>' +
+      '<span class="log-message">' + escapeHtml(ev.message) + fieldsHtml + '</span>';
+    return row;
+  }
+
+  function rerenderAll(events) {
+    // Re-render the current view based on the cached buffer when the
+    // filter changes. We keep the last MAX_LOG_ROWS events around so
+    // the user can flip filter on/off without the buffer disappearing.
+    logWindow.innerHTML = '';
+    for (const ev of events) {
+      const row = renderRow(ev);
+      if (row) logWindow.appendChild(row);
+    }
+    if (logAutoscroll.checked) {
+      logWindow.scrollTop = logWindow.scrollHeight;
+    }
+  }
+
+  const eventBuffer = [];
+
+  async function pollLog() {
+    if (logPause.checked) {
+      logStatus.textContent = 'paused';
+      logStatus.className = 'pill initial';
+      return;
+    }
+    try {
+      const r = await fetch('/events?since=' + lastSeq + '&max=200', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      lastSeq = data.current_seq;
+      for (const ev of data.events) {
+        eventBuffer.push(ev);
+        const row = renderRow(ev);
+        if (row) logWindow.appendChild(row);
+      }
+      while (eventBuffer.length > MAX_LOG_ROWS) eventBuffer.shift();
+      while (logWindow.children.length > MAX_LOG_ROWS) {
+        logWindow.removeChild(logWindow.firstChild);
+      }
+      if (data.events.length && logAutoscroll.checked) {
+        logWindow.scrollTop = logWindow.scrollHeight;
+      }
+      logStatus.textContent = 'live · ' + eventBuffer.length + ' rows';
+      logStatus.className = 'pill up';
+    } catch (e) {
+      logStatus.textContent = 'fetch error';
+      logStatus.className = 'pill down';
+    }
+  }
+
+  logFilter.addEventListener('input', () => rerenderAll(eventBuffer));
+  logClear.addEventListener('click', () => {
+    eventBuffer.length = 0;
+    logWindow.innerHTML = '';
+  });
+
+  pollLog();
+  setInterval(pollLog, 1000);
 </script>
 </body>
 </html>

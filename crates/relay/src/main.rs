@@ -10,7 +10,9 @@ use anyhow::Result;
 use clap::Parser;
 #[cfg(not(feature = "profile-heap"))]
 use mimalloc::MiMalloc;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 use url::Url;
 
 // Heap-profiling builds replace mimalloc with dhat::Alloc so every
@@ -137,10 +139,19 @@ async fn main() -> Result<()> {
     // on the first TLS handshake if no provider has been installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    // Two layers: an `fmt` layer for stderr (respects `RUST_LOG`) and
+    // an `EventLogLayer` that always captures `relay=debug` into the
+    // dashboard's in-process ring buffer. The dashboard view exists
+    // precisely so we can see debug-level events without re-running
+    // with a louder `RUST_LOG`.
+    let event_ring = dashboard::EventRing::new(2000);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
+    let event_layer = dashboard::EventLogLayer::new(event_ring.clone())
+        .with_filter(EnvFilter::new("relay=debug"));
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(event_layer)
         .init();
 
     let args = Args::parse();
@@ -186,6 +197,7 @@ async fn main() -> Result<()> {
         args.database.clone(),
         mirror_database.clone(),
         DEFAULT_MAX_IN_FLIGHT,
+        event_ring,
     );
 
     if !args.dashboard_bind.trim().is_empty() {
@@ -224,7 +236,7 @@ async fn main() -> Result<()> {
         codegen_script,
         spacetime_bin: args.spacetime_bin,
     };
-    stdb_mode::run(cfg, raw_schema.into(), Arc::new(schema), metrics).await
+    stdb_mode::run(cfg, raw_schema, Arc::new(schema), metrics).await
 }
 
 fn sanitize_db_name(name: &str) -> String {
