@@ -117,6 +117,14 @@ struct Args {
     /// Empty string disables the dashboard.
     #[arg(long = "dashboard-bind", env = "RELAY_DASHBOARD_BIND", default_value = "127.0.0.1:3001")]
     dashboard_bind: String,
+
+    /// File where the relay persists the local-stdb identity token
+    /// captured from `InitialConnection`. Loaded on startup so the
+    /// relay reconnects as the same identity (and thus the bound
+    /// writer) across restarts. Defaults to
+    /// `<data-dir>/relay-stdb-identity.token`.
+    #[arg(long = "identity-token-file", env = "RELAY_IDENTITY_TOKEN_FILE")]
+    identity_token_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -166,6 +174,10 @@ async fn main() -> Result<()> {
         .codegen_script
         .clone()
         .unwrap_or_else(|| default_repo_path("tools/codegen.py"));
+    let identity_token_file = args
+        .identity_token_file
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("relay-stdb-identity.token"));
 
     // Default in-flight cap matches relay-mirror-driver's default; we
     // remember it here so the dashboard can show "used / max".
@@ -205,6 +217,7 @@ async fn main() -> Result<()> {
         stdb_url: args.stdb_url,
         mirror_database,
         identity_token: args.stdb_identity_token,
+        identity_token_file,
         stdb_server_alias: args.stdb_server_alias,
         publisher_workdir,
         publisher_template_dir: template_dir,

@@ -51,10 +51,15 @@ pub struct StdbModeConfig {
     pub stdb_url: Url,
     /// Database name to publish under (e.g. `relay-mirror-bitcraft-14`).
     pub mirror_database: String,
-    /// Bearer token for the writer identity. The same identity that
-    /// runs `spacetime publish` should be used here so the wasm
-    /// `assert_writer` gate accepts our calls.
+    /// Optional explicit Bearer token for the local-stdb connection.
+    /// Usually `None` — the relay reads/writes
+    /// `identity_token_file` instead so it captures the identity
+    /// SpacetimeDB issued on the first connection. This field is only
+    /// here for callers who want to override that flow.
     pub identity_token: Option<String>,
+    /// File the relay persists the local-stdb identity token to.
+    /// Loaded on startup; written after `connect()` if absent or stale.
+    pub identity_token_file: PathBuf,
     /// Server alias known to `spacetime` CLI (e.g. `relay-local`).
     pub stdb_server_alias: String,
 
@@ -96,17 +101,43 @@ pub async fn run(
     );
     metrics.publisher.record(&outcome.fingerprint, outcome.republished);
 
-    // 2. Open the WS link to local stdb and bind ourselves as the
-    //    writer (idempotent if init already captured us).
+    // 2. Open the WS link to local stdb. The token comes either from
+    //    an explicit override on cfg.identity_token, or from a token
+    //    file the relay persisted on a previous run. If neither is
+    //    available we connect anonymously and capture the
+    //    server-issued token from `InitialConnection`, so the next
+    //    restart reconnects as the same identity.
+    let identity_token = if cfg.identity_token.is_some() {
+        cfg.identity_token.clone()
+    } else {
+        load_identity_token(&cfg.identity_token_file)
+    };
     let mut driver = MirrorDriver::connect(DriverConfig {
         stdb_url: cfg.stdb_url.clone(),
         database: cfg.mirror_database.clone(),
-        identity_token: cfg.identity_token.clone(),
+        identity_token,
         ..Default::default()
     })
     .await
     .context("connect to local SpacetimeDB")?;
     metrics.local_stdb.mark_up();
+    if let Some(captured) = driver.captured() {
+        if let Err(e) = save_identity_token(&cfg.identity_token_file, &captured.token) {
+            tracing::warn!(
+                target: "relay::stdb_mode",
+                path = %cfg.identity_token_file.display(),
+                error = %e,
+                "failed to persist local-stdb identity token"
+            );
+        } else {
+            tracing::info!(
+                target: "relay::stdb_mode",
+                identity = %captured.identity_hex,
+                path = %cfg.identity_token_file.display(),
+                "persisted local-stdb identity token"
+            );
+        }
+    }
     driver
         .bind_writer()
         .await
@@ -279,6 +310,56 @@ pub async fn run(
     }
 
     let _ = driver.close().await;
+    Ok(())
+}
+
+fn load_identity_token(path: &std::path::Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                target: "relay::stdb_mode",
+                path = %path.display(),
+                error = %e,
+                "failed to read persisted identity token"
+            );
+            None
+        }
+    }
+}
+
+fn save_identity_token(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write to a temp file then rename so a crashed write never leaves
+    // a partial token on disk.
+    let tmp = path.with_extension("token.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        use std::io::Write;
+        f.write_all(token.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 

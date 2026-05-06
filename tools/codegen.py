@@ -16,9 +16,9 @@ from typing import Any
 
 AUTH_SCAFFOLD = """\
 /// Singleton table tracking which Identity is allowed to call the
-/// `relay_insert_*` reducers. Populated by the `init` lifecycle hook
-/// (sender = the publisher) or by an idempotent `relay_bind_writer`
-/// fallback if init's sender wasn't preserved across republish.
+/// `relay_insert_*` reducers. Empty after `init`; populated by the
+/// first caller of `relay_bind_writer` (the relay process on its
+/// first WS connection after publish).
 #[spacetimedb::table(name = "_relay_meta", accessor = relay_meta)]
 pub struct RelayMetaRow {
     #[primary_key]
@@ -27,13 +27,13 @@ pub struct RelayMetaRow {
 }
 
 #[spacetimedb::reducer(init)]
-fn relay_init(ctx: &ReducerContext) {
-    if ctx.db.relay_meta().id().find(&0u8).is_none() {
-        ctx.db.relay_meta().insert(RelayMetaRow {
-            id: 0,
-            writer: ctx.sender(),
-        });
-    }
+fn relay_init(_ctx: &ReducerContext) {
+    // Intentionally empty. The writer slot is claimed by the first
+    // caller of `relay_bind_writer` — typically the relay's runtime
+    // WS connection moments after publish. We avoid auto-binding to
+    // `ctx.sender()` here because that's the publishing identity (the
+    // spacetime CLI), which the relay process can't easily replay
+    // without sharing its login token.
 }
 
 /// Idempotent: succeeds if no writer is bound yet, or if the caller
