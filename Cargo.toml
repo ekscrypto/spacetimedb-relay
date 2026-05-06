@@ -8,8 +8,11 @@ members = [
     "crates/relay-engine",
     "crates/relay-server",
     "crates/relay-test-harness",
+    "crates/relay-publisher",
+    "crates/relay-mirror-driver",
+    "spike/replay",
 ]
-exclude = ["test-module"]
+exclude = ["test-module", "spike/mirror"]
 
 [workspace.package]
 version = "1.0.1"
@@ -23,6 +26,8 @@ relay-upstream = { path = "crates/relay-upstream" }
 relay-storage  = { path = "crates/relay-storage" }
 relay-engine   = { path = "crates/relay-engine" }
 relay-server   = { path = "crates/relay-server" }
+relay-publisher = { path = "crates/relay-publisher" }
+relay-mirror-driver = { path = "crates/relay-mirror-driver" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -53,8 +58,11 @@ dashmap = "6"
 parking_lot = "0.12"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 mimalloc = { version = "0.1", default-features = false }
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+dhat = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 hex = "0.4"
+sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 
