@@ -18,6 +18,7 @@
 //!   updating MemStore + the engine.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,8 @@ use relay_upstream::{
 };
 use tokio::sync::mpsc;
 use url::Url;
+
+use crate::dashboard::Metrics;
 
 /// CLI-derived configuration for the stdb-backed mode.
 #[derive(Debug, Clone)]
@@ -65,7 +68,12 @@ pub struct StdbModeConfig {
     pub spacetime_bin: PathBuf,
 }
 
-pub async fn run(cfg: StdbModeConfig, raw_schema: Vec<u8>, schema: Arc<MirroredSchema>) -> Result<()> {
+pub async fn run(
+    cfg: StdbModeConfig,
+    raw_schema: Vec<u8>,
+    schema: Arc<MirroredSchema>,
+    metrics: Arc<Metrics>,
+) -> Result<()> {
     // 1. Publish the mirror module if the schema has drifted (or this
     //    is the first run). Wipes the whole local database on drift.
     let publisher = Publisher::new(PublisherConfig {
@@ -86,6 +94,7 @@ pub async fn run(cfg: StdbModeConfig, raw_schema: Vec<u8>, schema: Arc<MirroredS
         fingerprint = %outcome.fingerprint,
         "mirror module ready"
     );
+    metrics.publisher.record(&outcome.fingerprint, outcome.republished);
 
     // 2. Open the WS link to local stdb and bind ourselves as the
     //    writer (idempotent if init already captured us).
@@ -97,6 +106,7 @@ pub async fn run(cfg: StdbModeConfig, raw_schema: Vec<u8>, schema: Arc<MirroredS
     })
     .await
     .context("connect to local SpacetimeDB")?;
+    metrics.local_stdb.mark_up();
     driver
         .bind_writer()
         .await
@@ -173,17 +183,25 @@ pub async fn run(cfg: StdbModeConfig, raw_schema: Vec<u8>, schema: Arc<MirroredS
             match event {
                 UpstreamEvent::Connected => {
                     connected_at = Some(std::time::Instant::now());
+                    metrics.upstream.mark_up();
                     tracing::info!(target: "relay::stdb_mode", "upstream connected");
                 }
                 UpstreamEvent::Frame(frame) => {
                     frames += 1;
+                    let frame_bytes = frame.bsatn.len() as u64;
+                    metrics.upstream.record_traffic(frame_bytes, 1);
                     let tag = frame.server_tag();
                     let protocol = frame.protocol;
                     match frame.decode() {
                         Ok(message) => {
-                            if let Err(e) =
-                                handle_message(message, &subscribe_tables, &cmd_tx, &mut driver)
-                                    .await
+                            if let Err(e) = handle_message(
+                                message,
+                                &subscribe_tables,
+                                &cmd_tx,
+                                &mut driver,
+                                &metrics,
+                            )
+                            .await
                             {
                                 tracing::error!(
                                     target: "relay::stdb_mode",
@@ -193,6 +211,7 @@ pub async fn run(cfg: StdbModeConfig, raw_schema: Vec<u8>, schema: Arc<MirroredS
                                 // Driver/stdb link is critical; bail out
                                 // of the inner loop so we reconnect both
                                 // ends.
+                                metrics.local_stdb.mark_down(Some(format!("{e}")));
                                 break InnerExit::UpstreamGone;
                             }
                         }
@@ -204,6 +223,10 @@ pub async fn run(cfg: StdbModeConfig, raw_schema: Vec<u8>, schema: Arc<MirroredS
                             "failed to decode ServerMessage"
                         ),
                     }
+                    metrics.available_permits.store(
+                        driver.available_permits() as u64,
+                        Ordering::Relaxed,
+                    );
                     if let Some(limit) = cfg.frame_limit {
                         if frames >= limit {
                             tracing::info!(target: "relay::stdb_mode", frames, "frame limit reached");
@@ -215,6 +238,7 @@ pub async fn run(cfg: StdbModeConfig, raw_schema: Vec<u8>, schema: Arc<MirroredS
                 UpstreamEvent::Ping => {}
                 UpstreamEvent::Disconnected { reason } => {
                     tracing::warn!(target: "relay::stdb_mode", %reason, "upstream disconnected");
+                    metrics.upstream.mark_down(Some(reason.clone()));
                     break InnerExit::UpstreamGone;
                 }
             }
@@ -263,6 +287,7 @@ async fn handle_message(
     subscribe_tables: &[String],
     cmd_tx: &mpsc::Sender<UpstreamCommand>,
     driver: &mut MirrorDriver,
+    metrics: &Arc<Metrics>,
 ) -> Result<()> {
     match message {
         ServerMessage::InitialConnection(ic) => {
@@ -308,10 +333,13 @@ async fn handle_message(
                     rows = inserts.len(),
                     "applying initial subscribe rows"
                 );
-                driver
+                let stats = driver
                     .apply(upstream_name, Vec::new(), inserts)
                     .await
                     .with_context(|| format!("driver.apply for {upstream_name}"))?;
+                metrics
+                    .local_stdb
+                    .record_traffic(stats.bytes_sent, stats.calls);
             }
         }
         ServerMessage::TransactionUpdate(tu) => {
@@ -334,10 +362,13 @@ async fn handle_message(
                     if deletes.is_empty() && inserts.is_empty() {
                         continue;
                     }
-                    driver
+                    let stats = driver
                         .apply(upstream_name, deletes, inserts)
                         .await
                         .with_context(|| format!("driver.apply for {upstream_name}"))?;
+                    metrics
+                        .local_stdb
+                        .record_traffic(stats.bytes_sent, stats.calls);
                 }
             }
         }

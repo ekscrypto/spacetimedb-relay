@@ -89,6 +89,14 @@ type Conn = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Conn, Message>;
 type Stream = SplitStream<Conn>;
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ApplyStats {
+    pub calls: u64,
+    pub bytes_sent: u64,
+    pub deletes: u64,
+    pub inserts: u64,
+}
+
 pub struct MirrorDriver {
     sink: Sink,
     in_flight: Arc<Semaphore>,
@@ -122,6 +130,13 @@ impl MirrorDriver {
         self.send_call("relay_bind_writer", &[]).await
     }
 
+    /// Available permits on the in-flight semaphore. The "used" count
+    /// is `max_in_flight - available`; callers that want the absolute
+    /// number should remember the configured cap themselves.
+    pub fn available_permits(&self) -> usize {
+        self.in_flight.available_permits()
+    }
+
     /// Apply one TableUpdate's worth of changes for `table`. Splits into
     /// multiple `relay_apply_<table>` calls when the row count exceeds
     /// `max_rows_per_apply`; pairing within each chunk still happens
@@ -135,7 +150,7 @@ impl MirrorDriver {
         table: &str,
         deletes: Vec<Bytes>,
         inserts: Vec<Bytes>,
-    ) -> Result<(), DriverError> {
+    ) -> Result<ApplyStats, DriverError> {
         let reducer = format!("relay_apply_{table}");
         let chunks = chunk_apply(
             deletes,
@@ -143,11 +158,16 @@ impl MirrorDriver {
             self.max_rows_per_apply,
             self.max_bytes_per_apply,
         );
+        let mut stats = ApplyStats::default();
         for (deletes_chunk, inserts_chunk) in chunks {
             let args = encode_apply_args(&deletes_chunk, &inserts_chunk);
+            stats.calls += 1;
+            stats.bytes_sent += args.len() as u64;
+            stats.deletes += deletes_chunk.len() as u64;
+            stats.inserts += inserts_chunk.len() as u64;
             self.send_call(&reducer, &args).await?;
         }
-        Ok(())
+        Ok(stats)
     }
 
     pub async fn close(mut self) -> Result<(), DriverError> {

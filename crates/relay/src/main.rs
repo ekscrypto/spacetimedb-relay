@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+mod dashboard;
 mod stdb_mode;
 
 use std::path::PathBuf;
@@ -111,6 +112,11 @@ struct Args {
     /// Path to the `spacetime` CLI binary.
     #[arg(long = "spacetime-bin", env = "RELAY_SPACETIME_BIN", default_value = "spacetime")]
     spacetime_bin: PathBuf,
+
+    /// Bind address for the in-process dashboard (HTML + /metrics JSON).
+    /// Empty string disables the dashboard.
+    #[arg(long = "dashboard-bind", env = "RELAY_DASHBOARD_BIND", default_value = "127.0.0.1:3001")]
+    dashboard_bind: String,
 }
 
 #[tokio::main]
@@ -161,6 +167,34 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_repo_path("tools/codegen.py"));
 
+    // Default in-flight cap matches relay-mirror-driver's default; we
+    // remember it here so the dashboard can show "used / max".
+    const DEFAULT_MAX_IN_FLIGHT: u64 = 8000;
+    let metrics = dashboard::Metrics::new(
+        args.database.clone(),
+        mirror_database.clone(),
+        DEFAULT_MAX_IN_FLIGHT,
+    );
+
+    if !args.dashboard_bind.trim().is_empty() {
+        match args.dashboard_bind.parse::<std::net::SocketAddr>() {
+            Ok(bind) => {
+                let m = metrics.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dashboard::serve(bind, m).await {
+                        tracing::error!(target: "relay::dashboard", error = %e, "dashboard exited");
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(
+                target: "relay",
+                bind = %args.dashboard_bind,
+                error = %e,
+                "invalid --dashboard-bind; dashboard disabled"
+            ),
+        }
+    }
+
     let cfg = stdb_mode::StdbModeConfig {
         upstream_host: args.upstream,
         upstream_database: args.database,
@@ -177,7 +211,7 @@ async fn main() -> Result<()> {
         codegen_script,
         spacetime_bin: args.spacetime_bin,
     };
-    stdb_mode::run(cfg, raw_schema.into(), Arc::new(schema)).await
+    stdb_mode::run(cfg, raw_schema.into(), Arc::new(schema), metrics).await
 }
 
 fn sanitize_db_name(name: &str) -> String {

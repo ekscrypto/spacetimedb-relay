@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>spacetimedb-relay</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --good: #3fb950;
+    --bad: #f85149;
+    --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 16px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+  }
+  .panel h3 {
+    margin: 0 0 12px;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .pill {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: #21262d;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+  .pill.up { background: rgba(63, 185, 80, 0.18); color: var(--good); }
+  .pill.down { background: rgba(248, 81, 73, 0.18); color: var(--bad); }
+  .pill.initial { background: rgba(210, 153, 34, 0.18); color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 4px 0; vertical-align: top; }
+  td.label { color: var(--muted); width: 40%; }
+  td.value { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .number { text-align: right; font-variant-numeric: tabular-nums; }
+  .windows {
+    margin-top: 12px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+  .windows .bucket {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px;
+    text-align: center;
+  }
+  .windows .bucket .label { font-size: 10px; color: var(--muted); text-transform: uppercase; }
+  .windows .bucket .value { font-size: 16px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  header { display: flex; justify-content: space-between; align-items: baseline; }
+  .stale { opacity: 0.5; }
+  .footer { margin-top: 24px; color: var(--muted); font-size: 11px; }
+  code { background: #0d1117; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>spacetimedb-relay</h1>
+    <div id="header-sub" class="muted">loading…</div>
+  </div>
+  <div>
+    <span id="last-update" class="pill">—</span>
+  </div>
+</header>
+
+<div class="grid">
+  <div class="panel" id="upstream-panel">
+    <h3>Upstream link <span id="upstream-state" class="pill">—</span></h3>
+    <table>
+      <tr><td class="label">database</td><td class="value" id="upstream-db">—</td></tr>
+      <tr><td class="label">last connected</td><td class="value" id="upstream-up">—</td></tr>
+      <tr><td class="label">last disconnect</td><td class="value" id="upstream-down">—</td></tr>
+      <tr><td class="label">disconnect reason</td><td class="value" id="upstream-reason">—</td></tr>
+      <tr><td class="label">total frames</td><td class="value number" id="upstream-total-units">0</td></tr>
+      <tr><td class="label">total bytes</td><td class="value number" id="upstream-total-bytes">0</td></tr>
+    </table>
+    <h2 style="margin-top:18px">frames received</h2>
+    <div class="windows">
+      <div class="bucket"><div class="label">last 1m</div><div class="value" id="upstream-units-1m">0</div></div>
+      <div class="bucket"><div class="label">last 5m</div><div class="value" id="upstream-units-5m">0</div></div>
+      <div class="bucket"><div class="label">last 30m</div><div class="value" id="upstream-units-30m">0</div></div>
+    </div>
+    <h2 style="margin-top:12px">bytes received</h2>
+    <div class="windows">
+      <div class="bucket"><div class="label">last 1m</div><div class="value" id="upstream-bytes-1m">0</div></div>
+      <div class="bucket"><div class="label">last 5m</div><div class="value" id="upstream-bytes-5m">0</div></div>
+      <div class="bucket"><div class="label">last 30m</div><div class="value" id="upstream-bytes-30m">0</div></div>
+    </div>
+  </div>
+
+  <div class="panel" id="local-panel">
+    <h3>Local SpacetimeDB <span id="local-state" class="pill">—</span></h3>
+    <table>
+      <tr><td class="label">database</td><td class="value" id="local-db">—</td></tr>
+      <tr><td class="label">last connected</td><td class="value" id="local-up">—</td></tr>
+      <tr><td class="label">last disconnect</td><td class="value" id="local-down">—</td></tr>
+      <tr><td class="label">disconnect reason</td><td class="value" id="local-reason">—</td></tr>
+      <tr><td class="label">in-flight calls</td><td class="value number" id="local-inflight">—</td></tr>
+      <tr><td class="label">total reducer calls</td><td class="value number" id="local-total-units">0</td></tr>
+      <tr><td class="label">total bytes sent</td><td class="value number" id="local-total-bytes">0</td></tr>
+    </table>
+    <h2 style="margin-top:18px">reducer calls sent</h2>
+    <div class="windows">
+      <div class="bucket"><div class="label">last 1m</div><div class="value" id="local-units-1m">0</div></div>
+      <div class="bucket"><div class="label">last 5m</div><div class="value" id="local-units-5m">0</div></div>
+      <div class="bucket"><div class="label">last 30m</div><div class="value" id="local-units-30m">0</div></div>
+    </div>
+    <h2 style="margin-top:12px">bytes sent</h2>
+    <div class="windows">
+      <div class="bucket"><div class="label">last 1m</div><div class="value" id="local-bytes-1m">0</div></div>
+      <div class="bucket"><div class="label">last 5m</div><div class="value" id="local-bytes-5m">0</div></div>
+      <div class="bucket"><div class="label">last 30m</div><div class="value" id="local-bytes-30m">0</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Mirror module</h3>
+    <table>
+      <tr><td class="label">schema fingerprint</td><td class="value" id="pub-fp">—</td></tr>
+      <tr><td class="label">last published</td><td class="value" id="pub-last">—</td></tr>
+      <tr><td class="label">republished this run</td><td class="value" id="pub-republished">—</td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="footer">
+  <span id="uptime">uptime —</span> &middot;
+  fetched from <code>/metrics</code> &middot;
+  refresh every 5s
+</div>
+
+<script>
+  const fmt = new Intl.NumberFormat();
+
+  function bytes(n) {
+    if (n < 1024) return fmt.format(n) + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  }
+
+  function ago(now, then) {
+    if (!then) return '—';
+    const s = now - then;
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+  }
+
+  function setState(elementId, state) {
+    const el = document.getElementById(elementId);
+    el.textContent = state;
+    el.className = 'pill ' + state;
+  }
+
+  function fillLink(prefix, link, now) {
+    setState(prefix + '-state', link.state);
+    document.getElementById(prefix + '-up').textContent = ago(now, link.last_up_at);
+    document.getElementById(prefix + '-down').textContent = ago(now, link.last_down_at);
+    document.getElementById(prefix + '-reason').textContent = link.last_disconnect_reason || '—';
+    document.getElementById(prefix + '-total-units').textContent = fmt.format(link.total_units);
+    document.getElementById(prefix + '-total-bytes').textContent = bytes(link.total_bytes);
+    document.getElementById(prefix + '-units-1m').textContent = fmt.format(link.units_1m);
+    document.getElementById(prefix + '-units-5m').textContent = fmt.format(link.units_5m);
+    document.getElementById(prefix + '-units-30m').textContent = fmt.format(link.units_30m);
+    document.getElementById(prefix + '-bytes-1m').textContent = bytes(link.bytes_1m);
+    document.getElementById(prefix + '-bytes-5m').textContent = bytes(link.bytes_5m);
+    document.getElementById(prefix + '-bytes-30m').textContent = bytes(link.bytes_30m);
+  }
+
+  async function refresh() {
+    try {
+      const r = await fetch('/metrics', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const m = await r.json();
+      document.getElementById('header-sub').textContent =
+        m.upstream_database + ' → ' + m.mirror_database;
+      document.getElementById('upstream-db').textContent = m.upstream_database;
+      document.getElementById('local-db').textContent = m.mirror_database;
+      fillLink('upstream', m.upstream, m.now);
+      fillLink('local', m.local_stdb, m.now);
+      document.getElementById('local-inflight').textContent =
+        fmt.format(m.in_flight.max - m.in_flight.available) +
+        ' / ' + fmt.format(m.in_flight.max);
+      document.getElementById('pub-fp').textContent = m.publisher.fingerprint || '—';
+      document.getElementById('pub-last').textContent = ago(m.now, m.publisher.last_published_at);
+      document.getElementById('pub-republished').textContent =
+        m.publisher.republished_this_run ? 'yes' : 'no';
+      document.getElementById('uptime').textContent =
+        'uptime ' + Math.floor((m.now - m.started_at) / 60) + 'm';
+      const ts = new Date().toLocaleTimeString();
+      const lu = document.getElementById('last-update');
+      lu.textContent = 'updated ' + ts;
+      lu.className = 'pill up';
+    } catch (e) {
+      const lu = document.getElementById('last-update');
+      lu.textContent = 'fetch error';
+      lu.className = 'pill down';
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>
+</body>
+</html>
