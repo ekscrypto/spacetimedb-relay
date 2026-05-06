@@ -17,7 +17,9 @@ use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use http::header::{HeaderName, HeaderValue, AUTHORIZATION};
-use spacetimedb_client_api_messages::websocket::v2::{CallReducer, CallReducerFlags, ClientMessage};
+use spacetimedb_client_api_messages::websocket::v2::{
+    CallReducer, CallReducerFlags, ClientMessage, ServerMessage,
+};
 use spacetimedb_sats::bsatn;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -104,11 +106,25 @@ pub struct MirrorDriver {
     drain_handle: Option<tokio::task::JoinHandle<()>>,
     max_rows_per_apply: usize,
     max_bytes_per_apply: usize,
+    captured: Option<InitialConnectionInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InitialConnectionInfo {
+    pub identity_hex: String,
+    pub token: String,
 }
 
 impl MirrorDriver {
     pub async fn connect(cfg: DriverConfig) -> Result<Self, DriverError> {
-        let conn = open_ws(&cfg).await?;
+        let mut conn = open_ws(&cfg).await?;
+        // SpacetimeDB sends `InitialConnection` as the first frame
+        // post-handshake. Capture the issued identity + token so the
+        // caller can persist it and reconnect as the same identity
+        // across restarts. We do this synchronously here, BEFORE
+        // splitting + spawning the drainer — otherwise the drainer
+        // might consume it.
+        let captured = read_initial_connection(&mut conn).await?;
         let (sink, stream) = conn.split();
         let in_flight = Arc::new(Semaphore::new(cfg.max_in_flight));
         let drain_handle = Some(tokio::spawn(drain_responses(stream, in_flight.clone())));
@@ -119,7 +135,16 @@ impl MirrorDriver {
             drain_handle,
             max_rows_per_apply: cfg.max_rows_per_apply,
             max_bytes_per_apply: cfg.max_bytes_per_apply,
+            captured: Some(captured),
         })
+    }
+
+    /// The identity + token reported by the local SpacetimeDB on this
+    /// connection's `InitialConnection`. Persist the token to disk and
+    /// pass it back as `DriverConfig::identity_token` on the next run
+    /// to reconnect as the same identity.
+    pub fn captured(&self) -> Option<&InitialConnectionInfo> {
+        self.captured.as_ref()
     }
 
     /// Idempotent. Calls the module's `relay_bind_writer` reducer, which
@@ -199,6 +224,52 @@ impl MirrorDriver {
             .await
             .map_err(|e| DriverError::Send(e.to_string()))?;
         Ok(())
+    }
+}
+
+async fn read_initial_connection(conn: &mut Conn) -> Result<InitialConnectionInfo, DriverError> {
+    use std::time::Duration;
+    let timeout = Duration::from_secs(10);
+    loop {
+        let msg = tokio::time::timeout(timeout, conn.next())
+            .await
+            .map_err(|_| DriverError::Connect("InitialConnection not received within 10s".into()))?
+            .ok_or_else(|| DriverError::Connect("ws closed before InitialConnection".into()))??;
+        let bytes = match msg {
+            Message::Binary(b) => b,
+            Message::Text(_) | Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(_) => {
+                return Err(DriverError::Connect("ws closed before InitialConnection".into()))
+            }
+            Message::Frame(_) => continue,
+        };
+        if bytes.is_empty() {
+            return Err(DriverError::Connect("empty initial frame".into()));
+        }
+        // Compression byte. We negotiated ?compression=None so anything
+        // non-zero is unexpected.
+        if bytes[0] != 0 {
+            return Err(DriverError::Connect(format!(
+                "unexpected compression tag {} on initial frame (compression=None requested)",
+                bytes[0]
+            )));
+        }
+        let body = &bytes[1..];
+        let server_msg: ServerMessage = bsatn::from_slice(body)
+            .map_err(|e| DriverError::Encode(format!("decode initial ServerMessage: {e}")))?;
+        match server_msg {
+            ServerMessage::InitialConnection(ic) => {
+                return Ok(InitialConnectionInfo {
+                    identity_hex: ic.identity.to_hex().as_str().to_string(),
+                    token: ic.token.to_string(),
+                });
+            }
+            other => {
+                return Err(DriverError::Connect(format!(
+                    "expected InitialConnection as first frame, got {other:?}"
+                )))
+            }
+        }
     }
 }
 
