@@ -68,6 +68,22 @@ fn assert_writer(ctx: &ReducerContext) -> Result<(), Box<str>> {
     }
     Ok(())
 }
+
+/// Upstream reducer provenance, threaded through every `relay_*_<table>`
+/// reducer as the second argument. The relay populates this from the
+/// upstream `TransactionUpdate` (or passes `None` for initial subscribe
+/// rows). Downstream clients read it back out of
+/// `ctx.event.reducer.args.upstream` to recover the original caller /
+/// timestamp / reducer name / request_id that triggered the change.
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct UpstreamReducerInfo {
+    pub reducer_name: String,
+    pub caller_identity: spacetimedb::Identity,
+    pub caller_connection_id: spacetimedb::ConnectionId,
+    pub timestamp: spacetimedb::Timestamp,
+    pub request_id: u32,
+    pub args: Vec<u8>,
+}
 """
 
 RUST_KEYWORDS = {
@@ -308,9 +324,20 @@ class Codegen:
             lines.append(f"    pub {fname}: {ty},")
         lines.append("}\n")
 
+        # The `upstream` arg carries the provenance (caller/timestamp/
+        # reducer-name/args) of the upstream TransactionUpdate that
+        # triggered this call. The wasm body ignores it — its only job
+        # is to ride along in the local TransactionUpdate.reducer_call
+        # so downstream subscribers can recover upstream context as
+        # `ctx.event.reducer.args.upstream`.
         insert_reducer = "\n".join([
             f"#[spacetimedb::reducer]",
-            f"pub fn relay_insert_{rust_name}(ctx: &ReducerContext, row: Vec<u8>) -> Result<(), Box<str>> {{",
+            f"pub fn relay_insert_{rust_name}(",
+            f"    ctx: &ReducerContext,",
+            f"    upstream: Option<UpstreamReducerInfo>,",
+            f"    row: Vec<u8>,",
+            f") -> Result<(), Box<str>> {{",
+            f"    let _ = upstream;",
             f"    assert_writer(ctx)?;",
             f"    let r: {struct_name} = spacetimedb::sats::bsatn::from_slice(&row)",
             f"        .map_err(|e| format!(\"bsatn decode {rust_name}: {{e}}\").into_boxed_str())?;",
@@ -324,7 +351,12 @@ class Codegen:
             delete_update_apply = "\n".join([
                 "",
                 f"#[spacetimedb::reducer]",
-                f"pub fn relay_delete_{rust_name}(ctx: &ReducerContext, row: Vec<u8>) -> Result<(), Box<str>> {{",
+                f"pub fn relay_delete_{rust_name}(",
+                f"    ctx: &ReducerContext,",
+                f"    upstream: Option<UpstreamReducerInfo>,",
+                f"    row: Vec<u8>,",
+                f") -> Result<(), Box<str>> {{",
+                f"    let _ = upstream;",
                 f"    assert_writer(ctx)?;",
                 f"    let r: {struct_name} = spacetimedb::sats::bsatn::from_slice(&row)",
                 f"        .map_err(|e| format!(\"bsatn decode {rust_name} delete: {{e}}\").into_boxed_str())?;",
@@ -333,7 +365,13 @@ class Codegen:
                 f"}}",
                 "",
                 f"#[spacetimedb::reducer]",
-                f"pub fn relay_update_{rust_name}(ctx: &ReducerContext, old_row: Vec<u8>, new_row: Vec<u8>) -> Result<(), Box<str>> {{",
+                f"pub fn relay_update_{rust_name}(",
+                f"    ctx: &ReducerContext,",
+                f"    upstream: Option<UpstreamReducerInfo>,",
+                f"    old_row: Vec<u8>,",
+                f"    new_row: Vec<u8>,",
+                f") -> Result<(), Box<str>> {{",
+                f"    let _ = upstream;",
                 f"    assert_writer(ctx)?;",
                 f"    let old: {struct_name} = spacetimedb::sats::bsatn::from_slice(&old_row)",
                 f"        .map_err(|e| format!(\"bsatn decode {rust_name} old: {{e}}\").into_boxed_str())?;",
@@ -353,9 +391,11 @@ class Codegen:
                 f"#[spacetimedb::reducer]",
                 f"pub fn relay_apply_{rust_name}(",
                 f"    ctx: &ReducerContext,",
+                f"    upstream: Option<UpstreamReducerInfo>,",
                 f"    deletes: Vec<Vec<u8>>,",
                 f"    inserts: Vec<Vec<u8>>,",
                 f") -> Result<(), Box<str>> {{",
+                f"    let _ = upstream;",
                 f"    assert_writer(ctx)?;",
                 f"    let mut old_rows: Vec<{struct_name}> = Vec::with_capacity(deletes.len());",
                 f"    for b in &deletes {{",

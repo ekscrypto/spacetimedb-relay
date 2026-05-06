@@ -32,7 +32,8 @@ use bytes::{Bytes, BytesMut};
 
 use relay_protocol::api_messages::websocket::common as v2_common;
 use relay_protocol::api_messages::websocket::v2;
-use relay_protocol::lib::{ConnectionId, Identity};
+use relay_protocol::lib::{ConnectionId, Identity, Timestamp};
+use relay_protocol::UpstreamReducerMeta;
 use spacetimedb_client_api_messages_v1::websocket as v1;
 
 use crate::client::UpstreamError;
@@ -40,7 +41,19 @@ use crate::client::UpstreamError;
 const TRANSLATED_QUERY_SET_ID: u32 = 1;
 const TRANSLATED_REQUEST_ID: u32 = 1;
 
-pub fn decode_and_translate(bsatn_bytes: &[u8]) -> Result<v2::ServerMessage, UpstreamError> {
+/// Decode a v1 ServerMessage and translate it into the v2 shape, also
+/// returning any upstream reducer provenance recovered along the way.
+///
+/// The relay forwards `meta` as the second arg of `relay_apply_<table>`
+/// so downstream subscribers can read upstream caller / timestamp /
+/// reducer name out of the local TransactionUpdate's `reducer.args`.
+/// `meta` is `Some` only for v1 `TransactionUpdate(Committed)` since
+/// that's the only variant carrying full caller info; everything else
+/// (initial subscription, lightweight transaction updates,
+/// subscription errors) returns `None`.
+pub fn decode_and_translate(
+    bsatn_bytes: &[u8],
+) -> Result<(v2::ServerMessage, Option<UpstreamReducerMeta>), UpstreamError> {
     let v1_msg =
         spacetimedb_lib_v1::bsatn::from_slice::<v1::ServerMessage<v1::BsatnFormat>>(bsatn_bytes)
             .map_err(|e| UpstreamError::Decode(format!("v1 ServerMessage: {e}")))?;
@@ -61,51 +74,64 @@ pub fn encode_subscribe(request_id: u32, queries: &[String]) -> Result<Vec<u8>, 
 
 fn translate_server_message(
     msg: v1::ServerMessage<v1::BsatnFormat>,
-) -> Result<v2::ServerMessage, UpstreamError> {
+) -> Result<(v2::ServerMessage, Option<UpstreamReducerMeta>), UpstreamError> {
     match msg {
-        v1::ServerMessage::IdentityToken(it) => Ok(v2::ServerMessage::InitialConnection(
-            v2::InitialConnection {
+        v1::ServerMessage::IdentityToken(it) => Ok((
+            v2::ServerMessage::InitialConnection(v2::InitialConnection {
                 identity: convert_identity(it.identity),
                 connection_id: convert_connection_id(it.connection_id),
                 token: it.token,
-            },
+            }),
+            None,
         )),
         v1::ServerMessage::InitialSubscription(is) => {
             let tables = single_table_rows_from_database_update(is.database_update);
-            Ok(v2::ServerMessage::SubscribeApplied(v2::SubscribeApplied {
-                request_id: TRANSLATED_REQUEST_ID,
-                query_set_id: v2_common::QuerySetId::new(TRANSLATED_QUERY_SET_ID),
-                rows: v2::QueryRows {
-                    tables: tables.into_boxed_slice(),
-                },
-            }))
+            Ok((
+                v2::ServerMessage::SubscribeApplied(v2::SubscribeApplied {
+                    request_id: TRANSLATED_REQUEST_ID,
+                    query_set_id: v2_common::QuerySetId::new(TRANSLATED_QUERY_SET_ID),
+                    rows: v2::QueryRows {
+                        tables: tables.into_boxed_slice(),
+                    },
+                }),
+                None,
+            ))
         }
         v1::ServerMessage::TransactionUpdate(tu) => {
+            let meta = upstream_meta_from_v1(&tu);
             let database_update = match tu.status {
                 v1::UpdateStatus::Committed(d) => d,
                 v1::UpdateStatus::Failed(_) | v1::UpdateStatus::OutOfEnergy => {
-                    return Ok(v2::ServerMessage::TransactionUpdate(
-                        v2::TransactionUpdate {
+                    return Ok((
+                        v2::ServerMessage::TransactionUpdate(v2::TransactionUpdate {
                             query_sets: Box::new([]),
-                        },
+                        }),
+                        None,
                     ));
                 }
             };
-            Ok(v2::ServerMessage::TransactionUpdate(
-                transaction_update_from_database_update(database_update),
+            Ok((
+                v2::ServerMessage::TransactionUpdate(transaction_update_from_database_update(
+                    database_update,
+                )),
+                Some(meta),
             ))
         }
-        v1::ServerMessage::TransactionUpdateLight(tul) => Ok(v2::ServerMessage::TransactionUpdate(
-            transaction_update_from_database_update(tul.update),
+        v1::ServerMessage::TransactionUpdateLight(tul) => Ok((
+            v2::ServerMessage::TransactionUpdate(transaction_update_from_database_update(
+                tul.update,
+            )),
+            None,
         )),
-        v1::ServerMessage::SubscriptionError(err) => Ok(v2::ServerMessage::SubscriptionError(
-            v2::SubscriptionError {
+        v1::ServerMessage::SubscriptionError(err) => Ok((
+            v2::ServerMessage::SubscriptionError(v2::SubscriptionError {
                 request_id: err.request_id,
                 query_set_id: v2_common::QuerySetId::new(
                     err.query_id.unwrap_or(TRANSLATED_QUERY_SET_ID),
                 ),
                 error: err.error,
-            },
+            }),
+            None,
         )),
         v1::ServerMessage::SubscribeApplied(_)
         | v1::ServerMessage::UnsubscribeApplied(_)
@@ -116,6 +142,21 @@ fn translate_server_message(
             "unexpected v1 ServerMessage variant: {}",
             v1_variant_name(&msg)
         ))),
+    }
+}
+
+fn upstream_meta_from_v1(
+    tu: &v1::TransactionUpdate<v1::BsatnFormat>,
+) -> UpstreamReducerMeta {
+    UpstreamReducerMeta {
+        reducer_name: tu.reducer_call.reducer_name.to_string(),
+        caller_identity: convert_identity(tu.caller_identity),
+        caller_connection_id: convert_connection_id(tu.caller_connection_id),
+        timestamp: Timestamp::from_micros_since_unix_epoch(
+            tu.timestamp.to_micros_since_unix_epoch(),
+        ),
+        request_id: tu.reducer_call.request_id,
+        args: tu.reducer_call.args.to_vec(),
     }
 }
 
@@ -275,7 +316,8 @@ mod tests {
         });
         let bsatn = spacetimedb_lib_v1::bsatn::to_vec(&v1_msg).unwrap();
 
-        let translated = decode_and_translate(&bsatn).unwrap();
+        let (translated, meta) = decode_and_translate(&bsatn).unwrap();
+        assert!(meta.is_none(), "IdentityToken does not carry reducer meta");
         match translated {
             v2::ServerMessage::InitialConnection(ic) => {
                 assert_eq!(ic.identity.to_byte_array(), id_bytes);
@@ -284,6 +326,45 @@ mod tests {
             }
             other => panic!("expected InitialConnection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transaction_update_carries_caller_meta() {
+        // Build a v1 TransactionUpdate with all caller fields populated;
+        // verify the translated v2 message comes paired with an
+        // UpstreamReducerMeta whose fields match.
+        let id_bytes = [0x11u8; 32];
+        let cid_be = 0x1234567890ABCDEF_FEEDFACECAFEBEEFu128.to_be_bytes();
+        let v1_msg = v1::ServerMessage::<v1::BsatnFormat>::TransactionUpdate(
+            v1::TransactionUpdate {
+                status: v1::UpdateStatus::Committed(v1::DatabaseUpdate { tables: vec![] }),
+                timestamp: spacetimedb_lib_v1::Timestamp::from_micros_since_unix_epoch(
+                    1_700_000_000_000_000,
+                ),
+                caller_identity: spacetimedb_lib_v1::Identity::from_byte_array(id_bytes),
+                caller_connection_id: spacetimedb_lib_v1::ConnectionId::from_be_byte_array(cid_be),
+                reducer_call: v1::ReducerCallInfo {
+                    reducer_name: "send_message".to_string().into_boxed_str(),
+                    reducer_id: 7,
+                    args: vec![1, 2, 3].into_boxed_slice(),
+                    request_id: 42,
+                },
+                energy_quanta_used: spacetimedb_client_api_messages_v1::energy::EnergyQuanta {
+                    quanta: 0,
+                },
+                total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::ZERO,
+            },
+        );
+        let bsatn = spacetimedb_lib_v1::bsatn::to_vec(&v1_msg).unwrap();
+        let (msg, meta) = decode_and_translate(&bsatn).unwrap();
+        assert!(matches!(msg, v2::ServerMessage::TransactionUpdate(_)));
+        let meta = meta.expect("Committed v1 TransactionUpdate must carry meta");
+        assert_eq!(meta.reducer_name, "send_message");
+        assert_eq!(meta.request_id, 42);
+        assert_eq!(meta.args, vec![1, 2, 3]);
+        assert_eq!(meta.caller_identity.to_byte_array(), id_bytes);
+        assert_eq!(meta.caller_connection_id.as_be_byte_array(), cid_be);
+        assert_eq!(meta.timestamp.to_micros_since_unix_epoch(), 1_700_000_000_000_000);
     }
 
     #[test]
@@ -324,3 +405,5 @@ mod tests {
         assert!(matches!(err, UpstreamError::Decode(_)));
     }
 }
+
+

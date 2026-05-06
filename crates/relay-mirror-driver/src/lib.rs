@@ -17,6 +17,7 @@ use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use http::header::{HeaderName, HeaderValue, AUTHORIZATION};
+pub use relay_protocol::UpstreamReducerMeta;
 use spacetimedb_client_api_messages::websocket::v2::{
     CallReducer, CallReducerFlags, ClientMessage, ServerMessage,
 };
@@ -170,9 +171,17 @@ impl MirrorDriver {
     /// from atomic update to delete-then-insert). Acceptable on the
     /// initial subscribe-applied firehose where deletes are typically
     /// empty.
+    ///
+    /// `upstream` carries the upstream reducer's provenance (caller,
+    /// timestamp, name, args). When the upstream protocol can't supply
+    /// it (e.g. v2 upstream, or initial `SubscribeApplied`), pass
+    /// `None`; downstream subscribers will see the local reducer's own
+    /// context as usual. Same `upstream` is reused across all chunks
+    /// produced from a single upstream `TableUpdate`.
     pub async fn apply(
         &mut self,
         table: &str,
+        upstream: Option<&UpstreamReducerMeta>,
         deletes: Vec<Bytes>,
         inserts: Vec<Bytes>,
     ) -> Result<ApplyStats, DriverError> {
@@ -185,7 +194,7 @@ impl MirrorDriver {
         );
         let mut stats = ApplyStats::default();
         for (deletes_chunk, inserts_chunk) in chunks {
-            let args = encode_apply_args(&deletes_chunk, &inserts_chunk);
+            let args = encode_apply_args(upstream, &deletes_chunk, &inserts_chunk);
             stats.calls += 1;
             stats.bytes_sent += args.len() as u64;
             stats.deletes += deletes_chunk.len() as u64;
@@ -381,12 +390,40 @@ fn chunk_apply(
     out
 }
 
-/// Encode the BSATN body for `relay_apply_<table>(deletes: Vec<Vec<u8>>, inserts: Vec<Vec<u8>>)`.
-/// Wire shape: `[u32 deletes_count][per-delete: u32 len, bytes][u32 inserts_count][per-insert: u32 len, bytes]`.
-fn encode_apply_args(deletes: &[Bytes], inserts: &[Bytes]) -> Vec<u8> {
+/// Encode the BSATN body for
+/// `relay_apply_<table>(upstream: Option<UpstreamReducerInfo>, deletes: Vec<Vec<u8>>, inserts: Vec<Vec<u8>>)`.
+///
+/// Wire shape:
+/// * `[u8 some_tag] (0 = Some, 1 = None)` per `spacetimedb_sats`'s
+///   `Option<T>` encoding
+/// * if `Some`: BSATN-encoded `UpstreamReducerMeta` (delegated to
+///   `bsatn::to_vec` since `SpacetimeType` is derived on it)
+/// * `[u32 deletes_count][per-delete: u32 len, bytes]`
+/// * `[u32 inserts_count][per-insert: u32 len, bytes]`
+fn encode_apply_args(
+    upstream: Option<&UpstreamReducerMeta>,
+    deletes: &[Bytes],
+    inserts: &[Bytes],
+) -> Vec<u8> {
     let total_inner: usize = deletes.iter().map(|b| b.len()).sum::<usize>()
         + inserts.iter().map(|b| b.len()).sum::<usize>();
     let mut buf = Vec::with_capacity(8 + 8 * (deletes.len() + inserts.len()) + total_inner);
+    match upstream {
+        Some(meta) => {
+            buf.push(0); // Some — `spacetimedb_sats` encodes Some as variant 0
+            // BSATN-encoding a struct of primitives + String + Vec<u8>
+            // never fails (no IO, no fallible conversions), so we
+            // surface a panic if it ever does — that would be a
+            // programmer error in `UpstreamReducerMeta`'s SpacetimeType
+            // derive, not a runtime condition we can recover from.
+            let meta_bytes =
+                bsatn::to_vec(meta).expect("UpstreamReducerMeta BSATN encode is infallible");
+            buf.extend_from_slice(&meta_bytes);
+        }
+        None => {
+            buf.push(1); // None — variant 1 in `spacetimedb_sats` Option encoding
+        }
+    }
     push_vec_vec_u8(&mut buf, deletes);
     push_vec_vec_u8(&mut buf, inserts);
     buf
@@ -453,28 +490,99 @@ mod tests {
     }
 
     #[test]
-    fn encode_apply_args_format() {
-        // empty lists: two zero-length prefixes
-        let buf = encode_apply_args(&[], &[]);
-        assert_eq!(buf, vec![0, 0, 0, 0, 0, 0, 0, 0]);
+    fn encode_apply_args_none_upstream() {
+        // None tag (0x01) + two empty Vec<Vec<u8>> length prefixes.
+        let buf = encode_apply_args(None, &[], &[]);
+        assert_eq!(buf, vec![0x01, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-        // one delete, one insert with single-byte bodies
+        // None tag + one delete + one insert with single-byte bodies
         let buf = encode_apply_args(
+            None,
             &[Bytes::from_static(&[0xAA])],
             &[Bytes::from_static(&[0xBB, 0xCC])],
         );
         let expected = vec![
+            0x01, // None tag
             // deletes: count=1
             0x01, 0x00, 0x00, 0x00,
             // delete[0]: len=1
-            0x01, 0x00, 0x00, 0x00,
-            0xAA,
+            0x01, 0x00, 0x00, 0x00, 0xAA,
             // inserts: count=1
             0x01, 0x00, 0x00, 0x00,
             // insert[0]: len=2
-            0x02, 0x00, 0x00, 0x00,
-            0xBB, 0xCC,
+            0x02, 0x00, 0x00, 0x00, 0xBB, 0xCC,
         ];
         assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn encode_apply_args_some_upstream_round_trips() {
+        use spacetimedb_client_api_messages::websocket::v2::CallReducer;
+        use spacetimedb_sats::bsatn;
+        let meta = UpstreamReducerMeta {
+            reducer_name: "send_message".into(),
+            caller_identity: relay_protocol::lib::Identity::ZERO,
+            caller_connection_id: relay_protocol::lib::ConnectionId::ZERO,
+            timestamp: relay_protocol::lib::Timestamp::UNIX_EPOCH,
+            request_id: 42,
+            args: b"\x01\x02\x03".to_vec(),
+        };
+        let buf = encode_apply_args(
+            Some(&meta),
+            &[Bytes::from_static(&[0xAA])],
+            &[Bytes::from_static(&[0xBB])],
+        );
+        // First byte must be Some-tag (0x00).
+        assert_eq!(buf[0], 0x00);
+        // The encoded meta should round-trip through bsatn::from_slice
+        // when the trailing Vec<Vec<u8>> bytes are dropped. We verify
+        // by decoding the prefix and checking the field values.
+        let (decoded, consumed) = bsatn_decode_meta(&buf[1..]);
+        assert_eq!(decoded.reducer_name, "send_message");
+        assert_eq!(decoded.request_id, 42);
+        assert_eq!(decoded.args, b"\x01\x02\x03");
+        // Remaining bytes after meta should be the existing
+        // Vec<Vec<u8>> deletes+inserts encoding.
+        let tail = &buf[1 + consumed..];
+        assert_eq!(
+            tail,
+            &[
+                // deletes: count=1, len=1, 0xAA
+                0x01, 0, 0, 0, 0x01, 0, 0, 0, 0xAA,
+                // inserts: count=1, len=1, 0xBB
+                0x01, 0, 0, 0, 0x01, 0, 0, 0, 0xBB,
+            ]
+        );
+        // Ensure the whole CallReducer envelope still encodes (no
+        // panic / size overflow on the args buffer).
+        let msg = ClientMessage::CallReducer(CallReducer {
+            request_id: 1,
+            flags: CallReducerFlags::Default,
+            reducer: "relay_apply_x".into(),
+            args: Bytes::copy_from_slice(&buf),
+        });
+        bsatn::to_vec(&msg).unwrap();
+    }
+
+    /// Decode a single `UpstreamReducerMeta` from BSATN; returns the
+    /// decoded value + bytes consumed.
+    fn bsatn_decode_meta(input: &[u8]) -> (UpstreamReducerMeta, usize) {
+        use spacetimedb_sats::bsatn;
+        // bsatn::from_slice consumes the full slice, so we discover
+        // the meta length by trial-encoding then re-decoding.
+        let m: UpstreamReducerMeta = bsatn::from_slice(&input[..meta_byte_len(input)]).unwrap();
+        (m, meta_byte_len(input))
+    }
+
+    fn meta_byte_len(input: &[u8]) -> usize {
+        // reducer_name: u32 LE len + bytes
+        let name_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
+        let mut p = 4 + name_len;
+        // identity: 32, connection_id: 16, timestamp: 8, request_id: 4
+        p += 32 + 16 + 8 + 4;
+        // args: u32 LE len + bytes
+        let args_len = u32::from_le_bytes(input[p..p + 4].try_into().unwrap()) as usize;
+        p += 4 + args_len;
+        p
     }
 }
