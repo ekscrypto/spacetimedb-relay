@@ -65,6 +65,11 @@ pub struct DriverConfig {
     /// pairing within a call still works because we keep paired
     /// delete+insert within the same chunk.
     pub max_rows_per_apply: usize,
+    /// Maximum total payload bytes per single `relay_apply_<table>`
+    /// call. SpacetimeDB caps incoming WS frames around 32 MB, so we
+    /// stay well under that. Chunks split when **either** the row
+    /// count or the byte budget is hit.
+    pub max_bytes_per_apply: usize,
 }
 
 impl Default for DriverConfig {
@@ -75,6 +80,7 @@ impl Default for DriverConfig {
             identity_token: None,
             max_in_flight: 8000,
             max_rows_per_apply: 4096,
+            max_bytes_per_apply: 16 * 1024 * 1024,
         }
     }
 }
@@ -89,6 +95,7 @@ pub struct MirrorDriver {
     request_id: AtomicU32,
     drain_handle: Option<tokio::task::JoinHandle<()>>,
     max_rows_per_apply: usize,
+    max_bytes_per_apply: usize,
 }
 
 impl MirrorDriver {
@@ -103,6 +110,7 @@ impl MirrorDriver {
             request_id: AtomicU32::new(1),
             drain_handle,
             max_rows_per_apply: cfg.max_rows_per_apply,
+            max_bytes_per_apply: cfg.max_bytes_per_apply,
         })
     }
 
@@ -129,7 +137,12 @@ impl MirrorDriver {
         inserts: Vec<Bytes>,
     ) -> Result<(), DriverError> {
         let reducer = format!("relay_apply_{table}");
-        let chunks = chunk_apply(deletes, inserts, self.max_rows_per_apply);
+        let chunks = chunk_apply(
+            deletes,
+            inserts,
+            self.max_rows_per_apply,
+            self.max_bytes_per_apply,
+        );
         for (deletes_chunk, inserts_chunk) in chunks {
             let args = encode_apply_args(&deletes_chunk, &inserts_chunk);
             self.send_call(&reducer, &args).await?;
@@ -218,42 +231,56 @@ async fn drain_responses(mut stream: Stream, in_flight: Arc<Semaphore>) {
     tracing::debug!(target: "relay::mirror_driver", "drainer task exited");
 }
 
-/// Split the row lists into chunks of at most `max_rows`. Pairing
-/// within a chunk is still possible because `apply()` keeps deletes and
-/// inserts of one chunk together; cross-chunk pairing degrades to
-/// delete-then-insert but the overall outcome is the same (just one
-/// extra notification on the affected row).
+/// Split the row lists so each chunk obeys both `max_rows` and
+/// `max_bytes`. Bytes are counted as the inner row payload sum (the
+/// CallReducer envelope adds a few bytes of overhead per row, easily
+/// covered by the headroom we leave before the 32 MB WS frame cap).
 fn chunk_apply(
     deletes: Vec<Bytes>,
     inserts: Vec<Bytes>,
     max_rows: usize,
+    max_bytes: usize,
 ) -> Vec<(Vec<Bytes>, Vec<Bytes>)> {
-    if deletes.len() + inserts.len() <= max_rows {
-        return vec![(deletes, inserts)];
-    }
-    // Greedy: emit chunks of paired (deletes, inserts) up to max_rows
-    // each. We do not try to keep paired-by-PK rows together — that
-    // would require decoding PKs here, which we explicitly avoid (the
-    // wasm module owns BSATN decoding).
     let mut out = Vec::new();
-    let mut d_iter = deletes.into_iter();
-    let mut i_iter = inserts.into_iter();
+    let mut d_iter = deletes.into_iter().peekable();
+    let mut i_iter = inserts.into_iter().peekable();
     loop {
         let mut d_chunk = Vec::new();
         let mut i_chunk = Vec::new();
-        let mut remaining = max_rows;
-        while remaining > 0 {
-            if let Some(d) = d_iter.next() {
-                d_chunk.push(d);
-                remaining -= 1;
-                continue;
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        loop {
+            // Peek at next available row from either side; stop if
+            // adding it would blow either budget.
+            let next = if d_iter.peek().is_some() {
+                Some(true)
+            } else if i_iter.peek().is_some() {
+                Some(false)
+            } else {
+                None
+            };
+            let Some(is_delete) = next else { break };
+            let next_len = if is_delete {
+                d_iter.peek().map(|b| b.len()).unwrap_or(0)
+            } else {
+                i_iter.peek().map(|b| b.len()).unwrap_or(0)
+            };
+            // Always include at least one row per chunk so we don't
+            // deadlock on a single oversize row (it'll still fail at
+            // the server, but the failure is per-row not per-chunk).
+            if rows >= max_rows || (rows > 0 && bytes + next_len > max_bytes) {
+                break;
             }
-            if let Some(i) = i_iter.next() {
-                i_chunk.push(i);
-                remaining -= 1;
-                continue;
+            if is_delete {
+                let b = d_iter.next().expect("peeked");
+                bytes += b.len();
+                d_chunk.push(b);
+            } else {
+                let b = i_iter.next().expect("peeked");
+                bytes += b.len();
+                i_chunk.push(b);
             }
-            break;
+            rows += 1;
         }
         if d_chunk.is_empty() && i_chunk.is_empty() {
             break;
@@ -287,20 +314,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunk_returns_single_when_under_limit() {
+    fn chunk_returns_single_when_under_limits() {
         let d = vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")];
         let i = vec![Bytes::from_static(b"c")];
-        let chunks = chunk_apply(d, i, 100);
+        let chunks = chunk_apply(d, i, 100, 100);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].0.len(), 2);
         assert_eq!(chunks[0].1.len(), 1);
     }
 
     #[test]
-    fn chunk_splits_when_over_limit() {
+    fn chunk_splits_by_row_count() {
         let d: Vec<Bytes> = (0..3).map(|n| Bytes::from(vec![n as u8])).collect();
         let i: Vec<Bytes> = (0..5).map(|n| Bytes::from(vec![n as u8 + 100])).collect();
-        let chunks = chunk_apply(d, i, 3);
+        let chunks = chunk_apply(d, i, 3, 1_000_000);
         let total_d: usize = chunks.iter().map(|(d, _)| d.len()).sum();
         let total_i: usize = chunks.iter().map(|(_, i)| i.len()).sum();
         assert_eq!(total_d, 3);
@@ -308,6 +335,30 @@ mod tests {
         for (d, i) in &chunks {
             assert!(d.len() + i.len() <= 3);
         }
+    }
+
+    #[test]
+    fn chunk_splits_by_byte_budget() {
+        // 10 rows of 1000 bytes each; budget is 3500 bytes per chunk.
+        let i: Vec<Bytes> = (0..10).map(|_| Bytes::from(vec![0u8; 1000])).collect();
+        let chunks = chunk_apply(Vec::new(), i, 100_000, 3500);
+        // 3 rows fit per chunk (3000 < 3500, 4000 > 3500).
+        for (_, ic) in &chunks {
+            let total: usize = ic.iter().map(|b| b.len()).sum();
+            assert!(total <= 3500);
+        }
+        let total_rows: usize = chunks.iter().map(|(_, i)| i.len()).sum();
+        assert_eq!(total_rows, 10);
+    }
+
+    #[test]
+    fn chunk_one_oversize_row_passes_through() {
+        // A single row larger than the byte budget still gets emitted
+        // (server will reject; better than the driver deadlocking).
+        let i = vec![Bytes::from(vec![0u8; 10_000])];
+        let chunks = chunk_apply(Vec::new(), i, 100, 1000);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].1.len(), 1);
     }
 
     #[test]

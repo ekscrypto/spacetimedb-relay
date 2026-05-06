@@ -1,16 +1,28 @@
 // SPDX-License-Identifier: MIT
 
+mod stdb_mode;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+#[cfg(not(feature = "profile-heap"))]
 use mimalloc::MiMalloc;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
+// Heap-profiling builds replace mimalloc with dhat::Alloc so every
+// allocation gets a backtrace. dhat is single-allocator: enabling
+// `--features profile-heap` swaps the global allocator and starts a
+// `Profiler` whose `Drop` writes `dhat-heap.json` on graceful shutdown.
+#[cfg(feature = "profile-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
+
+#[cfg(not(feature = "profile-heap"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -81,10 +93,74 @@ struct Args {
     /// translated to v2 internally.
     #[arg(long = "upstream-protocol", env = "RELAY_UPSTREAM_PROTOCOL", default_value_t = ProtocolVersion::V2)]
     upstream_protocol: ProtocolVersion,
+
+    /// Mirror backend. `legacy` is the in-process MemStore + custom
+    /// downstream WS server. `stdb` runs an embedded SpacetimeDB and
+    /// publishes a generated mirror module to it; downstream clients
+    /// connect directly to that local SpacetimeDB.
+    #[arg(long = "mirror-mode", env = "RELAY_MIRROR_MODE", default_value_t = MirrorMode::Legacy, value_enum)]
+    mirror_mode: MirrorMode,
+
+    /// stdb mode: local SpacetimeDB URL the relay publishes the mirror
+    /// module to and connects to as the writer.
+    #[arg(long = "stdb-url", env = "RELAY_STDB_URL", default_value = "ws://127.0.0.1:3000")]
+    stdb_url: Url,
+
+    /// stdb mode: spacetime CLI server alias (run `spacetime server add ...` once).
+    #[arg(long = "stdb-server-alias", env = "RELAY_STDB_SERVER_ALIAS", default_value = "local")]
+    stdb_server_alias: String,
+
+    /// stdb mode: name of the database to publish under.
+    #[arg(long = "mirror-database", env = "RELAY_MIRROR_DATABASE")]
+    mirror_database: Option<String>,
+
+    /// stdb mode: bearer token for the writer identity. Should match
+    /// the identity that ran `spacetime publish` so the wasm
+    /// `assert_writer` gate accepts our calls.
+    #[arg(long = "stdb-identity-token", env = "RELAY_STDB_IDENTITY_TOKEN")]
+    stdb_identity_token: Option<String>,
+
+    /// stdb mode: where to materialize the generated mirror crate.
+    /// Defaults to `<data-dir>/mirror-publisher`.
+    #[arg(long = "publisher-workdir", env = "RELAY_PUBLISHER_WORKDIR")]
+    publisher_workdir: Option<PathBuf>,
+
+    /// stdb mode: source directory holding `Cargo.toml` and
+    /// `rust-toolchain.toml` for the mirror crate (defaults to
+    /// `tools/mirror-template/` next to the relay binary).
+    #[arg(long = "publisher-template-dir", env = "RELAY_PUBLISHER_TEMPLATE_DIR")]
+    publisher_template_dir: Option<PathBuf>,
+
+    /// stdb mode: path to the Python codegen script (defaults to
+    /// `tools/codegen.py`).
+    #[arg(long = "codegen-script", env = "RELAY_CODEGEN_SCRIPT")]
+    codegen_script: Option<PathBuf>,
+
+    /// stdb mode: path to the `spacetime` CLI binary.
+    #[arg(long = "spacetime-bin", env = "RELAY_SPACETIME_BIN", default_value = "spacetime")]
+    spacetime_bin: PathBuf,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum MirrorMode {
+    Legacy,
+    Stdb,
+}
+
+impl std::fmt::Display for MirrorMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Legacy => "legacy",
+            Self::Stdb => "stdb",
+        })
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(feature = "profile-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     // Required for `wss://` upstreams: rustls 0.23 makes the
     // CryptoProvider an explicit choice, and tokio-tungstenite panics
     // on the first TLS handshake if no provider has been installed.
@@ -110,6 +186,42 @@ async fn main() -> Result<()> {
     let raw_schema = fetch_schema(&args.upstream, &args.database).await?;
     let schema = parse_schema(&raw_schema)?;
     log_schema(&schema);
+
+    if matches!(args.mirror_mode, MirrorMode::Stdb) {
+        let mirror_database = args
+            .mirror_database
+            .clone()
+            .unwrap_or_else(|| format!("relay-mirror-{}", sanitize_db_name(&args.database)));
+        let publisher_workdir = args
+            .publisher_workdir
+            .clone()
+            .unwrap_or_else(|| args.data_dir.join("mirror-publisher"));
+        let template_dir = args
+            .publisher_template_dir
+            .clone()
+            .unwrap_or_else(|| default_repo_path("tools/mirror-template"));
+        let codegen_script = args
+            .codegen_script
+            .clone()
+            .unwrap_or_else(|| default_repo_path("tools/codegen.py"));
+        let cfg = stdb_mode::StdbModeConfig {
+            upstream_host: args.upstream.clone(),
+            upstream_database: args.database.clone(),
+            upstream_token: args.upstream_token.clone(),
+            upstream_protocol: args.upstream_protocol,
+            frame_limit: args.frame_limit,
+            subscribe_tables: args.subscribe_tables.clone(),
+            stdb_url: args.stdb_url.clone(),
+            mirror_database,
+            identity_token: args.stdb_identity_token.clone(),
+            stdb_server_alias: args.stdb_server_alias.clone(),
+            publisher_workdir,
+            publisher_template_dir: template_dir,
+            codegen_script,
+            spacetime_bin: args.spacetime_bin.clone(),
+        };
+        return stdb_mode::run(cfg, raw_schema.into(), Arc::new(schema)).await;
+    }
 
     let storage = Storage::new(StorageConfig {
         upstream_host: args.upstream.to_string(),
@@ -389,9 +501,34 @@ async fn write_snapshots_blocking(storage: &Arc<Storage>, data_dir: &std::path::
     }
 }
 
+fn sanitize_db_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        return "mirror".into();
+    }
+    out
+}
+
+fn default_repo_path(rel: &str) -> PathBuf {
+    // CARGO_MANIFEST_DIR is `crates/relay`; the repo root is two up.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join(rel))
+        .unwrap_or_else(|| PathBuf::from(rel))
+}
+
 /// Resolve the first SIGINT or SIGTERM into a future the main loop can
 /// `.await`. Falls back to ctrl_c-only on non-Unix.
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

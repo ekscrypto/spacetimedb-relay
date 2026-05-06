@@ -14,6 +14,8 @@ relay-upstream.workspace = true
 relay-storage.workspace = true
 relay-engine.workspace = true
 relay-server.workspace = true
+relay-publisher.workspace = true
+relay-mirror-driver.workspace = true
 
 tokio.workspace = true
 clap.workspace = true
@@ -25,3 +27,12 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 rustls.workspace = true
 mimalloc.workspace = true
+dhat = { workspace = true, optional = true }
+
+[features]
+# Replace mimalloc with dhat-rs for heap profiling. Run with:
+#   cargo run -p relay --features profile-heap -- ...
+# The Profiler writes `dhat-heap.json` to CWD on graceful shutdown;
+# load it in https://nnethercote.github.io/dh_view/dh_view.html.
+# Off by default — dhat tracks every allocation and is not for production.
+profile-heap = ["dep:dhat"]
