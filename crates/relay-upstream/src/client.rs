@@ -16,6 +16,7 @@ use relay_protocol::api_messages::websocket::common::QuerySetId;
 use relay_protocol::api_messages::websocket::v2::{ClientMessage, ServerMessage, Subscribe};
 use relay_protocol::sats::bsatn;
 use relay_protocol::tags;
+use relay_protocol::UpstreamReducerMeta;
 
 use crate::v1_compat;
 
@@ -120,9 +121,14 @@ impl UpstreamFrame {
         self.bsatn.first().copied().unwrap_or(0xff)
     }
 
-    pub fn decode(&self) -> Result<ServerMessage, UpstreamError> {
+    /// Decode the frame's `ServerMessage` plus any upstream reducer
+    /// provenance recovered alongside it. Provenance is currently only
+    /// present for v1 `TransactionUpdate(Committed)` (v2's
+    /// `TransactionUpdate` doesn't carry caller info on the wire).
+    pub fn decode(&self) -> Result<(ServerMessage, Option<UpstreamReducerMeta>), UpstreamError> {
         match self.protocol {
             ProtocolVersion::V2 => bsatn::from_slice::<ServerMessage>(&self.bsatn)
+                .map(|m| (m, None))
                 .map_err(|e| UpstreamError::Decode(e.to_string())),
             ProtocolVersion::V1 => v1_compat::decode_and_translate(&self.bsatn),
         }

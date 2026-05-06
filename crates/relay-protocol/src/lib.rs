@@ -20,6 +20,40 @@ pub use schema::{
     SchemaParseError, TableAccess, TableKind,
 };
 
+/// Upstream reducer provenance threaded through `relay_apply_<table>`.
+///
+/// When we receive a v1 `TransactionUpdate` from upstream, the
+/// caller_identity / timestamp / reducer name / args are stamped here
+/// and forwarded as the second argument to the local mirror's apply
+/// reducer. Downstream subscribers reading the local SpacetimeDB then
+/// see this struct in `TransactionUpdate.reducer_call.args`, which
+/// lets them recover the original upstream provenance.
+///
+/// The wasm-side mirror crate has a structurally-identical struct
+/// emitted by `tools/codegen.py`; both sides BSATN-encode via
+/// `SpacetimeType` so the wire layout matches.
+///
+/// Sentinel values (used when the upstream protocol can't supply
+/// the field — e.g. v2 upstream, v1 `TransactionUpdateLight`):
+/// * `reducer_name = ""`
+/// * `caller_identity = Identity::ZERO`
+/// * `caller_connection_id = ConnectionId::ZERO`
+/// * `timestamp = Timestamp::UNIX_EPOCH`
+/// * `request_id = 0`
+/// * `args = []`
+///
+/// `SubscribeApplied` rows pass `None` (no upstream cause at all).
+#[derive(Clone, Debug, sats::SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct UpstreamReducerMeta {
+    pub reducer_name: String,
+    pub caller_identity: lib::Identity,
+    pub caller_connection_id: lib::ConnectionId,
+    pub timestamp: lib::Timestamp,
+    pub request_id: u32,
+    pub args: Vec<u8>,
+}
+
 pub mod tags {
     pub const CLIENT_SUBSCRIBE: u8 = 0x00;
     pub const CLIENT_UNSUBSCRIBE: u8 = 0x01;

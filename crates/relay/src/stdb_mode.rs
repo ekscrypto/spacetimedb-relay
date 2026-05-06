@@ -26,7 +26,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use relay_mirror_driver::{DriverConfig, MirrorDriver};
 use relay_protocol::api_messages::websocket::v2::{ServerMessage, TableUpdateRows};
-use relay_protocol::MirroredSchema;
+use relay_protocol::{MirroredSchema, UpstreamReducerMeta};
 use relay_publisher::{Publisher, PublisherConfig};
 use relay_upstream::{
     connect_and_run, server_tag_name, Compression, ProtocolVersion, UpstreamCommand,
@@ -224,9 +224,10 @@ pub async fn run(
                     let tag = frame.server_tag();
                     let protocol = frame.protocol;
                     match frame.decode() {
-                        Ok(message) => {
+                        Ok((message, meta)) => {
                             if let Err(e) = handle_message(
                                 message,
+                                meta,
                                 &subscribe_tables,
                                 &cmd_tx,
                                 &mut driver,
@@ -365,6 +366,7 @@ fn save_identity_token(path: &std::path::Path, token: &str) -> std::io::Result<(
 
 async fn handle_message(
     message: ServerMessage,
+    meta: Option<UpstreamReducerMeta>,
     subscribe_tables: &[String],
     cmd_tx: &mpsc::Sender<UpstreamCommand>,
     driver: &mut MirrorDriver,
@@ -414,8 +416,11 @@ async fn handle_message(
                     rows = inserts.len(),
                     "applying initial subscribe rows"
                 );
+                // Initial subscribe-applied has no upstream reducer
+                // cause — pass None so downstream sees the raw apply
+                // call only.
                 let stats = driver
-                    .apply(upstream_name, Vec::new(), inserts)
+                    .apply(upstream_name, None, Vec::new(), inserts)
                     .await
                     .with_context(|| format!("driver.apply for {upstream_name}"))?;
                 metrics
@@ -424,6 +429,11 @@ async fn handle_message(
             }
         }
         ServerMessage::TransactionUpdate(tu) => {
+            // The same upstream meta (caller / timestamp / reducer
+            // name / args) covers every TableUpdate inside this v1
+            // TransactionUpdate, so we forward `meta` to each per-
+            // table apply call. v2 upstreams produce `meta = None`
+            // (no caller info on the wire).
             for set in tu.query_sets.iter() {
                 for table in set.tables.iter() {
                     let upstream_name: &str = table.table_name.as_ref();
@@ -444,7 +454,7 @@ async fn handle_message(
                         continue;
                     }
                     let stats = driver
-                        .apply(upstream_name, deletes, inserts)
+                        .apply(upstream_name, meta.as_ref(), deletes, inserts)
                         .await
                         .with_context(|| format!("driver.apply for {upstream_name}"))?;
                     metrics

@@ -1730,6 +1730,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "http",
+ "relay-protocol",
  "spacetimedb-client-api-messages 2.2.0",
  "spacetimedb-sats 2.2.0",
  "thiserror 2.0.18",
