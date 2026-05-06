@@ -4,9 +4,6 @@ members = [
     "crates/relay",
     "crates/relay-protocol",
     "crates/relay-upstream",
-    "crates/relay-storage",
-    "crates/relay-engine",
-    "crates/relay-server",
     "crates/relay-test-harness",
     "crates/relay-publisher",
     "crates/relay-mirror-driver",
@@ -23,9 +20,6 @@ repository = "https://github.com/ekscrypto/spacetimedb-relay"
 [workspace.dependencies]
 relay-protocol = { path = "crates/relay-protocol" }
 relay-upstream = { path = "crates/relay-upstream" }
-relay-storage  = { path = "crates/relay-storage" }
-relay-engine   = { path = "crates/relay-engine" }
-relay-server   = { path = "crates/relay-server" }
 relay-publisher = { path = "crates/relay-publisher" }
 relay-mirror-driver = { path = "crates/relay-mirror-driver" }
 
