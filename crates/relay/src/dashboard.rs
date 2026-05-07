@@ -203,7 +203,8 @@ impl PublisherMetrics {
     pub fn record(&self, fingerprint: &str, republished: bool) {
         *self.fingerprint.lock() = Some(fingerprint.to_string());
         if republished {
-            self.last_published_at.store(epoch_secs(), Ordering::Relaxed);
+            self.last_published_at
+                .store(epoch_secs(), Ordering::Relaxed);
             self.republished_this_run.store(1, Ordering::Relaxed);
         }
     }
@@ -313,6 +314,15 @@ pub struct Metrics {
     pub upstream_database: String,
     pub mirror_database: String,
     pub events: Arc<EventRing>,
+    /// Optional handle to the frontend proxy. `None` when
+    /// `--frontend-bind` is empty.
+    pub frontend: Mutex<Option<FrontendHandles>>,
+}
+
+#[derive(Clone)]
+pub struct FrontendHandles {
+    pub metrics: Arc<relay_frontend::FrontendMetrics>,
+    pub clients: relay_frontend::ActiveClients,
 }
 
 impl Metrics {
@@ -332,10 +342,20 @@ impl Metrics {
             upstream_database,
             mirror_database,
             events,
+            frontend: Mutex::new(None),
         })
     }
 
+    pub fn install_frontend(&self, handles: FrontendHandles) {
+        *self.frontend.lock() = Some(handles);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
+        let frontend = self
+            .frontend
+            .lock()
+            .as_ref()
+            .map(|h| relay_frontend::state::snapshot(&h.metrics, &h.clients));
         MetricsSnapshot {
             now: epoch_secs(),
             started_at: self.started_at,
@@ -345,17 +365,17 @@ impl Metrics {
             local_stdb: link_snapshot(&self.local_stdb),
             publisher: PublisherSnapshot {
                 fingerprint: self.publisher.fingerprint.lock().clone(),
-                last_published_at: nonzero(self.publisher.last_published_at.load(Ordering::Relaxed)),
-                republished_this_run: self
-                    .publisher
-                    .republished_this_run
-                    .load(Ordering::Relaxed)
+                last_published_at: nonzero(
+                    self.publisher.last_published_at.load(Ordering::Relaxed),
+                ),
+                republished_this_run: self.publisher.republished_this_run.load(Ordering::Relaxed)
                     != 0,
             },
             in_flight: InFlightSnapshot {
                 max: self.max_in_flight.load(Ordering::Relaxed),
                 available: self.available_permits.load(Ordering::Relaxed),
             },
+            frontend,
         }
     }
 }
@@ -395,6 +415,8 @@ pub struct MetricsSnapshot {
     pub local_stdb: LinkSnapshot,
     pub publisher: PublisherSnapshot,
     pub in_flight: InFlightSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<relay_frontend::FrontendSnapshot>,
 }
 
 #[derive(Serialize)]
@@ -575,8 +597,9 @@ mod tests {
     #[test]
     fn layer_captures_relay_targets_and_skips_others() {
         let ring = EventRing::new(50);
-        let layer = EventLogLayer::new(ring.clone())
-            .with_filter(tracing_subscriber::EnvFilter::new("relay=trace,other=trace"));
+        let layer = EventLogLayer::new(ring.clone()).with_filter(
+            tracing_subscriber::EnvFilter::new("relay=trace,other=trace"),
+        );
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "relay::test", field_a = "v1", "captured-message");

@@ -248,7 +248,9 @@ async fn read_initial_connection(conn: &mut Conn) -> Result<InitialConnectionInf
             Message::Binary(b) => b,
             Message::Text(_) | Message::Ping(_) | Message::Pong(_) => continue,
             Message::Close(_) => {
-                return Err(DriverError::Connect("ws closed before InitialConnection".into()))
+                return Err(DriverError::Connect(
+                    "ws closed before InitialConnection".into(),
+                ))
             }
             Message::Frame(_) => continue,
         };
@@ -290,7 +292,8 @@ async fn open_ws(cfg: &DriverConfig) -> Result<Conn, DriverError> {
         s => s,
     }
     .to_string();
-    url.set_scheme(&scheme).map_err(|_| DriverError::Url("bad scheme".into()))?;
+    url.set_scheme(&scheme)
+        .map_err(|_| DriverError::Url("bad scheme".into()))?;
     url.set_path(&format!("/v1/database/{}/subscribe", cfg.database));
     url.set_query(Some("compression=None"));
     let mut req = url
@@ -411,11 +414,11 @@ fn encode_apply_args(
     match upstream {
         Some(meta) => {
             buf.push(0); // Some — `spacetimedb_sats` encodes Some as variant 0
-            // BSATN-encoding a struct of primitives + String + Vec<u8>
-            // never fails (no IO, no fallible conversions), so we
-            // surface a panic if it ever does — that would be a
-            // programmer error in `UpstreamReducerMeta`'s SpacetimeType
-            // derive, not a runtime condition we can recover from.
+                         // BSATN-encoding a struct of primitives + String + Vec<u8>
+                         // never fails (no IO, no fallible conversions), so we
+                         // surface a panic if it ever does — that would be a
+                         // programmer error in `UpstreamReducerMeta`'s SpacetimeType
+                         // derive, not a runtime condition we can recover from.
             let meta_bytes =
                 bsatn::to_vec(meta).expect("UpstreamReducerMeta BSATN encode is infallible");
             buf.extend_from_slice(&meta_bytes);
@@ -504,12 +507,9 @@ mod tests {
         let expected = vec![
             0x01, // None tag
             // deletes: count=1
-            0x01, 0x00, 0x00, 0x00,
-            // delete[0]: len=1
-            0x01, 0x00, 0x00, 0x00, 0xAA,
-            // inserts: count=1
-            0x01, 0x00, 0x00, 0x00,
-            // insert[0]: len=2
+            0x01, 0x00, 0x00, 0x00, // delete[0]: len=1
+            0x01, 0x00, 0x00, 0x00, 0xAA, // inserts: count=1
+            0x01, 0x00, 0x00, 0x00, // insert[0]: len=2
             0x02, 0x00, 0x00, 0x00, 0xBB, 0xCC,
         ];
         assert_eq!(buf, expected);
@@ -548,8 +548,7 @@ mod tests {
             tail,
             &[
                 // deletes: count=1, len=1, 0xAA
-                0x01, 0, 0, 0, 0x01, 0, 0, 0, 0xAA,
-                // inserts: count=1, len=1, 0xBB
+                0x01, 0, 0, 0, 0x01, 0, 0, 0, 0xAA, // inserts: count=1, len=1, 0xBB
                 0x01, 0, 0, 0, 0x01, 0, 0, 0, 0xBB,
             ]
         );

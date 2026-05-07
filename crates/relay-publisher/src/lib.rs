@@ -144,9 +144,9 @@ impl Publisher {
             if !src.exists() {
                 continue;
             }
-            tokio::fs::copy(&src, &dst).await.with_context(|| {
-                format!("copy {} to {}", src.display(), dst.display())
-            })?;
+            tokio::fs::copy(&src, &dst)
+                .await
+                .with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
         }
         info!(
             target: "relay::publisher",
@@ -202,12 +202,7 @@ impl Publisher {
     async fn run_cargo_build(&self) -> Result<()> {
         info!(target: "relay::publisher", "building mirror crate to wasm32");
         let status = Command::new("cargo")
-            .args([
-                "build",
-                "--release",
-                "--target",
-                "wasm32-unknown-unknown",
-            ])
+            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
             .current_dir(&self.cfg.workdir)
             .status()
             .await
@@ -274,8 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_roundtrip(
-    ) -> Result<()> {
+    fn sidecar_roundtrip() -> Result<()> {
         let dir = tempdir_for_test();
         let cfg = PublisherConfig {
             workdir: dir.clone(),
@@ -295,8 +289,7 @@ mod tests {
     }
 
     fn tempdir_for_test() -> PathBuf {
-        let p = std::env::temp_dir()
-            .join(format!("relay-publisher-test-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("relay-publisher-test-{}", std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

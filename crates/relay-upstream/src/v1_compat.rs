@@ -182,9 +182,7 @@ fn translate_server_message(
     }
 }
 
-fn upstream_meta_from_v1(
-    tu: &v1::TransactionUpdate<v1::BsatnFormat>,
-) -> UpstreamReducerMeta {
+fn upstream_meta_from_v1(tu: &v1::TransactionUpdate<v1::BsatnFormat>) -> UpstreamReducerMeta {
     UpstreamReducerMeta {
         reducer_name: tu.reducer_call.reducer_name.to_string(),
         caller_identity: convert_identity(tu.caller_identity),
@@ -372,8 +370,8 @@ mod tests {
         // UpstreamReducerMeta whose fields match.
         let id_bytes = [0x11u8; 32];
         let cid_be = 0x1234567890ABCDEF_FEEDFACECAFEBEEFu128.to_be_bytes();
-        let v1_msg = v1::ServerMessage::<v1::BsatnFormat>::TransactionUpdate(
-            v1::TransactionUpdate {
+        let v1_msg =
+            v1::ServerMessage::<v1::BsatnFormat>::TransactionUpdate(v1::TransactionUpdate {
                 status: v1::UpdateStatus::Committed(v1::DatabaseUpdate { tables: vec![] }),
                 timestamp: spacetimedb_lib_v1::Timestamp::from_micros_since_unix_epoch(
                     1_700_000_000_000_000,
@@ -390,8 +388,7 @@ mod tests {
                     quanta: 0,
                 },
                 total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::ZERO,
-            },
-        );
+            });
         let bsatn = spacetimedb_lib_v1::bsatn::to_vec(&v1_msg).unwrap();
         let (msg, meta) = decode_and_translate(&bsatn).unwrap();
         assert!(matches!(msg, v2::ServerMessage::TransactionUpdate(_)));
@@ -401,7 +398,10 @@ mod tests {
         assert_eq!(meta.args, vec![1, 2, 3]);
         assert_eq!(meta.caller_identity.to_byte_array(), id_bytes);
         assert_eq!(meta.caller_connection_id.as_be_byte_array(), cid_be);
-        assert_eq!(meta.timestamp.to_micros_since_unix_epoch(), 1_700_000_000_000_000);
+        assert_eq!(
+            meta.timestamp.to_micros_since_unix_epoch(),
+            1_700_000_000_000_000
+        );
     }
 
     #[test]
@@ -426,11 +426,11 @@ mod tests {
 
     #[test]
     fn unexpected_v1_variant_is_an_error() {
-        // SubscribeMultiApplied is not on the relay's expected path
-        // because the relay only sends set-replace `Subscribe`. If a
-        // server sent it anyway we'd want a loud error, not a silent drop.
-        let v1_msg = v1::ServerMessage::<v1::BsatnFormat>::SubscribeMultiApplied(
-            v1::SubscribeMultiApplied {
+        // UnsubscribeMultiApplied is not on the relay's expected path —
+        // the relay never sends UnsubscribeMulti. If a server sent it
+        // anyway we'd want a loud error, not a silent drop.
+        let v1_msg = v1::ServerMessage::<v1::BsatnFormat>::UnsubscribeMultiApplied(
+            v1::UnsubscribeMultiApplied {
                 request_id: 1,
                 total_host_execution_duration_micros: 0,
                 query_id: v1::QueryId::new(1),
@@ -442,5 +442,3 @@ mod tests {
         assert!(matches!(err, UpstreamError::Decode(_)));
     }
 }
-
-

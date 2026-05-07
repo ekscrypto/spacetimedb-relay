@@ -215,6 +215,53 @@
       <tr><td class="label">republished this run</td><td class="value" id="pub-republished">—</td></tr>
     </table>
   </div>
+
+  <div class="panel" id="frontend-panel" style="display:none">
+    <h3>Frontend proxy <span id="frontend-state" class="pill">—</span></h3>
+    <table>
+      <tr><td class="label">bind</td><td class="value" id="frontend-bind">—</td></tr>
+      <tr><td class="label">active clients</td><td class="value number" id="frontend-active">0</td></tr>
+      <tr><td class="label">lifetime connect / disconnect</td><td class="value" id="frontend-lifetime">—</td></tr>
+      <tr><td class="label">v1 frames rewritten</td><td class="value number" id="frontend-rewrites">0</td></tr>
+      <tr><td class="label">total bytes in</td><td class="value number" id="frontend-total-in">0</td></tr>
+      <tr><td class="label">total bytes out</td><td class="value number" id="frontend-total-out">0</td></tr>
+    </table>
+    <h2 style="margin-top:18px">bytes out (fan-out)</h2>
+    <div class="windows">
+      <div class="bucket"><div class="label">last 1m</div><div class="value" id="frontend-out-1m">0</div></div>
+      <div class="bucket"><div class="label">last 5m</div><div class="value" id="frontend-out-5m">0</div></div>
+      <div class="bucket"><div class="label">last 30m</div><div class="value" id="frontend-out-30m">0</div></div>
+    </div>
+    <h2 style="margin-top:12px">frames out</h2>
+    <div class="windows">
+      <div class="bucket"><div class="label">last 1m</div><div class="value" id="frontend-fr-1m">0</div></div>
+      <div class="bucket"><div class="label">last 5m</div><div class="value" id="frontend-fr-5m">0</div></div>
+      <div class="bucket"><div class="label">last 30m</div><div class="value" id="frontend-fr-30m">0</div></div>
+    </div>
+  </div>
+</div>
+
+<div id="clients-panel" style="display:none; margin-top:24px">
+  <h2 style="margin-top:0">Active clients <span id="clients-count" class="pill">0</span></h2>
+  <div style="overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:6px;">
+    <table id="clients-table" style="min-width:980px">
+      <thead>
+        <tr style="text-align:left; color:var(--muted); font-size:11px; text-transform:uppercase;">
+          <th style="padding:8px 12px">id</th>
+          <th style="padding:8px 12px">remote</th>
+          <th style="padding:8px 12px">proto</th>
+          <th style="padding:8px 12px">conn</th>
+          <th style="padding:8px 12px">idle</th>
+          <th style="padding:8px 12px" class="number">subs</th>
+          <th style="padding:8px 12px" class="number">oneoff</th>
+          <th style="padding:8px 12px" class="number">rewrites</th>
+          <th style="padding:8px 12px" class="number">in (1m / total)</th>
+          <th style="padding:8px 12px" class="number">out (1m / 5m / total)</th>
+        </tr>
+      </thead>
+      <tbody id="clients-body"></tbody>
+    </table>
+  </div>
 </div>
 
 <div class="log-panel">
@@ -261,6 +308,60 @@
     el.className = 'pill ' + state;
   }
 
+  function fillFrontend(f, now) {
+    const panel = document.getElementById('frontend-panel');
+    const clientsPanel = document.getElementById('clients-panel');
+    if (!f) {
+      panel.style.display = 'none';
+      clientsPanel.style.display = 'none';
+      return;
+    }
+    panel.style.display = '';
+    clientsPanel.style.display = '';
+    setState('frontend-state', f.active_clients > 0 ? 'up' : 'initial');
+    document.getElementById('frontend-bind').textContent = f.bind;
+    document.getElementById('frontend-active').textContent = fmt.format(f.active_clients);
+    document.getElementById('frontend-lifetime').textContent =
+      fmt.format(f.lifetime_connections) + ' / ' + fmt.format(f.lifetime_disconnects);
+    document.getElementById('frontend-rewrites').textContent = fmt.format(f.lifetime_rewrites);
+    document.getElementById('frontend-total-in').textContent = bytes(f.total_bytes_in);
+    document.getElementById('frontend-total-out').textContent = bytes(f.total_bytes_out);
+    document.getElementById('frontend-out-1m').textContent = bytes(f.bytes_out_1m);
+    document.getElementById('frontend-out-5m').textContent = bytes(f.bytes_out_5m);
+    document.getElementById('frontend-out-30m').textContent = bytes(f.bytes_out_30m);
+    document.getElementById('frontend-fr-1m').textContent = fmt.format(f.frames_out_1m);
+    document.getElementById('frontend-fr-5m').textContent = fmt.format(f.frames_out_5m);
+    document.getElementById('frontend-fr-30m').textContent = fmt.format(f.frames_out_30m);
+    document.getElementById('clients-count').textContent = fmt.format(f.active_clients);
+    renderClients(f.clients, now);
+  }
+
+  function renderClients(clients, now) {
+    const body = document.getElementById('clients-body');
+    body.innerHTML = '';
+    for (const c of clients) {
+      const tr = document.createElement('tr');
+      tr.style.borderTop = '1px solid var(--border)';
+      const subsTitle = (c.subscriptions || []).join('\n');
+      const idShort = c.id.slice(0, 8);
+      tr.innerHTML =
+        '<td style="padding:6px 12px;font-family:ui-monospace,monospace;" title="' + escapeHtml(c.id) + '">' + escapeHtml(idShort) + '</td>' +
+        '<td style="padding:6px 12px;font-family:ui-monospace,monospace;">' + escapeHtml(c.remote) + '</td>' +
+        '<td style="padding:6px 12px;">' + escapeHtml(c.subprotocol) + '</td>' +
+        '<td style="padding:6px 12px;">' + ago(now, c.connected_at) + '</td>' +
+        '<td style="padding:6px 12px;">' + c.idle_secs + 's</td>' +
+        '<td style="padding:6px 12px;text-align:right;" title="' + escapeHtml(subsTitle) + '">' +
+          fmt.format((c.subscriptions || []).length) + '</td>' +
+        '<td style="padding:6px 12px;text-align:right;">' + fmt.format(c.one_off_queries) + '</td>' +
+        '<td style="padding:6px 12px;text-align:right;">' + fmt.format(c.rewrites) + '</td>' +
+        '<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums;">' +
+          bytes(c.bytes_in_1m) + ' / ' + bytes(c.total_bytes_in) + '</td>' +
+        '<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums;">' +
+          bytes(c.bytes_out_1m) + ' / ' + bytes(c.bytes_out_5m) + ' / ' + bytes(c.total_bytes_out) + '</td>';
+      body.appendChild(tr);
+    }
+  }
+
   function fillLink(prefix, link, now) {
     setState(prefix + '-state', link.state);
     document.getElementById(prefix + '-up').textContent = ago(now, link.last_up_at);
@@ -294,6 +395,7 @@
       document.getElementById('pub-last').textContent = ago(m.now, m.publisher.last_published_at);
       document.getElementById('pub-republished').textContent =
         m.publisher.republished_this_run ? 'yes' : 'no';
+      fillFrontend(m.frontend, m.now);
       document.getElementById('uptime').textContent =
         'uptime ' + Math.floor((m.now - m.started_at) / 60) + 'm';
       const ts = new Date().toLocaleTimeString();

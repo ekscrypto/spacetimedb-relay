@@ -10,9 +10,7 @@ use relay_publisher::{Publisher, PublisherConfig};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let schema_path = std::env::args()
-        .nth(1)
-        .expect("usage: smoke <schema.json>");
+    let schema_path = std::env::args().nth(1).expect("usage: smoke <schema.json>");
     let schema = std::fs::read(&schema_path)?;
 
     let repo_root: PathBuf = env!("CARGO_MANIFEST_DIR").into();
@@ -33,7 +31,10 @@ async fn main() -> anyhow::Result<()> {
     let pub1 = Publisher::new(cfg.clone());
 
     let r1 = pub1.publish_if_drifted(&schema).await?;
-    println!("first call: republished={} fingerprint={}", r1.republished, r1.fingerprint);
+    println!(
+        "first call: republished={} fingerprint={}",
+        r1.republished, r1.fingerprint
+    );
 
     let r2 = pub1.publish_if_drifted(&schema).await?;
     println!("second call (same schema): republished={}", r2.republished);
