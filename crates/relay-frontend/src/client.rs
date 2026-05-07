@@ -108,6 +108,13 @@ async fn drive(
                 match msg.map_err(ClientError::DownstreamWs)? {
                     Message::Binary(b) => {
                         let bytes = Bytes::from(b);
+                        tracing::debug!(
+                            target: "relay::frontend",
+                            client_id = %stats.id,
+                            len = bytes.len(),
+                            tag = ?bytes.first().copied(),
+                            "client→local frame"
+                        );
                         observe_inbound(&ctx.metrics, stats, &bytes);
                         local.send(Message::Binary(bytes.to_vec())).await
                             .map_err(ClientError::LocalWs)?;
@@ -136,6 +143,13 @@ async fn drive(
                 match msg.map_err(ClientError::LocalWs)? {
                     Message::Binary(b) => {
                         let mut bytes = Bytes::from(b);
+                        tracing::debug!(
+                            target: "relay::frontend",
+                            client_id = %stats.id,
+                            len = bytes.len(),
+                            tag = ?codec::message_tag(&bytes),
+                            "local→client frame"
+                        );
                         if ctx.subprotocol == Subprotocol::V1 {
                             // v1 clients get the full upstream-meta
                             // injection; we hide internal traffic as a
