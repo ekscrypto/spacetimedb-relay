@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! Replacement for the legacy MemStore + downstream-WS path. Mirrors
-//! upstream tables into a sibling SpacetimeDB by calling per-table
-//! `relay_apply_<table>` reducers on a generated mirror module.
+//! Mirrors upstream tables into a sibling SpacetimeDB by calling
+//! per-table `relay_apply_<table>` reducers on a generated mirror
+//! module.
 //!
 //! Three components wired together:
 //! * [`relay_publisher::Publisher`] — codegen + cargo build + spacetime
@@ -10,12 +10,15 @@
 //!   *whole* local database is wiped (`--delete-data`); we never trust
 //!   a partial preservation across schema changes (invariant #4).
 //! * [`relay_mirror_driver::MirrorDriver`] — v2 WebSocket client that
-//!   pushes `relay_apply_<table>(deletes, inserts)` calls to the local
-//!   stdb with bounded in-flight backpressure.
-//! * Upstream subscribe loop — mostly identical to the legacy path,
-//!   but the per-message handler routes `SubscribeApplied`/
-//!   `TransactionUpdate` rows straight to the driver instead of
-//!   updating MemStore + the engine.
+//!   pushes `relay_apply_<table>(upstream, deletes, inserts)` calls to
+//!   the local stdb with bounded in-flight backpressure.
+//! * Upstream subscribe loop — opens one upstream WS, sends either a
+//!   single set-replace `Subscribe` (default) OR a sequential
+//!   `SubscribeMulti` per table (`--subscribe-chunk-size 1`, v1
+//!   only — see CLAUDE.md "Subscribing at scale" for why this is
+//!   required against BitCraft). Routes `SubscribeApplied` and
+//!   `TransactionUpdate` rows into `driver.apply()`. Reconnects with
+//!   exponential backoff on disconnect.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

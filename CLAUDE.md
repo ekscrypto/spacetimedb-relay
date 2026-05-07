@@ -58,20 +58,45 @@ cp tools/mirror-template/{Cargo.toml,rust-toolchain.toml} /tmp/mirror/
 (cd /tmp/mirror && cargo build --release --target wasm32-unknown-unknown)
 (cd /tmp/mirror && spacetime publish -s relay-local -y --delete-data relay-mirror)
 
-# Run the relay against the live BitCraft test region
+# Run the relay against the live BitCraft test region.
+# `--subscribe-chunk-size 1` is REQUIRED for BitCraft (or any v1
+# upstream with a large schema) — see "Subscribing at scale" below.
+# RELAY_STDB_IDENTITY_TOKEN is optional — on first run the relay
+# captures the local-stdb-issued token via InitialConnection and
+# persists it under --data-dir; subsequent runs reuse it.
 RELAY_UPSTREAM_TOKEN=$(cat .bitcraft-token) \
-RELAY_STDB_IDENTITY_TOKEN="<spacetime CLI's logged-in token>" \
 cargo run -p relay --release -- \
   --upstream wss://bitcraft-early-access.spacetimedb.com \
   --database bitcraft-live-14 \
   --upstream-protocol v1 \
+  --subscribe-chunk-size 1 \
   --stdb-url ws://127.0.0.1:3010 \
   --stdb-server-alias relay-local \
-  --mirror-database relay-mirror-bc14
+  --mirror-database relay-mirror-bc14 \
+  --data-dir /var/lib/relay-bc14
+
+# Heap-profiling build: swaps the system allocator for dhat::Alloc
+# and writes `dhat-heap.json` to CWD on graceful shutdown.
+# Off by default.
+cargo run -p relay --features profile-heap -- ...
 
 # Speak v2 directly to either the local SpacetimeDB or the upstream
 cargo run -p relay-test-harness -- <args>
 ```
+
+Other relay flags worth knowing:
+- `--data-dir` (env `RELAY_DATA_DIR`, default `data/`) — workdir for
+  state safe to lose. Publisher workdir defaults to
+  `<data-dir>/mirror-publisher`; persisted identity token defaults to
+  `<data-dir>/relay-stdb-identity.token`.
+- `--dashboard-bind` (env `RELAY_DASHBOARD_BIND`, default
+  `127.0.0.1:3001`) — see "Dashboard" below. Empty string disables.
+- `--subscribe-table` (env `RELAY_SUBSCRIBE_TABLES`, comma-delimited,
+  repeatable) — restrict the upstream subscription set.
+- `--subscribe-chunk-size` (env `RELAY_SUBSCRIBE_CHUNK_SIZE`,
+  default `0`) — see "Subscribing at scale" below.
+- `--frame-limit` (env `RELAY_FRAME_LIMIT`) — stop after N upstream
+  frames; useful for smoke tests.
 
 ## Architecture invariants
 
@@ -126,15 +151,53 @@ When v1 is selected:
   `relay/src/stdb_mode.rs` stay v2-only.
 - Outbound `Subscribe` is encoded as v1's set-replace
   `Subscribe { query_strings, request_id }` (no `QuerySetId`).
+- Outbound `SubscribeMulti` (v1, additive) is also supported — used
+  exclusively in sequential subscribe mode (`--subscribe-chunk-size 1`,
+  see below). The single-query form is encoded by
+  `v1_compat::encode_subscribe_multi`.
 - Per-table compression (`CompressableQueryUpdate::Brotli`/`Gzip`) is
   ignored; we always ask for `?compression=None`.
 - `IdentityToken` (v1) maps to v2's `InitialConnection`.
 - `InitialSubscription` (v1) maps to v2's `SubscribeApplied` with
   synthetic `request_id = 1` and `query_set_id = 1`.
+- `SubscribeMultiApplied` (v1) maps to v2's `SubscribeApplied` with
+  the original `request_id` and `query_id` (in `query_set_id`).
 
 Reference: `crates/client-api-messages/src/websocket.rs` in
 clockworklabs/SpacetimeDB at tag `v1.12.0`. We pin that version of
 `spacetimedb-client-api-messages` as a separately-named workspace dep.
+
+## Subscribing at scale
+
+For small schemas, the default mode (`--subscribe-chunk-size 0`)
+sends a single set-replace `Subscribe` with all tables and the
+upstream replies with one `InitialSubscription` covering the entire
+working set. Simple, fast.
+
+For large v1 schemas (e.g. BitCraft's 250 public-user tables — about
+1 GB of initial state today), that single `InitialSubscription`
+becomes a single multi-hundred-MB WS message that BitCraft's edge
+RSTs at ~90 s — well before any client (verified including the
+official SpacetimeDB Rust SDK at v1.12.0; see `crates/bc14-sdk-test/`)
+can finish receiving it. We confirmed this empirically: every variant
+of our client and the SDK itself hit the same TCP RST at the same
+byte mark.
+
+The fix: `--subscribe-chunk-size 1` activates **sequential
+SubscribeMulti** mode. The relay sends one `SubscribeMulti` per
+table, waits for `SubscribeMultiApplied`, applies the rows, then
+moves to the next. Each per-table InitialSubscription fits
+comfortably under the 90 s window even for the worst behemoth
+(`footprint_tile_state` is ~644 MB on its own — still completes).
+
+State machine lives in `stdb_mode.rs::SequentialState`; advances on
+each `SubscribeApplied` and emits `"all sequential subscriptions
+applied"` when done. On reconnect, restarts from index 0 — per-table
+dumps are cheap once we're past the multi-hundred-MB single-message
+wall.
+
+Currently this mode is v1-only (the path we need; v2 callers can
+add a similar `SubscribeMulti` encoding if it ever matters).
 
 ## Wire protocol — v2 message tags
 
@@ -157,13 +220,14 @@ Source of truth: `clockworklabs/SpacetimeDB`,
 
 | Crate                  | Purpose |
 |------------------------|---------|
-| `relay-protocol`       | Wraps `spacetimedb-sats` + `spacetimedb-client-api-messages`. Wire types only — no I/O. |
-| `relay-upstream`       | Owns the single upstream WebSocket. Decodes ServerMessages, exposes a stream of `UpstreamEvent`. |
+| `relay-protocol`       | Wraps `spacetimedb-sats` + `spacetimedb-client-api-messages`. Wire types only — no I/O. Hosts the shared `UpstreamReducerMeta` struct that gets forwarded as `relay_apply_<table>`'s `original` arg. |
+| `relay-upstream`       | Owns the single upstream WebSocket. Un-split socket pattern (single `tokio::select!` on `&mut sock` for read / 30 s idle Ping / cmd arms — matches the SpacetimeDB SDK). Decodes ServerMessages and exposes them as `UpstreamEvent`. Emits a 2 s watchdog heartbeat with iteration / frame counters on `relay::upstream::watchdog`. |
 | `relay-publisher`      | Codegen → cargo build → `spacetime publish -y --delete-data`, keyed by SHA-256 of the upstream schema JSON. No-op when the fingerprint hasn't changed. |
-| `relay-mirror-driver`  | v2 WS client to local SpacetimeDB. Sends `relay_apply_<table>(deletes, inserts)` calls with semaphore backpressure (≤8 K in-flight) and chunking by row count + payload bytes. |
-| `relay`                | Binary. Args, schema fetch, dispatches to `stdb_mode`. |
+| `relay-mirror-driver`  | v2 WS client to local SpacetimeDB. Sends `relay_apply_<table>(upstream, deletes, inserts)` calls with semaphore backpressure (≤8 K in-flight) and chunking by row count + payload bytes. |
+| `relay`                | Binary. Args, schema fetch, dashboard, dispatches to `stdb_mode`. The `stdb_mode.rs` run loop drives publisher → driver → `relay_bind_writer` → upstream subscribe (set-replace OR sequential SubscribeMulti) → routes `SubscribeApplied` + `TransactionUpdate` into `driver.apply()`. |
 | `relay-test-harness`   | Standalone binary that plays the C/D role. Speaks v2 directly via `spacetimedb-client-api-messages`. |
-| `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table (`relay_insert/delete/update/apply_<table>`). |
+| `bc14-sdk-test`        | Standalone bin (excluded from the workspace). Vendors v1.12.0 SDK's `websocket.rs` + `compression.rs` verbatim with `pub` accessors, no codegen. Used to prove that BitCraft's 90 s RST on a 250-table set-replace is server/middlebox behavior, not a client-side bug. See `crates/bc14-sdk-test/README.md`. |
+| `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table (`relay_insert/delete/update/apply_<table>`), each taking an `Option<UpstreamReducerInfo>` arg that downstream subscribers see in `ctx.event.reducer.args`. |
 | `tools/mirror-template/` | Cargo.toml + rust-toolchain.toml copied into the runtime workdir before each codegen run. |
 
 ## Mirror module + writer auth
@@ -175,15 +239,15 @@ Every code-generated mirror module includes a fixed scaffold:
 struct RelayMetaRow { #[primary_key] id: u8, writer: Identity }
 
 #[spacetimedb::reducer(init)]
-fn relay_init(ctx: &ReducerContext) {
-    if ctx.db.relay_meta().id().find(&0u8).is_none() {
-        ctx.db.relay_meta().insert(RelayMetaRow { id: 0, writer: ctx.sender() });
-    }
+fn relay_init(_ctx: &ReducerContext) {
+    /* no-op: writer is captured by the first relay_bind_writer call,
+       not by whichever identity ran `spacetime publish` */
 }
 
 #[spacetimedb::reducer]
 pub fn relay_bind_writer(ctx: &ReducerContext) -> Result<(), Box<str>> {
-    /* idempotent: already-bound to same identity → ok; different → error */
+    /* first call inserts ctx.sender() as the writer.
+       subsequent calls: same identity → ok; different → "unauthorized" */
 }
 
 fn assert_writer(ctx: &ReducerContext) -> Result<(), Box<str>> {
@@ -191,10 +255,51 @@ fn assert_writer(ctx: &ReducerContext) -> Result<(), Box<str>> {
 }
 ```
 
-The publisher's identity (the spacetime CLI's logged-in identity) is
-captured at `init` time. The relay must present that same identity at
-runtime via `--stdb-identity-token` / `RELAY_STDB_IDENTITY_TOKEN`,
-otherwise every reducer call fails `unauthorized`.
+Identity-binding flow at runtime:
+
+1. The relay opens its first WS to the local SpacetimeDB. The local
+   stdb sends back `InitialConnection { identity, token }` — that's
+   the identity the local stdb has issued for this connection.
+2. The relay persists that token to
+   `<data-dir>/relay-stdb-identity.token` (atomic rename, chmod 600)
+   and uses it for all subsequent connections.
+3. The relay calls `relay_bind_writer` over that connection. The
+   freshly-issued identity is sealed into `_relay_meta.writer`.
+4. On restart, the relay loads the persisted token, reconnects as the
+   same identity, and `relay_bind_writer` is a no-op (already bound).
+
+`--stdb-identity-token` / `RELAY_STDB_IDENTITY_TOKEN` is an **optional
+override**: pass it when you want the relay to bind as a specific
+pre-existing identity (e.g. the spacetime CLI's logged-in identity)
+rather than a fresh one. Not required for first run.
+
+## Dashboard
+
+The relay binary serves an in-process dashboard plus a `/metrics` and
+`/events` JSON endpoint at `--dashboard-bind` (default
+`127.0.0.1:3001`; set to empty string to disable).
+
+Panels:
+
+- Upstream and local-stdb link state.
+- Sliding 1m / 5m / 30m windows for inbound bytes and frame counts.
+- Driver in-flight permits (used / max).
+- Publisher fingerprint and timestamp of last republish.
+- **Live log** — tail of every `relay::*` tracing event, filterable
+  by substring. Captured by an in-process `tracing_subscriber::Layer`
+  that respects its own `EnvFilter::new("relay=debug")` so the
+  dashboard always shows debug-level relay events without restarting
+  with verbose `RUST_LOG`. Ring buffer holds the last 50 000 events
+  (~12 minutes of BitCraft traffic at ~64 events/s); browser polls
+  `/events?since=N&max=200` every 1 s.
+
+Source: `crates/relay/src/dashboard.rs` + `dashboard.html`.
+
+## Historical / superseded docs
+
+- `MEMORY-MIGRATION.md` — describes an abandoned in-process memstore
+  plan that was replaced by the SpacetimeDB-mirror architecture
+  documented here. Kept for reference only; do not treat as current.
 
 ## Reference: live test database
 
@@ -234,9 +339,14 @@ cross-checking encoding decisions.
 
 ## Common pitfalls
 
-1. **Identity binding.** The publisher and the running relay must use
-   the same identity, otherwise `assert_writer` rejects every call.
-   Use `RELAY_STDB_IDENTITY_TOKEN`. (See "Mirror module + writer auth".)
+1. **Identity binding.** First run: the relay captures and persists a
+   local-stdb-issued token under `<data-dir>`; `relay_bind_writer`
+   seals that identity. On subsequent runs the persisted token must
+   still be present and readable, otherwise the relay reconnects as a
+   *different* identity and every reducer call fails `unauthorized`.
+   Wiping `--data-dir` mid-deployment requires a corresponding
+   `spacetime publish --delete-data` republish so the new identity
+   can re-bind. (See "Mirror module + writer auth".)
 2. **CallReducer args size.** SpacetimeDB caps incoming WS frames
    around 32 MB. The driver chunks by row count and payload bytes
    (default 16 MB / 4096 rows); raise either via `DriverConfig` if
@@ -252,6 +362,27 @@ cross-checking encoding decisions.
 6. **Schema fingerprint = SHA-256 of the upstream schema JSON.**
    Stored in `<workdir>/fingerprint.json`. Mismatch triggers a full
    `--delete-data` republish; the wipe is the correctness guarantee.
+7. **BitCraft's ~90 s RST on big set-replace `Subscribe`s.** Subscribing
+   to all 250 BitCraft tables in one shot triggers a single >1 GB
+   `InitialSubscription` WS message. Some middlebox along
+   BitCraft's edge resets the connection at ~90 s before any client
+   can finish receiving it. Confirmed against the official SpacetimeDB
+   Rust SDK (see `crates/bc14-sdk-test/`); same RST at the same byte
+   mark. Workaround is `--subscribe-chunk-size 1` (sequential
+   `SubscribeMulti`); see "Subscribing at scale".
+8. **Allocator pressure on multi-hundred-MB fragmented frames.**
+   `mimalloc` was previously the default global allocator but burns
+   3-4× the RSS while tungstenite accumulates a giant fragmented
+   Binary message. Removed in favor of the system allocator. Don't
+   re-enable mimalloc without retesting against a BitCraft-scale
+   subscribe.
+9. **`tokio::select!` over a split `WebSocketStream`.** Don't.
+   `WebSocketStream::split` returns a `BiLock`-shared sink/stream
+   pair; tungstenite's auto-Pong replies queue on the unpolled write
+   half during a long read poll. The relay uses a single un-split
+   `&mut sock` driven by one select with three arms (read / 30 s
+   idle Ping / cmd) — matches the SpacetimeDB SDK pattern. See
+   `relay-upstream/src/client.rs`.
 
 ## Deployment
 
@@ -303,6 +434,12 @@ SDK).
   before guessing wire details.
 - Cross-reference the Swift SDK's `Sources/SpacetimeDB/Server Messages/`
   for parser implementations.
+- For SpacetimeDB Rust SDK behavior, the v1.12.0 source is at
+  `https://github.com/clockworklabs/SpacetimeDB/tree/v1.12.0/sdks/rust`.
+  The crate's WS handling lives in `src/websocket.rs` and is
+  vendored verbatim by `crates/bc14-sdk-test/` for empirical
+  testing — run that bin to confirm any large-scale subscribe issue
+  isn't caused by something we did vs the SDK.
 - The spike under `spike/` (codegen Python + sample mirror crate +
   `spike-replay` standalone driver) was the original validation.
   Useful as a reference when refactoring codegen or driver internals.
