@@ -13,6 +13,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+pub mod registry;
+pub use registry::{MetaEntry, MetaRegistry};
+
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -108,6 +111,13 @@ pub struct MirrorDriver {
     max_rows_per_apply: usize,
     max_bytes_per_apply: usize,
     captured: Option<InitialConnectionInfo>,
+    /// Records meta + request_id for every `relay_apply_<table>`
+    /// CallReducer the driver sends. The frontend proxy reads from
+    /// this registry to synthesise full v1 `TransactionUpdate`s out
+    /// of the V2 local stdb's `TransactionUpdateLight` broadcasts.
+    /// Optional so callers that don't need it (tests, spikes) can
+    /// pass `None`.
+    meta_registry: Option<Arc<MetaRegistry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,7 +147,16 @@ impl MirrorDriver {
             max_rows_per_apply: cfg.max_rows_per_apply,
             max_bytes_per_apply: cfg.max_bytes_per_apply,
             captured: Some(captured),
+            meta_registry: None,
         })
+    }
+
+    /// Wire a [`MetaRegistry`] into this driver. Subsequent
+    /// `apply()` calls record `(request_id, meta)` so the relay
+    /// frontend can join `TransactionUpdateLight` frames against the
+    /// upstream meta when synthesising full v1 `TransactionUpdate`s.
+    pub fn set_meta_registry(&mut self, registry: Arc<MetaRegistry>) {
+        self.meta_registry = Some(registry);
     }
 
     /// The identity + token reported by the local SpacetimeDB on this
@@ -199,7 +218,7 @@ impl MirrorDriver {
             stats.bytes_sent += args.len() as u64;
             stats.deletes += deletes_chunk.len() as u64;
             stats.inserts += inserts_chunk.len() as u64;
-            self.send_call(&reducer, &args).await?;
+            self.send_call_with_meta(&reducer, &args, upstream).await?;
         }
         Ok(stats)
     }
@@ -213,6 +232,15 @@ impl MirrorDriver {
     }
 
     async fn send_call(&mut self, reducer: &str, args: &[u8]) -> Result<(), DriverError> {
+        self.send_call_with_meta(reducer, args, None).await
+    }
+
+    async fn send_call_with_meta(
+        &mut self,
+        reducer: &str,
+        args: &[u8],
+        meta: Option<&UpstreamReducerMeta>,
+    ) -> Result<(), DriverError> {
         let permit = self
             .in_flight
             .clone()
@@ -221,6 +249,9 @@ impl MirrorDriver {
             .map_err(|_| DriverError::Closed)?;
         permit.forget();
         let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
+        if let Some(reg) = &self.meta_registry {
+            reg.record(request_id, meta.cloned());
+        }
         let msg = ClientMessage::CallReducer(CallReducer {
             request_id,
             flags: CallReducerFlags::Default,

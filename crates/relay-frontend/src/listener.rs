@@ -20,8 +20,9 @@ use crate::client::{self, ClientCtx};
 use crate::metrics::FrontendMetrics;
 use crate::state::ActiveClients;
 use crate::Subprotocol;
+use relay_mirror_driver::MetaRegistry;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub bind: SocketAddr,
     /// Local SpacetimeDB url (loopback in production).
@@ -33,6 +34,12 @@ pub struct Config {
     pub local_token: Option<String>,
     pub max_clients: usize,
     pub idle_timeout: Duration,
+    /// Shared registry of `(request_id, UpstreamReducerMeta)` the
+    /// relay-mirror-driver populates for each `relay_apply_*`
+    /// CallReducer. The proxy reads it to synthesise full v1
+    /// TransactionUpdates from local stdb's TransactionUpdateLight
+    /// broadcasts. None disables synthesis (TUL passes through).
+    pub meta_registry: Option<Arc<MetaRegistry>>,
 }
 
 /// Accept loop. Returns when the listener errors or is dropped.
@@ -119,6 +126,7 @@ async fn handle_accept(
         idle_timeout: cfg.idle_timeout,
         metrics,
         clients,
+        meta_registry: cfg.meta_registry,
     };
     client::run(ws, ctx).await;
 }

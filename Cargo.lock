@@ -1740,8 +1740,10 @@ dependencies = [
  "futures-util",
  "http",
  "parking_lot",
+ "relay-mirror-driver",
  "relay-protocol",
  "serde",
+ "smallvec",
  "spacetimedb-client-api-messages 1.12.0",
  "spacetimedb-client-api-messages 2.2.0",
  "spacetimedb-lib 1.12.0",
@@ -1762,6 +1764,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "dashmap",
  "futures-util",
  "http",
  "relay-protocol",

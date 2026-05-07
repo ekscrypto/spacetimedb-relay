@@ -153,7 +153,14 @@ async fn main() -> Result<()> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        return run_subscribe_only(subscriber_url, database, tables, timeout).await;
+        return match args.subscriber_protocol {
+            SubscriberProtocol::V2 => {
+                run_subscribe_only(subscriber_url, database, tables, timeout).await
+            }
+            SubscriberProtocol::V1 => {
+                run_subscribe_only_v1(subscriber_url, database, tables, timeout).await
+            }
+        };
     }
 
     // Subscriber may want the writer's upstream identity to assert
@@ -299,6 +306,108 @@ async fn run_subscribe_only(
         total_rows,
         total_bytes,
     );
+    Ok(())
+}
+
+async fn run_subscribe_only_v1(
+    relay: Url,
+    database: String,
+    tables: Vec<String>,
+    timeout: Duration,
+) -> Result<()> {
+    if tables.is_empty() {
+        bail!("--subscribe-only requires at least one table in --table");
+    }
+    tracing::info!(
+        target: "harness::subscribe-only-v1",
+        ?tables,
+        "connecting via v1"
+    );
+    let mut conn = stdb_client_v1::open_connection(&relay, &database).await?;
+    let id_tok = stdb_client_v1::expect_identity_token(&mut conn).await?;
+    tracing::info!(
+        target: "harness::subscribe-only-v1",
+        identity = %hex::encode(id_tok.identity.to_byte_array()),
+        "got v1 IdentityToken"
+    );
+
+    let queries: Vec<String> = tables
+        .iter()
+        .map(|t| format!("SELECT * FROM {t}"))
+        .collect();
+    stdb_client_v1::send_subscribe(&mut conn, 100, queries).await?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut counts: std::collections::BTreeMap<&'static str, u64> = Default::default();
+    let mut got_initial = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let msg =
+            match tokio::time::timeout(remaining, stdb_client_v1::recv_server_message(&mut conn))
+                .await
+            {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => return Err(anyhow!("recv error: {e}")),
+                Err(_) => break,
+            };
+        let kind = v1_variant_name(&msg);
+        *counts.entry(kind).or_default() += 1;
+        match msg {
+            v1::ServerMessage::InitialSubscription(is) => {
+                got_initial = true;
+                use spacetimedb_client_api_messages_v1::websocket::{
+                    CompressableQueryUpdate, RowListLen,
+                };
+                let mut total_rows: usize = 0;
+                for table in is.database_update.tables.iter() {
+                    for upd in table.updates.iter() {
+                        if let CompressableQueryUpdate::Uncompressed(qu) = upd {
+                            total_rows += qu.inserts.len();
+                        }
+                    }
+                }
+                tracing::info!(
+                    target: "harness::subscribe-only-v1",
+                    rows = total_rows,
+                    "InitialSubscription"
+                );
+            }
+            v1::ServerMessage::TransactionUpdate(tu) => {
+                tracing::info!(
+                    target: "harness::subscribe-only-v1",
+                    reducer = %tu.reducer_call.reducer_name,
+                    request_id = tu.reducer_call.request_id,
+                    caller_id = %hex::encode(tu.caller_identity.to_byte_array()),
+                    args_len = tu.reducer_call.args.len(),
+                    "★ FULL v1 TransactionUpdate (rewrite path lit up)"
+                );
+            }
+            v1::ServerMessage::TransactionUpdateLight(tul) => {
+                tracing::info!(
+                    target: "harness::subscribe-only-v1",
+                    request_id = tul.request_id,
+                    "v1 TransactionUpdateLight (rows-only — no rewrite possible)"
+                );
+            }
+            other => {
+                tracing::debug!(
+                    target: "harness::subscribe-only-v1",
+                    kind = v1_variant_name(&other),
+                    "other v1 frame"
+                );
+            }
+        }
+    }
+    println!("v1 frame counts:");
+    for (k, n) in counts.iter() {
+        println!("  {k:<28} {n}");
+    }
+    if !got_initial {
+        bail!("no InitialSubscription received within timeout");
+    }
     Ok(())
 }
 

@@ -25,6 +25,7 @@ use crate::metrics::{ClientStats, FrontendMetrics};
 use crate::rewrite::{self, RewriteError};
 use crate::state::{ActiveClients, ClientHandle};
 use crate::Subprotocol;
+use relay_mirror_driver::MetaRegistry;
 
 const APPLY_PREFIX: &str = "relay_apply_";
 const META_TABLE: &str = "_relay_meta";
@@ -41,6 +42,12 @@ pub struct ClientCtx {
     pub idle_timeout: Duration,
     pub metrics: Arc<FrontendMetrics>,
     pub clients: ActiveClients,
+    /// Lookup table the relay-mirror-driver populates with
+    /// `(request_id, UpstreamReducerMeta)` for each `relay_apply_*`
+    /// `CallReducer`. The proxy joins it against incoming v1
+    /// `TransactionUpdateLight` frames (whose `request_id` echoes the
+    /// caller's) to synthesise full v1 TUs for v1 subscribers.
+    pub meta_registry: Option<Arc<MetaRegistry>>,
 }
 
 /// Run a single client connection to completion. Registers + deregisters
@@ -154,7 +161,12 @@ async fn drive(
                             // v1 clients get the full upstream-meta
                             // injection; we hide internal traffic as a
                             // side-effect.
-                            match handle_local_v1_frame(bytes.clone(), stats, &ctx.metrics) {
+                            match handle_local_v1_frame(
+                                bytes.clone(),
+                                stats,
+                                &ctx.metrics,
+                                ctx.meta_registry.as_deref(),
+                            ) {
                                 Ok(Some(rewritten)) => bytes = rewritten,
                                 Ok(None) => {
                                     // Silently dropped (relay's own
@@ -279,20 +291,88 @@ fn handle_local_v1_frame(
     frame: Bytes,
     stats: &ClientStats,
     metrics: &FrontendMetrics,
+    registry: Option<&MetaRegistry>,
 ) -> Result<Option<Bytes>, RewriteError> {
     if should_hide_v1(&frame) {
         return Ok(None);
     }
-    match rewrite::rewrite_local_to_v1_client(&frame)? {
-        rewrite::Rewritten::Owned(v) => {
+    // Decode once; dispatch on variant.
+    let body = codec::body(&frame)?;
+    use spacetimedb_client_api_messages_v1::websocket as v1;
+    let msg: v1::ServerMessage<v1::BsatnFormat> = spacetimedb_lib_v1::bsatn::from_slice(body)
+        .map_err(|e| RewriteError::Decode(e.to_string()))?;
+    match msg {
+        v1::ServerMessage::TransactionUpdate(mut tu) => {
+            // Already-full TU: rewrite in place if it's a relay_apply_*
+            // call. (V2 local stdb rarely emits this for subscribers;
+            // kept as a fallback for hosts that do send full v1 TUs.)
+            if !matches!(tu.status, v1::UpdateStatus::Committed(_)) {
+                return Ok(Some(frame));
+            }
+            if !tu.reducer_call.reducer_name.starts_with("relay_apply_") {
+                return Ok(Some(frame));
+            }
+            let Some(meta) = rewrite::extract_upstream_meta(&tu.reducer_call.args)? else {
+                return Ok(Some(frame));
+            };
+            apply_meta_into_v1_tu(&mut tu, meta);
+            let body = spacetimedb_lib_v1::bsatn::to_vec(
+                &v1::ServerMessage::<v1::BsatnFormat>::TransactionUpdate(tu),
+            )
+            .map_err(|e| RewriteError::Encode(e.to_string()))?;
             stats
                 .rewrites
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             metrics.record_rewrite();
-            Ok(Some(Bytes::from(v)))
+            Ok(Some(Bytes::from(codec::wrap_uncompressed(body))))
         }
-        rewrite::Rewritten::Passthrough => Ok(Some(frame)),
+        v1::ServerMessage::TransactionUpdateLight(tul) => {
+            // V2 local stdb sends TUL on the v1 subprotocol — rows
+            // only, no caller info. Look up the meta the driver
+            // recorded for this CallReducer's request_id and synthesise
+            // a full v1 TU.
+            let Some(reg) = registry else {
+                return Ok(Some(frame));
+            };
+            let Some(meta_opt) = reg.get(tul.request_id) else {
+                // Unknown request_id (race or non-relay writer). Pass
+                // through verbatim.
+                return Ok(Some(frame));
+            };
+            let Some(meta) = meta_opt else {
+                // Driver knew about this call but had no upstream meta
+                // (e.g. the initial subscribe-applied apply path). Pass
+                // through.
+                return Ok(Some(frame));
+            };
+            let synth = rewrite::synthesize_v1_tu_from_tul(tul, meta);
+            stats
+                .rewrites
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics.record_rewrite();
+            Ok(Some(Bytes::from(synth)))
+        }
+        _ => Ok(Some(frame)),
     }
+}
+
+fn apply_meta_into_v1_tu(
+    tu: &mut spacetimedb_client_api_messages_v1::websocket::TransactionUpdate<
+        spacetimedb_client_api_messages_v1::websocket::BsatnFormat,
+    >,
+    meta: relay_protocol::UpstreamReducerMeta,
+) {
+    tu.caller_identity =
+        spacetimedb_lib_v1::Identity::from_byte_array(meta.caller_identity.to_byte_array());
+    tu.caller_connection_id = spacetimedb_lib_v1::ConnectionId::from_be_byte_array(
+        meta.caller_connection_id.as_be_byte_array(),
+    );
+    tu.timestamp = spacetimedb_lib_v1::Timestamp::from_micros_since_unix_epoch(
+        meta.timestamp.to_micros_since_unix_epoch(),
+    );
+    tu.reducer_call.reducer_name = meta.reducer_name.into_boxed_str();
+    tu.reducer_call.args = meta.args.into_boxed_slice();
+    tu.reducer_call.request_id = meta.request_id;
 }
 
 /// True for frames the proxy should hide from downstream clients.
