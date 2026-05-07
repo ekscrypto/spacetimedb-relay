@@ -7,14 +7,18 @@ without multiplying load on the game server.
 The relay code-generates a mirror module at runtime, publishes it to a
 sibling SpacetimeDB instance you run alongside the relay, and pipes
 upstream inserts/deletes/updates onto that local SpacetimeDB.
-**Downstream clients connect directly to the local SpacetimeDB**
-using the unmodified v2 WebSocket protocol — they're literally talking
-to a SpacetimeDB, so any SDK works without changes.
+**Downstream clients connect to the relay's frontend proxy** (default
+`:3009`), which forwards each connection to the local SpacetimeDB on
+loopback and — for v1 clients — synthesises full v1
+`TransactionUpdate` frames from the local stdb's
+`TransactionUpdateLight` broadcasts so subscribers see the upstream's
+`reducer_call` and `caller_identity` rather than the relay's
+internal `relay_apply_<table>` plumbing.
 
-The upstream side can speak either **`v2.bsatn.spacetimedb`** (default,
-SpacetimeDB ≥ 2.0) or **`v1.bsatn.spacetimedb`** (pre-2.0 deployments,
-opt-in via `--upstream-protocol v1`). v1 messages are translated to v2
-internally.
+The frontend negotiates the same subprotocol the client offers
+(**`v1.bsatn.spacetimedb`** or **`v2.bsatn.spacetimedb`**), and the
+upstream side can speak either of those too (default `v2`, opt into
+`v1` via `--upstream-protocol v1`).
 
 > **Community project — not affiliated with Clockwork Labs.**
 > SpacetimeDB™ is a trademark of [Clockwork Labs](https://clockworklabs.io/).
@@ -43,20 +47,24 @@ RAM with a struct-per-row mirror was closer to 20×.
                                             (codegen + spacetime
                                             publish) materializes a
                                             mirror module on L (local
-                                            SpacetimeDB).
-                                  │
-                                  ▼
-                                  D         D subscribes to L; never
-                                            reaches S.
+                                            SpacetimeDB on loopback).
+                                  ▲
+                                  │ loopback only
+                                  F ◄──── D    D connects to F; F
+                                               negotiates v1/v2 with D,
+                                               proxies frames to L, and
+                                               synthesises full v1 TUs
+                                               from L's TULs for v1 D.
 ```
 
 `R` = relay process. `S` = upstream SpacetimeDB. `L` = sibling
-SpacetimeDB you run on the relay host. `P` = publisher pipeline. `D` =
-downstream clients (game SDKs).
+SpacetimeDB you run on the relay host (loopback-only). `P` =
+publisher pipeline. `F` = frontend proxy (in-process with `R`,
+default `0.0.0.0:3009`). `D` = downstream clients (game SDKs).
 
 The relay never propagates `CallReducer` upstream. Clients that need
-to mutate state call reducers directly on the upstream; the relay's
-job is read-only fan-out via `L`.
+to mutate state call reducers directly on the upstream (`C → S` in
+the diagram); the relay's job is read-only fan-out via `L` and `F`.
 
 ## Prerequisites
 
@@ -103,12 +111,108 @@ Logs you should see, in order:
    `cargo build` + `spacetime publish` (~50 s on a cold cache; no-op
    thereafter when the schema's fingerprint hasn't changed)
 3. `bound writer on local stdb` — `relay_bind_writer` ack'd
-4. `upstream connected` — relay→upstream WebSocket up
-5. `SubscribeApplied n_tables=…` — initial bulk-load is streaming
+4. `frontend listening bind=0.0.0.0:3009` — proxy ready for downstream
+5. `upstream connected` — relay→upstream WebSocket up
+6. `SubscribeApplied n_tables=…` — initial bulk-load is streaming
    `relay_apply_<table>` calls into the local SpacetimeDB
 
-Downstream clients now connect directly to the local SpacetimeDB on
-`ws://relay-host:3010/v1/database/relay-mirror-<your-database>/subscribe`.
+Downstream clients connect to the **frontend proxy** at
+`ws://relay-host:3009/v1/database/<mirror-database>/subscribe` —
+see the next section for v1 and v2 examples.
+
+## Connecting downstream clients
+
+The frontend negotiates whichever subprotocol the client offers in
+`Sec-WebSocket-Protocol`. Both shapes are valid; pick based on what
+your client SDK speaks. Local SpacetimeDB binds loopback-only; clients
+should never address it directly.
+
+### v2.bsatn.spacetimedb (default for current SDKs)
+
+Plain passthrough plus per-client metrics. Subscribers see standard
+v2 `TransactionUpdate` frames (rows-only — v2 broadcasts don't carry
+reducer info, regardless of what's upstream).
+
+```
+GET /v1/database/<mirror-database>/subscribe?compression=None HTTP/1.1
+Host: relay-host:3009
+Upgrade: websocket
+Sec-WebSocket-Protocol: v2.bsatn.spacetimedb
+```
+
+Drop-in replacement for the official SpacetimeDB Rust/TS/C# SDK
+configured against `ws://relay-host:3009`. No code changes.
+
+### v1.bsatn.spacetimedb (full upstream-flavored TransactionUpdates)
+
+Subscribers see full v1 `TransactionUpdate` frames whose
+`reducer_call.{reducer_name,args,request_id}`, `caller_identity`,
+`caller_connection_id`, and `timestamp` are sourced from the
+**upstream** transaction that triggered the change — not the relay's
+local `relay_apply_<table>` plumbing.
+
+The proxy gets these by joining each local-stdb
+`TransactionUpdateLight` against an in-process registry the
+relay-mirror-driver populates with `(request_id, UpstreamReducerMeta)`
+at the moment it sends the corresponding `CallReducer`. Effective
+when the upstream is v1; against a v2 upstream the registry stores
+`None` (no upstream meta available) and TULs pass through verbatim.
+
+```
+GET /v1/database/<mirror-database>/subscribe?compression=None HTTP/1.1
+Host: relay-host:3009
+Upgrade: websocket
+Sec-WebSocket-Protocol: v1.bsatn.spacetimedb
+```
+
+The dashboard's `frontend.lifetime_rewrites` counter increments by 1
+for every TUL the proxy turns into a synthesised full TU.
+
+### End-to-end smoke test (relay-test-harness)
+
+The bundled harness exercises both paths against a running relay:
+
+```sh
+# v2 subscriber (passthrough) against the maincloud test database
+cargo run -p relay-test-harness --release -- \
+  --upstream wss://maincloud.spacetimedb.com \
+  --database <upstream-db> \
+  --via-frontend ws://127.0.0.1:3009 \
+  --subscriber-protocol v2 \
+  --table user_account --reducer set_name
+
+# v1 subscriber (full TU synthesis) — same flags, different subprotocol
+cargo run -p relay-test-harness --release -- \
+  --upstream wss://maincloud.spacetimedb.com \
+  --database <upstream-db> \
+  --via-frontend ws://127.0.0.1:3009 \
+  --subscriber-protocol v1 \
+  --table user_account --reducer set_name
+
+# v1 subscriber against a real v1 upstream — observes synthesised TUs
+# carrying the upstream's actual reducer_name + caller_identity.
+RELAY_UPSTREAM_TOKEN=$(cat .bitcraft-token) \
+cargo run -p relay-test-harness --release -- \
+  --upstream wss://bitcraft-early-access.spacetimedb.com \
+  --database bitcraft-live-14 \
+  --via-frontend ws://127.0.0.1:3009 \
+  --subscriber-protocol v1 \
+  --subscribe-only \
+  --table chat_message_state \
+  --timeout-secs 180
+```
+
+The last command, against BitCraft's live v1 server, prints frames
+like:
+
+```
+★ FULL v1 TransactionUpdate (rewrite path lit up)
+  reducer=chat_post_message
+  caller_id=8c36065830b0…  args_len=28
+```
+
+— which is the upstream player's actual chat reducer, surfaced to a
+v1 subscriber as if it had been talking to BitCraft directly.
 
 ## Configuration
 
@@ -130,6 +234,10 @@ Downstream clients now connect directly to the local SpacetimeDB on
 | `--publisher-template-dir` | `RELAY_PUBLISHER_TEMPLATE_DIR`     | `tools/mirror-template/` (relative to repo)  | Source `Cargo.toml` + `rust-toolchain.toml` |
 | `--codegen-script`         | `RELAY_CODEGEN_SCRIPT`             | `tools/codegen.py` (relative to repo)        | Python codegen script |
 | `--spacetime-bin`          | `RELAY_SPACETIME_BIN`              | `spacetime`                                  | Path to the SpacetimeDB CLI |
+| `--frontend-bind`          | `RELAY_FRONTEND_BIND`              | `0.0.0.0:3009`                               | Public WS bind for downstream clients. Empty string disables the proxy |
+| `--frontend-max-clients`   | `RELAY_FRONTEND_MAX_CLIENTS`       | `1024`                                       | Cap on concurrent downstream connections; excess are dropped at accept time |
+| `--frontend-idle-secs`     | `RELAY_FRONTEND_IDLE_SECS`         | `30`                                         | Seconds between WS pings to keep idle TCP flows alive through middleboxes |
+| `--dashboard-bind`         | `RELAY_DASHBOARD_BIND`             | `127.0.0.1:3001`                             | HTML + `/metrics` JSON endpoint. Empty string disables |
 
 `RUST_LOG` controls log level (default `info`). For example,
 `RUST_LOG=relay=trace,relay_publisher=debug cargo run -p relay …`.
@@ -141,7 +249,8 @@ Downstream clients now connect directly to the local SpacetimeDB on
 | `relay-protocol`       | Wire types; re-exports `spacetimedb-sats` and `spacetimedb-client-api-messages`. Hosts the shared `UpstreamReducerMeta` struct that the relay forwards to mirror reducers as the `original` arg. |
 | `relay-upstream`       | Owns the single upstream WebSocket. Single un-split `tokio::select!` over read / 30 s idle Ping / cmd arms (matches the SpacetimeDB SDK). Emits a 2 s watchdog heartbeat with iteration counters on `relay::upstream::watchdog`. |
 | `relay-publisher`      | Codegen → cargo build → `spacetime publish -y --delete-data`, keyed by SHA-256 fingerprint of the upstream schema. No-op when fingerprint unchanged. |
-| `relay-mirror-driver`  | v2 WS client to local SpacetimeDB; sends `relay_apply_<table>(upstream, deletes, inserts)` calls with semaphore backpressure and chunking. |
+| `relay-mirror-driver`  | v2 WS client to local SpacetimeDB; sends `relay_apply_<table>(upstream, deletes, inserts)` calls with semaphore backpressure and chunking. Hosts the `MetaRegistry` the frontend reads to synthesise full v1 TUs. |
+| `relay-frontend`       | Public-facing WS proxy: subprotocol negotiation, per-client metrics, hides `_relay_meta` traffic, and synthesises full v1 `TransactionUpdate`s from local stdb's `TransactionUpdateLight` broadcasts via the mirror-driver's meta registry. |
 | `relay`                | Binary. Args, schema fetch, dashboard, dispatches to `stdb_mode`. |
 | `relay-test-harness`   | Standalone v2 client; useful for end-to-end testing against either the local SpacetimeDB or a remote upstream. |
 | `bc14-sdk-test`        | Standalone bin (excluded from the workspace) that vendors the v1.12.0 SpacetimeDB Rust SDK's WebSocket layer verbatim. Used to confirm large-scale subscribe issues against BitCraft are server/middlebox behavior, not relay-side regressions. See `crates/bc14-sdk-test/README.md`. |
