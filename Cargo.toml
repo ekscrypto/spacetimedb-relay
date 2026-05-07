@@ -15,7 +15,7 @@ members = [
 exclude = ["test-module", "spike/mirror", "crates/bc14-sdk-test"]
 
 [workspace.package]
-version = "1.0.1"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ekscrypto/spacetimedb-relay"
