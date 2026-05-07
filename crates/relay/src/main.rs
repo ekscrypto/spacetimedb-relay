@@ -8,24 +8,19 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-#[cfg(not(feature = "profile-heap"))]
-use mimalloc::MiMalloc;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 use url::Url;
 
-// Heap-profiling builds replace mimalloc with dhat::Alloc so every
-// allocation gets a backtrace. dhat is single-allocator: enabling
-// `--features profile-heap` swaps the global allocator and starts a
-// `Profiler` whose `Drop` writes `dhat-heap.json` on graceful shutdown.
+// Heap-profiling builds use dhat::Alloc so every allocation gets a
+// backtrace. dhat is single-allocator: enabling `--features
+// profile-heap` swaps the global allocator and starts a `Profiler`
+// whose `Drop` writes `dhat-heap.json` on graceful shutdown.
+// Default builds use the system allocator.
 #[cfg(feature = "profile-heap")]
 #[global_allocator]
 static GLOBAL: dhat::Alloc = dhat::Alloc;
-
-#[cfg(not(feature = "profile-heap"))]
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 use relay_protocol::{parse_schema, MirroredSchema, MirroredType};
 use relay_upstream::{fetch_schema, ProtocolVersion};
@@ -64,6 +59,15 @@ struct Args {
     /// Stop after N upstream frames (useful for smoke-testing)
     #[arg(long, env = "RELAY_FRAME_LIMIT")]
     frame_limit: Option<u64>,
+
+    /// Split the upstream subscription across N parallel WS connections
+    /// of at most this many tables each. Useful when a single
+    /// 250-table InitialSubscription gets killed by middlebox / server
+    /// timeouts during the (multi-minute, multi-hundred-MB) initial
+    /// dump. `0` (default) means no chunking — one connection
+    /// subscribes to all tables.
+    #[arg(long = "subscribe-chunk-size", env = "RELAY_SUBSCRIBE_CHUNK_SIZE", default_value_t = 0)]
+    subscribe_chunk_size: usize,
 
     /// SpacetimeDB WebSocket subprotocol version of the upstream.
     /// `v2` (default) targets current SpacetimeDB. `v1` targets pre-2.0
@@ -144,7 +148,10 @@ async fn main() -> Result<()> {
     // dashboard's in-process ring buffer. The dashboard view exists
     // precisely so we can see debug-level events without re-running
     // with a louder `RUST_LOG`.
-    let event_ring = dashboard::EventRing::new(2000);
+    // 50K capacity is enough to hold ~12 minutes of BitCraft live
+    // traffic at the observed ~64 events/sec frame rate without
+    // evicting earlier milestones (Subscribe, SubscribeApplied, etc.).
+    let event_ring = dashboard::EventRing::new(50_000);
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
     let event_layer = dashboard::EventLogLayer::new(event_ring.clone())
@@ -226,6 +233,7 @@ async fn main() -> Result<()> {
         upstream_protocol: args.upstream_protocol,
         frame_limit: args.frame_limit,
         subscribe_tables: args.subscribe_tables,
+        subscribe_chunk_size: args.subscribe_chunk_size,
         stdb_url: args.stdb_url,
         mirror_database,
         identity_token: args.stdb_identity_token,
