@@ -1,0 +1,41 @@
+[package]
+name = "bc14-sdk-test"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "bc14-sdk-test"
+path = "src/main.rs"
+
+[dependencies]
+# Use the EXACT v1.12.0 SDK dependencies pinned to this tag, since we
+# vendor the SDK's websocket.rs verbatim. The spacetimedb-* deps must
+# match the wire-format version (v1) BitCraft speaks.
+spacetimedb-client-api-messages = { path = "/tmp/spacetimedb-v1/SpacetimeDB/crates/client-api-messages" }
+spacetimedb-lib = { path = "/tmp/spacetimedb-v1/SpacetimeDB/crates/lib", features = ["serde", "metrics_impls"] }
+spacetimedb-sats = { path = "/tmp/spacetimedb-v1/SpacetimeDB/crates/sats" }
+
+# Stripped from the SDK's metrics impl which depends on these.
+# (We replaced metrics with a stub but compression still uses brotli/flate2.)
+brotli = "3"
+flate2 = "1"
+
+# Async runtime + utilities the SDK websocket.rs uses.
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+futures-channel = "0.3"
+
+# HTTP / URI primitives.
+http = "1"
+bytes = "1"
+url = "2"
+
+# Misc.
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rustls = { version = "0.23", features = ["ring"] }
+log = "0.4"
