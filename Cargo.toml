@@ -9,7 +9,10 @@ members = [
     "crates/relay-mirror-driver",
     "spike/replay",
 ]
-exclude = ["test-module", "spike/mirror"]
+# bc14-sdk-test is intentionally excluded — it pulls v1.12.0 SpacetimeDB
+# crates from /tmp via path deps that conflict with the workspace's 2.x
+# pins. Build it standalone with `cargo build -p bc14-sdk-test --manifest-path crates/bc14-sdk-test/Cargo.toml`.
+exclude = ["test-module", "spike/mirror", "crates/bc14-sdk-test"]
 
 [workspace.package]
 version = "1.0.1"
