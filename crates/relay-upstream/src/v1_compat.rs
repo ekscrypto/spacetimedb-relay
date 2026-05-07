@@ -8,9 +8,11 @@
 //! crate (pinned at 1.12.0) and rebuilds the equivalent v2 messages
 //! the rest of the relay already consumes.
 //!
-//! Outbound `Subscribe` is also re-encoded for v1, since v1 used a
-//! set-replace `Subscribe { query_strings, request_id }` instead of
-//! v2's `QuerySetId`-keyed variant.
+//! Outbound `Subscribe`/`SubscribeMulti` are also re-encoded for v1.
+//! v1 had set-replace `Subscribe { query_strings, request_id }`
+//! (no `QuerySetId`) and additive `SubscribeMulti` keyed by
+//! `QueryId` — the relay uses the latter for sequential per-table
+//! subscribes (`--subscribe-chunk-size 1`).
 //!
 //! The v1 → v2 mapping the relay relies on:
 //!
@@ -18,6 +20,9 @@
 //! - `InitialSubscription` → `SubscribeApplied` (synthesise the
 //!   request/query-set ids that v1 doesn't carry on this message;
 //!   flatten the `DatabaseUpdate` into `QueryRows`).
+//! - `SubscribeMultiApplied` → `SubscribeApplied` (per-query initial
+//!   rows; `query_id` rides through as `query_set_id`). The relay's
+//!   sequential subscribe state machine acks off this.
 //! - `TransactionUpdate` (`Committed` only) and `TransactionUpdateLight`
 //!   → v2 `TransactionUpdate { query_sets: [QuerySetUpdate] }`.
 //!   `Failed` / `OutOfEnergy` reducer outcomes are dropped (the relay
@@ -25,8 +30,8 @@
 //! - `SubscriptionError` ↔ `SubscriptionError`.
 //!
 //! Anything we don't expect — `SubscribeApplied`, `UnsubscribeApplied`,
-//! `OneOffQueryResponse`, `ProcedureResult`, the `Multi*` variants — is
-//! reported as a decode error rather than silently dropped.
+//! `UnsubscribeMultiApplied`, `OneOffQueryResponse`, `ProcedureResult` —
+//! is reported as a decode error rather than silently dropped.
 
 use bytes::{Bytes, BytesMut};
 

@@ -119,6 +119,7 @@ Downstream clients now connect directly to the local SpacetimeDB on
 | `--upstream-token`         | `RELAY_UPSTREAM_TOKEN`             | none                                         | Bearer token for upstream auth |
 | `--upstream-protocol`      | `RELAY_UPSTREAM_PROTOCOL`          | `v2`                                         | `v1` for pre-2.0 SpacetimeDB |
 | `--subscribe-table`        | `RELAY_SUBSCRIBE_TABLES`           | all user-public tables                       | Repeatable; comma-separated via env |
+| `--subscribe-chunk-size`   | `RELAY_SUBSCRIBE_CHUNK_SIZE`       | `0`                                          | `0` = single set-replace `Subscribe` for all tables. `1` (v1 only) = sequential `SubscribeMulti` per table — required for large schemas like BitCraft, see ["Large databases"](#large-databases) below |
 | `--frame-limit`            | `RELAY_FRAME_LIMIT`                | unlimited                                    | Stop after N upstream frames (smoke tests) |
 | `--data-dir`               | `RELAY_DATA_DIR`                   | `data`                                       | Working directory; the publisher's mirror crate workdir lives under here |
 | `--stdb-url`               | `RELAY_STDB_URL`                   | `ws://127.0.0.1:3000`                        | Local SpacetimeDB URL the relay publishes to and connects to |
@@ -137,14 +138,39 @@ Downstream clients now connect directly to the local SpacetimeDB on
 
 | Crate                  | Purpose |
 |------------------------|---------|
-| `relay-protocol`       | Wire types; re-exports `spacetimedb-sats` and `spacetimedb-client-api-messages`. |
-| `relay-upstream`       | Owns the single upstream WebSocket; emits decoded `ServerMessage` events. |
+| `relay-protocol`       | Wire types; re-exports `spacetimedb-sats` and `spacetimedb-client-api-messages`. Hosts the shared `UpstreamReducerMeta` struct that the relay forwards to mirror reducers as the `original` arg. |
+| `relay-upstream`       | Owns the single upstream WebSocket. Single un-split `tokio::select!` over read / 30 s idle Ping / cmd arms (matches the SpacetimeDB SDK). Emits a 2 s watchdog heartbeat with iteration counters on `relay::upstream::watchdog`. |
 | `relay-publisher`      | Codegen → cargo build → `spacetime publish -y --delete-data`, keyed by SHA-256 fingerprint of the upstream schema. No-op when fingerprint unchanged. |
-| `relay-mirror-driver`  | v2 WS client to local SpacetimeDB; sends `relay_apply_<table>(deletes, inserts)` calls with semaphore backpressure and chunking. |
-| `relay`                | Binary. Args, schema fetch, dispatches to `stdb_mode`. |
+| `relay-mirror-driver`  | v2 WS client to local SpacetimeDB; sends `relay_apply_<table>(upstream, deletes, inserts)` calls with semaphore backpressure and chunking. |
+| `relay`                | Binary. Args, schema fetch, dashboard, dispatches to `stdb_mode`. |
 | `relay-test-harness`   | Standalone v2 client; useful for end-to-end testing against either the local SpacetimeDB or a remote upstream. |
-| `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table. |
+| `bc14-sdk-test`        | Standalone bin (excluded from the workspace) that vendors the v1.12.0 SpacetimeDB Rust SDK's WebSocket layer verbatim. Used to confirm large-scale subscribe issues against BitCraft are server/middlebox behavior, not relay-side regressions. See `crates/bc14-sdk-test/README.md`. |
+| `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table, each taking an `Option<UpstreamReducerInfo>` arg. |
 | `tools/mirror-template/` | `Cargo.toml` + `rust-toolchain.toml` copied into the publisher's workdir. |
+
+## Large databases
+
+For small schemas the default mode (`--subscribe-chunk-size 0`)
+works: the relay sends one set-replace `Subscribe` covering every
+table and the upstream replies with a single `InitialSubscription`.
+
+For large v1 schemas — concretely BitCraft's 250 public-user tables,
+about 1 GB of initial state — that single `InitialSubscription`
+becomes a single multi-hundred-MB WebSocket message that the
+upstream's edge consistently RSTs at ~90 s, before any client can
+finish receiving it. We verified this against the official
+SpacetimeDB Rust SDK; same TCP reset at the same byte mark.
+
+Pass `--subscribe-chunk-size 1` to switch to **sequential
+SubscribeMulti**: the relay subscribes to one table at a time, waits
+for the per-table `SubscribeMultiApplied` (and applies its rows),
+then advances. Each per-table dump fits comfortably under the 90 s
+window even for the worst-case table (BitCraft's
+`footprint_tile_state` is ~644 MB on its own and still completes
+fine). Total time to ingest BitCraft 14's full 1 GB: ~8.5 minutes.
+
+This mode is currently v1-only (the path that needs it). Use it
+together with `--upstream-protocol v1`.
 
 ## Schema drift
 
