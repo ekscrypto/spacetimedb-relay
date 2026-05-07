@@ -72,6 +72,21 @@ pub fn encode_subscribe(request_id: u32, queries: &[String]) -> Result<Vec<u8>, 
     spacetimedb_lib_v1::bsatn::to_vec(&msg).map_err(|e| UpstreamError::Encode(e.to_string()))
 }
 
+/// Encode a v1 `SubscribeMulti` carrying a single query, additively
+/// adding it to the connection's subscription set.
+pub fn encode_subscribe_multi(
+    request_id: u32,
+    query_id: u32,
+    query: &str,
+) -> Result<Vec<u8>, UpstreamError> {
+    let msg = v1::ClientMessage::<Box<[u8]>>::SubscribeMulti(v1::SubscribeMulti {
+        query_strings: vec![query.to_string().into_boxed_str()].into_boxed_slice(),
+        request_id,
+        query_id: v1::QueryId::new(query_id),
+    });
+    spacetimedb_lib_v1::bsatn::to_vec(&msg).map_err(|e| UpstreamError::Encode(e.to_string()))
+}
+
 fn translate_server_message(
     msg: v1::ServerMessage<v1::BsatnFormat>,
 ) -> Result<(v2::ServerMessage, Option<UpstreamReducerMeta>), UpstreamError> {
@@ -133,9 +148,26 @@ fn translate_server_message(
             }),
             None,
         )),
+        v1::ServerMessage::SubscribeMultiApplied(sma) => {
+            // Same translation as v1 InitialSubscription, but the rows
+            // belong to the single query identified by `sma.query_id`.
+            // Forward as v2 SubscribeApplied so stdb_mode can apply
+            // the rows via its existing path; downstream uses the
+            // per-table breakdown rather than the query_id.
+            let tables = single_table_rows_from_database_update(sma.update);
+            Ok((
+                v2::ServerMessage::SubscribeApplied(v2::SubscribeApplied {
+                    request_id: sma.request_id,
+                    query_set_id: v2_common::QuerySetId::new(sma.query_id.id),
+                    rows: v2::QueryRows {
+                        tables: tables.into_boxed_slice(),
+                    },
+                }),
+                None,
+            ))
+        }
         v1::ServerMessage::SubscribeApplied(_)
         | v1::ServerMessage::UnsubscribeApplied(_)
-        | v1::ServerMessage::SubscribeMultiApplied(_)
         | v1::ServerMessage::UnsubscribeMultiApplied(_)
         | v1::ServerMessage::OneOffQueryResponse(_)
         | v1::ServerMessage::ProcedureResult(_) => Err(UpstreamError::Decode(format!(

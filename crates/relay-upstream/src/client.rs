@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -155,6 +157,19 @@ pub enum UpstreamCommand {
         query_set_id: u32,
         queries: Vec<String>,
     },
+    /// Add a single query to the active subscription set, additively.
+    /// Wire format: v1 `SubscribeMulti` for `protocol = V1`. Each call
+    /// adds one query identified by `query_id`; the server responds
+    /// with `SubscribeMultiApplied` (translated to v2 `SubscribeApplied`
+    /// in `v1_compat`) carrying just that query's initial rows. v2 has
+    /// a similar additive `SubscribeMulti` shape, but we currently
+    /// only encode the v1 form since that's the only path that needs
+    /// it (BitCraft v1).
+    SubscribeOne {
+        request_id: u32,
+        query_id: u32,
+        query: String,
+    },
     Shutdown,
 }
 
@@ -260,98 +275,221 @@ pub async fn connect_and_run(
         .await
         .map_err(|_| UpstreamError::EventChannelClosed)?;
 
-    let (mut writer, mut reader) = ws_stream.split();
+    // Mirror SpacetimeDB Rust SDK pattern (sdks/rust/src/websocket.rs):
+    // keep the WebSocketStream un-split. Splitting via futures::split
+    // creates a BiLock between the read and write halves, which means
+    // tungstenite's auto-Pong replies (queued during read polls)
+    // never get flushed until the write half is independently polled.
+    // For multi-hundred-MB fragmented messages from BitCraft this can
+    // never happen — the read poll monopolises the future for the
+    // duration of message reassembly, by which point the upstream's
+    // ~30 s ping-timeout fires and resets the connection. With an
+    // un-split socket every read poll also flushes the write buffer
+    // as a side-effect inside tungstenite, so auto-Pongs get out
+    // even mid-1GB-message.
+    let mut sock = ws_stream;
 
-    loop {
-        tokio::select! {
-            biased;
-            cmd = commands_rx.recv() => {
-                match cmd {
-                    Some(UpstreamCommand::Subscribe { request_id, query_set_id, queries }) => {
-                        let frame = match config.protocol {
-                            ProtocolVersion::V2 => {
-                                let msg = ClientMessage::Subscribe(Subscribe {
-                                    request_id,
-                                    query_set_id: QuerySetId::new(query_set_id),
-                                    query_strings: queries
-                                        .iter()
-                                        .map(|s| s.clone().into_boxed_str())
-                                        .collect::<Vec<_>>()
-                                        .into_boxed_slice(),
-                                });
-                                bsatn::to_vec(&msg)
-                                    .map_err(|e| UpstreamError::Encode(e.to_string()))?
-                            }
-                            ProtocolVersion::V1 => v1_compat::encode_subscribe(request_id, &queries)?,
-                        };
-                        debug!(
-                            target: "relay::upstream",
-                            protocol = %config.protocol,
-                            request_id, query_set_id, n_queries = queries.len(),
-                            frame_len = frame.len(),
-                            "sending Subscribe"
-                        );
-                        writer.send(Message::Binary(frame)).await?;
-                    }
-                    Some(UpstreamCommand::Shutdown) | None => {
-                        let _ = writer.send(Message::Close(None)).await;
-                        let _ = events_tx
-                            .send(UpstreamEvent::Disconnected { reason: "shutdown".into() })
-                            .await;
-                        return Ok(());
-                    }
-                }
+    // Watchdog state. The outer select loop bumps `iter_count` every
+    // iteration; reader/writer paths bump their respective counters
+    // and stamp `last_event_ms`. A spawned watchdog task logs deltas
+    // every 2 s so we can tell — without attaching a debugger —
+    // whether the upstream task is making progress, parked on a
+    // future, or wedged inside tungstenite mid-message.
+    let iter_count = Arc::new(AtomicU64::new(0));
+    let frame_count = Arc::new(AtomicU64::new(0));
+    let cmd_processed = Arc::new(AtomicU64::new(0));
+    let last_event_ms = Arc::new(AtomicU64::new(now_ms()));
+    let watchdog_handle = {
+        let iter_count = iter_count.clone();
+        let frame_count = frame_count.clone();
+        let cmd_processed = cmd_processed.clone();
+        let last_event_ms = last_event_ms.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut prev_iter = 0u64;
+            let mut prev_frames = 0u64;
+            loop {
+                interval.tick().await;
+                let cur_iter = iter_count.load(Ordering::Relaxed);
+                let cur_frames = frame_count.load(Ordering::Relaxed);
+                let cur_cmds = cmd_processed.load(Ordering::Relaxed);
+                let last_ms = last_event_ms.load(Ordering::Relaxed);
+                let silence_ms = now_ms().saturating_sub(last_ms);
+                info!(
+                    target: "relay::upstream::watchdog",
+                    iter_delta = cur_iter - prev_iter,
+                    iter_total = cur_iter,
+                    frame_delta = cur_frames - prev_frames,
+                    frame_total = cur_frames,
+                    cmds_processed = cur_cmds,
+                    silence_ms,
+                    "upstream task heartbeat"
+                );
+                prev_iter = cur_iter;
+                prev_frames = cur_frames;
             }
-            msg = reader.next() => {
-                let Some(msg) = msg else { break };
-                match msg? {
-                    Message::Binary(data) => {
-                        match decode_frame(&data, config.compression, config.protocol) {
-                            Ok(frame) => {
-                                debug!(
-                                    target: "relay::upstream",
-                                    tag = frame.server_tag(),
-                                    kind = server_tag_name(frame.server_tag(), frame.protocol),
-                                    bsatn_len = frame.bsatn.len(),
-                                    "frame"
-                                );
-                                if events_tx.send(UpstreamEvent::Frame(frame)).await.is_err() {
-                                    return Err(UpstreamError::EventChannelClosed);
+        })
+    };
+
+    // Unconditional client Ping every 10 s. We tested SDK-style "only
+    // ping when idle for 30 s" and it never fires during a multi-100MB
+    // InitialSubscription burst (idle stays false the whole time), yet
+    // BitCraft's path RSTs the connection at ~90 s anyway — almost
+    // certainly a NAT/load-balancer dropping a half-idle TCP flow with
+    // no outbound traffic. Sending an unconditional Ping every 10 s
+    // keeps something flowing outbound to satisfy the middlebox, with
+    // RTT well under any reasonable middlebox idle threshold.
+    const PING_INTERVAL: Duration = Duration::from_secs(10);
+    let mut ping_interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let result: Result<(), UpstreamError> = async {
+        loop {
+            iter_count.fetch_add(1, Ordering::Relaxed);
+            tokio::select! {
+                biased;
+                msg = sock.next() => {
+                    let Some(msg) = msg else { break };
+                    match msg? {
+                        Message::Binary(data) => {
+                            frame_count.fetch_add(1, Ordering::Relaxed);
+                            last_event_ms.store(now_ms(), Ordering::Relaxed);
+                            match decode_frame(&data, config.compression, config.protocol) {
+                                Ok(frame) => {
+                                    debug!(
+                                        target: "relay::upstream",
+                                        tag = frame.server_tag(),
+                                        kind = server_tag_name(frame.server_tag(), frame.protocol),
+                                        bsatn_len = frame.bsatn.len(),
+                                        "frame"
+                                    );
+                                    if events_tx.send(UpstreamEvent::Frame(frame)).await.is_err() {
+                                        return Err(UpstreamError::EventChannelClosed);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(target: "relay::upstream", error = %e, "frame decode error");
                                 }
                             }
-                            Err(e) => {
-                                warn!(target: "relay::upstream", error = %e, "frame decode error");
-                            }
+                        }
+                        Message::Text(t) => {
+                            warn!(target: "relay::upstream", "unexpected text frame: {} bytes", t.len());
+                        }
+                        Message::Close(frame) => {
+                            let reason = frame
+                                .map(|f| format!("{}: {}", f.code, f.reason))
+                                .unwrap_or_else(|| "no close frame".to_string());
+                            let _ = events_tx
+                                .send(UpstreamEvent::Disconnected { reason: reason.clone() })
+                                .await;
+                            info!(target: "relay::upstream", %reason, "upstream closed");
+                            return Ok(());
+                        }
+                        Message::Ping(_) => {
+                            // Auto-Pong is queued by tungstenite; it
+                            // flushes on the next read poll because
+                            // we don't split the socket.
+                            last_event_ms.store(now_ms(), Ordering::Relaxed);
+                            let _ = events_tx.send(UpstreamEvent::Ping).await;
+                        }
+                        Message::Pong(_) => {
+                            last_event_ms.store(now_ms(), Ordering::Relaxed);
+                            let _ = events_tx.send(UpstreamEvent::Ping).await;
+                        }
+                        Message::Frame(_) => {}
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    debug!(target: "relay::upstream", "sending client ping");
+                    if let Err(e) = sock.send(Message::Ping(Vec::new())).await {
+                        warn!(target: "relay::upstream", error = %e, "client ping failed");
+                        return Err(e.into());
+                    }
+                }
+                cmd = commands_rx.recv() => {
+                    match cmd {
+                        Some(UpstreamCommand::Subscribe { request_id, query_set_id, queries }) => {
+                            let frame = match config.protocol {
+                                ProtocolVersion::V2 => {
+                                    let msg = ClientMessage::Subscribe(Subscribe {
+                                        request_id,
+                                        query_set_id: QuerySetId::new(query_set_id),
+                                        query_strings: queries
+                                            .iter()
+                                            .map(|s| s.clone().into_boxed_str())
+                                            .collect::<Vec<_>>()
+                                            .into_boxed_slice(),
+                                    });
+                                    bsatn::to_vec(&msg)
+                                        .map_err(|e| UpstreamError::Encode(e.to_string()))?
+                                }
+                                ProtocolVersion::V1 => v1_compat::encode_subscribe(request_id, &queries)?,
+                            };
+                            debug!(
+                                target: "relay::upstream",
+                                protocol = %config.protocol,
+                                request_id, query_set_id, n_queries = queries.len(),
+                                frame_len = frame.len(),
+                                "sending Subscribe"
+                            );
+                            sock.send(Message::Binary(frame)).await?;
+                            cmd_processed.fetch_add(1, Ordering::Relaxed);
+                            last_event_ms.store(now_ms(), Ordering::Relaxed);
+                        }
+                        Some(UpstreamCommand::SubscribeOne { request_id, query_id, query }) => {
+                            let frame = match config.protocol {
+                                ProtocolVersion::V1 => {
+                                    v1_compat::encode_subscribe_multi(request_id, query_id, &query)?
+                                }
+                                ProtocolVersion::V2 => {
+                                    return Err(UpstreamError::Encode(
+                                        "SubscribeOne not implemented for v2 protocol".into(),
+                                    ));
+                                }
+                            };
+                            debug!(
+                                target: "relay::upstream",
+                                protocol = %config.protocol,
+                                request_id, query_id, query = %query,
+                                frame_len = frame.len(),
+                                "sending SubscribeMulti"
+                            );
+                            sock.send(Message::Binary(frame)).await?;
+                            cmd_processed.fetch_add(1, Ordering::Relaxed);
+                            last_event_ms.store(now_ms(), Ordering::Relaxed);
+                        }
+                        Some(UpstreamCommand::Shutdown) | None => {
+                            let _ = sock.send(Message::Close(None)).await;
+                            let _ = events_tx
+                                .send(UpstreamEvent::Disconnected { reason: "shutdown".into() })
+                                .await;
+                            return Ok(());
                         }
                     }
-                    Message::Text(t) => {
-                        warn!(target: "relay::upstream", "unexpected text frame: {} bytes", t.len());
-                    }
-                    Message::Close(frame) => {
-                        let reason = frame
-                            .map(|f| format!("{}: {}", f.code, f.reason))
-                            .unwrap_or_else(|| "no close frame".to_string());
-                        let _ = events_tx
-                            .send(UpstreamEvent::Disconnected { reason: reason.clone() })
-                            .await;
-                        info!(target: "relay::upstream", %reason, "upstream closed");
-                        return Ok(());
-                    }
-                    Message::Ping(_) | Message::Pong(_) => {
-                        let _ = events_tx.send(UpstreamEvent::Ping).await;
-                    }
-                    Message::Frame(_) => {}
                 }
             }
         }
-    }
 
-    let _ = events_tx
-        .send(UpstreamEvent::Disconnected {
-            reason: "stream ended".into(),
-        })
-        .await;
-    Ok(())
+        let _ = events_tx
+            .send(UpstreamEvent::Disconnected {
+                reason: "stream ended".into(),
+            })
+            .await;
+        Ok(())
+    }
+    .await;
+
+    watchdog_handle.abort();
+    result
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn build_connect_request(

@@ -46,6 +46,14 @@ pub struct StdbModeConfig {
     pub upstream_protocol: ProtocolVersion,
     pub frame_limit: Option<u64>,
     pub subscribe_tables: Vec<String>,
+    /// Split the subscription into independent WS connections of this
+    /// many tables each. `0` means a single connection covers all
+    /// tables (legacy behavior). When non-zero, the relay opens
+    /// `ceil(n_tables / chunk_size)` WS connections in parallel; each
+    /// runs its own reconnect loop and applies frames into the shared
+    /// `MirrorDriver`. This avoids the multi-hundred-MB single-message
+    /// initial subscription that BitCraft's middlebox kills at ~90 s.
+    pub subscribe_chunk_size: usize,
 
     /// Local SpacetimeDB target (e.g. `ws://127.0.0.1:3000`).
     pub stdb_url: Url,
@@ -163,7 +171,12 @@ pub async fn run(
         );
     }
 
-    // 4. Reconnect loop, lifted from the legacy path.
+    // 4. Reconnect loop. Single upstream connection. When
+    //    `subscribe_chunk_size == 1` and the upstream is v1, we use
+    //    sequential SubscribeMulti (one query at a time, additive)
+    //    instead of one big set-replace Subscribe — avoiding
+    //    BitCraft's ~90 s middlebox kill on multi-hundred-MB initial
+    //    subscriptions.
     let upstream_cfg = UpstreamConfig {
         host: cfg.upstream_host.clone(),
         database: cfg.upstream_database.clone(),
@@ -172,6 +185,16 @@ pub async fn run(
         connect_timeout: Duration::from_secs(10),
         protocol: cfg.upstream_protocol,
     };
+
+    let sequential =
+        cfg.subscribe_chunk_size == 1 && cfg.upstream_protocol == ProtocolVersion::V1;
+    if sequential {
+        tracing::info!(
+            target: "relay::stdb_mode",
+            n_tables = subscribe_tables.len(),
+            "sequential SubscribeMulti mode — one table at a time"
+        );
+    }
 
     let shutdown = std::pin::pin!(crate::shutdown_signal());
     let mut shutdown = shutdown;
@@ -187,6 +210,15 @@ pub async fn run(
         FrameLimitReached,
     }
 
+    // Sequential-mode state. Outside the reconnect loop so it persists
+    // across reconnects — though re-subscribing from scratch on each
+    // reconnect is the conservative behavior (BitCraft's per-table
+    // initial dumps are inexpensive once we're past the 90 s wall).
+    let mut sequential_progress = SequentialState {
+        next_idx: 0,
+        in_flight_query_id: None,
+    };
+
     'reconnect: loop {
         let (event_tx, mut event_rx) = mpsc::channel(256);
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -200,6 +232,14 @@ pub async fn run(
                 );
             }
         });
+
+        // On reconnect, start sequential subscribe over.
+        if sequential {
+            sequential_progress = SequentialState {
+                next_idx: 0,
+                in_flight_query_id: None,
+            };
+        }
 
         let mut connected_at: Option<std::time::Instant> = None;
         let exit_reason = loop {
@@ -225,6 +265,11 @@ pub async fn run(
                     let protocol = frame.protocol;
                     match frame.decode() {
                         Ok((message, meta)) => {
+                            let mode = if sequential {
+                                SubscribeMode::Sequential(&mut sequential_progress)
+                            } else {
+                                SubscribeMode::All
+                            };
                             if let Err(e) = handle_message(
                                 message,
                                 meta,
@@ -232,6 +277,7 @@ pub async fn run(
                                 &cmd_tx,
                                 &mut driver,
                                 &metrics,
+                                mode,
                             )
                             .await
                             {
@@ -240,9 +286,6 @@ pub async fn run(
                                     error = %e,
                                     "failed to apply upstream message"
                                 );
-                                // Driver/stdb link is critical; bail out
-                                // of the inner loop so we reconnect both
-                                // ends.
                                 metrics.local_stdb.mark_down(Some(format!("{e}")));
                                 break InnerExit::UpstreamGone;
                             }
@@ -314,6 +357,22 @@ pub async fn run(
     Ok(())
 }
 
+/// In sequential SubscribeMulti mode, drives the per-table state
+/// machine: track which table index is next to subscribe and which
+/// query_id we're awaiting `SubscribeApplied` for.
+struct SequentialState {
+    next_idx: usize,
+    in_flight_query_id: Option<u32>,
+}
+
+enum SubscribeMode<'a> {
+    /// Single set-replace `Subscribe` with all tables (legacy).
+    All,
+    /// Sequential per-table `SubscribeMulti`. The state tracks
+    /// progress through the table list.
+    Sequential(&'a mut SequentialState),
+}
+
 fn load_identity_token(path: &std::path::Path) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(s) => {
@@ -371,6 +430,7 @@ async fn handle_message(
     cmd_tx: &mpsc::Sender<UpstreamCommand>,
     driver: &mut MirrorDriver,
     metrics: &Arc<Metrics>,
+    mut mode: SubscribeMode<'_>,
 ) -> Result<()> {
     match message {
         ServerMessage::InitialConnection(ic) => {
@@ -382,18 +442,25 @@ async fn handle_message(
                 "InitialConnection"
             );
             if !subscribe_tables.is_empty() {
-                let queries: Vec<String> = subscribe_tables
-                    .iter()
-                    .map(|t| format!("SELECT * FROM {t}"))
-                    .collect();
-                cmd_tx
-                    .send(UpstreamCommand::Subscribe {
-                        request_id: 1,
-                        query_set_id: 1,
-                        queries,
-                    })
-                    .await
-                    .map_err(|_| anyhow!("upstream command channel closed"))?;
+                match &mut mode {
+                    SubscribeMode::All => {
+                        let queries: Vec<String> = subscribe_tables
+                            .iter()
+                            .map(|t| format!("SELECT * FROM {t}"))
+                            .collect();
+                        cmd_tx
+                            .send(UpstreamCommand::Subscribe {
+                                request_id: 1,
+                                query_set_id: 1,
+                                queries,
+                            })
+                            .await
+                            .map_err(|_| anyhow!("upstream command channel closed"))?;
+                    }
+                    SubscribeMode::Sequential(state) => {
+                        send_next_sequential(state, subscribe_tables, cmd_tx).await?;
+                    }
+                }
             }
         }
         ServerMessage::SubscribeApplied(sa) => {
@@ -426,6 +493,20 @@ async fn handle_message(
                 metrics
                     .local_stdb
                     .record_traffic(stats.bytes_sent, stats.calls);
+            }
+            // Sequential mode: this SubscribeApplied acks the in-flight
+            // SubscribeMulti — advance to the next table.
+            if let SubscribeMode::Sequential(state) = &mut mode {
+                state.in_flight_query_id = None;
+                if state.next_idx < subscribe_tables.len() {
+                    send_next_sequential(state, subscribe_tables, cmd_tx).await?;
+                } else {
+                    tracing::info!(
+                        target: "relay::stdb_mode",
+                        n_tables = subscribe_tables.len(),
+                        "all sequential subscriptions applied"
+                    );
+                }
             }
         }
         ServerMessage::TransactionUpdate(tu) => {
@@ -467,5 +548,43 @@ async fn handle_message(
         // not propagated to the local stdb.
         _ => {}
     }
+    Ok(())
+}
+
+/// Send the next pending `SubscribeMulti` for the table at
+/// `state.next_idx`; advance `next_idx` and arm `in_flight_query_id`.
+async fn send_next_sequential(
+    state: &mut SequentialState,
+    subscribe_tables: &[String],
+    cmd_tx: &mpsc::Sender<UpstreamCommand>,
+) -> Result<()> {
+    let idx = state.next_idx;
+    let table = match subscribe_tables.get(idx) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    // Use idx + 1 as both request_id and query_id — both are 1-based,
+    // unique within the connection's lifetime, and trivially comparable
+    // when SubscribeApplied lands.
+    let id = (idx as u32) + 1;
+    let query = format!("SELECT * FROM {table}");
+    tracing::info!(
+        target: "relay::stdb_mode",
+        idx,
+        n_tables = subscribe_tables.len(),
+        table = %table,
+        query_id = id,
+        "subscribing to next table sequentially"
+    );
+    cmd_tx
+        .send(UpstreamCommand::SubscribeOne {
+            request_id: id,
+            query_id: id,
+            query,
+        })
+        .await
+        .map_err(|_| anyhow!("upstream command channel closed"))?;
+    state.in_flight_query_id = Some(id);
+    state.next_idx = idx + 1;
     Ok(())
 }

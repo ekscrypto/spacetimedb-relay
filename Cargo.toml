@@ -51,8 +51,6 @@ clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 parking_lot = "0.12"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
-mimalloc = { version = "0.1", default-features = false }
-libmimalloc-sys = { version = "0.1", features = ["extended"] }
 dhat = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 hex = "0.4"

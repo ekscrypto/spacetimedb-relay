@@ -27,11 +27,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 rustls.workspace = true
-mimalloc.workspace = true
 dhat = { workspace = true, optional = true }
 
 [features]
-# Replace mimalloc with dhat-rs for heap profiling. Run with:
+# Use dhat-rs for heap profiling. Run with:
 #   cargo run -p relay --features profile-heap -- ...
 # The Profiler writes `dhat-heap.json` to CWD on graceful shutdown;
 # load it in https://nnethercote.github.io/dh_view/dh_view.html.
