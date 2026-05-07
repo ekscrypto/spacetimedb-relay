@@ -21,6 +21,7 @@ serde.workspace = true
 uuid.workspace = true
 
 relay-protocol.workspace = true
+relay-mirror-driver.workspace = true
 spacetimedb-sats.workspace = true
 spacetimedb-client-api-messages.workspace = true
 spacetimedb-client-api-messages-v1.workspace = true
@@ -28,3 +29,4 @@ spacetimedb-lib-v1.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+smallvec = "1"

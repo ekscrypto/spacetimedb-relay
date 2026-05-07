@@ -261,6 +261,32 @@ async fn main() -> Result<()> {
         event_ring,
     );
 
+    // The relay-mirror-driver records (request_id, UpstreamReducerMeta)
+    // here for every CallReducer it sends; the frontend proxy reads
+    // entries to synthesise full v1 TransactionUpdates from local
+    // stdb's TransactionUpdateLight broadcasts. Sweep periodically to
+    // bound memory.
+    let meta_registry = relay_mirror_driver::MetaRegistry::new();
+    {
+        let r = meta_registry.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let evicted = r.sweep(relay_mirror_driver::MetaRegistry::DEFAULT_MAX_AGE);
+                if evicted > 0 {
+                    tracing::debug!(
+                        target: "relay::meta_registry",
+                        evicted,
+                        live = r.len(),
+                        "swept stale entries"
+                    );
+                }
+            }
+        });
+    }
+
     if !args.frontend_bind.trim().is_empty() {
         match args.frontend_bind.parse::<std::net::SocketAddr>() {
             Ok(bind) => {
@@ -281,6 +307,7 @@ async fn main() -> Result<()> {
                     local_token: None,
                     max_clients: args.frontend_max_clients,
                     idle_timeout: std::time::Duration::from_secs(args.frontend_idle_secs),
+                    meta_registry: Some(meta_registry.clone()),
                 };
                 tokio::spawn(async move {
                     if let Err(e) = relay_frontend::run(cfg, frontend_metrics, active_clients).await
@@ -339,7 +366,7 @@ async fn main() -> Result<()> {
         codegen_script,
         spacetime_bin: args.spacetime_bin,
     };
-    stdb_mode::run(cfg, raw_schema, Arc::new(schema), metrics).await
+    stdb_mode::run(cfg, raw_schema, Arc::new(schema), metrics, meta_registry).await
 }
 
 fn sanitize_db_name(name: &str) -> String {

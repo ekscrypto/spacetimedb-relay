@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use relay_mirror_driver::{DriverConfig, MirrorDriver};
+use relay_mirror_driver::{DriverConfig, MetaRegistry, MirrorDriver};
 use relay_protocol::api_messages::websocket::v2::{ServerMessage, TableUpdateRows};
 use relay_protocol::{MirroredSchema, UpstreamReducerMeta};
 use relay_publisher::{Publisher, PublisherConfig};
@@ -89,6 +89,7 @@ pub async fn run(
     raw_schema: Vec<u8>,
     schema: Arc<MirroredSchema>,
     metrics: Arc<Metrics>,
+    meta_registry: Arc<MetaRegistry>,
 ) -> Result<()> {
     // 1. Publish the mirror module if the schema has drifted (or this
     //    is the first run). Wipes the whole local database on drift.
@@ -133,6 +134,7 @@ pub async fn run(
     })
     .await
     .context("connect to local SpacetimeDB")?;
+    driver.set_meta_registry(meta_registry.clone());
     metrics.local_stdb.mark_up();
     if let Some(captured) = driver.captured() {
         if let Err(e) = save_identity_token(&cfg.identity_token_file, &captured.token) {

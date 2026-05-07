@@ -189,6 +189,118 @@ pub fn rewrite_or_pass_v1(original: Bytes) -> Result<Bytes, RewriteError> {
     }
 }
 
+/// Build a full v1 [`v1::TransactionUpdate`] frame from a
+/// [`v1::TransactionUpdateLight`] + the upstream meta the relay
+/// recorded when sending the corresponding `relay_apply_<table>`
+/// CallReducer.
+///
+/// Used by the proxy when local SpacetimeDB (V2) emits TUL on the v1
+/// subprotocol — TUL has rows but no caller info, so we construct the
+/// full TU shape that v1 SDKs expect.
+pub fn synthesize_v1_tu_from_tul(
+    tul: v1::TransactionUpdateLight<v1::BsatnFormat>,
+    meta: UpstreamReducerMeta,
+) -> Vec<u8> {
+    let tu = v1::ServerMessage::<v1::BsatnFormat>::TransactionUpdate(v1::TransactionUpdate {
+        status: v1::UpdateStatus::Committed(tul.update),
+        timestamp: spacetimedb_lib_v1::Timestamp::from_micros_since_unix_epoch(
+            meta.timestamp.to_micros_since_unix_epoch(),
+        ),
+        caller_identity: spacetimedb_lib_v1::Identity::from_byte_array(
+            meta.caller_identity.to_byte_array(),
+        ),
+        caller_connection_id: spacetimedb_lib_v1::ConnectionId::from_be_byte_array(
+            meta.caller_connection_id.as_be_byte_array(),
+        ),
+        reducer_call: v1::ReducerCallInfo {
+            reducer_name: meta.reducer_name.into_boxed_str(),
+            // We don't know the upstream's reducer_id (it's a numeric
+            // id local to the upstream's module). Zero is a safe
+            // sentinel — clients keying off `reducer_name` ignore it.
+            reducer_id: 0,
+            args: meta.args.into_boxed_slice(),
+            request_id: meta.request_id,
+        },
+        // Diagnostics SpacetimeDB clients rarely surface; zeroes are
+        // acceptable and consistent with relay-upstream's translation
+        // path (v1 TU → v2 TU drops these).
+        energy_quanta_used: spacetimedb_client_api_messages_v1::energy::EnergyQuanta { quanta: 0 },
+        total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::ZERO,
+    });
+    let body = v1_bsatn::to_vec(&tu).expect("v1 TU encode infallible");
+    codec::wrap_uncompressed(body)
+}
+
+#[cfg(test)]
+mod synthesis_tests {
+    use super::*;
+    use spacetimedb_client_api_messages_v1::websocket::{
+        BsatnRowList, CompressableQueryUpdate, DatabaseUpdate, QueryUpdate, RowSizeHint,
+        TableUpdate, TransactionUpdateLight,
+    };
+
+    fn meta() -> UpstreamReducerMeta {
+        UpstreamReducerMeta {
+            reducer_name: "send_chat".into(),
+            caller_identity: relay_protocol::lib::Identity::from_byte_array([0x77; 32]),
+            caller_connection_id: relay_protocol::lib::ConnectionId::from_u128(0xABCD),
+            timestamp: relay_protocol::lib::Timestamp::from_micros_since_unix_epoch(
+                1_700_000_000_000_000,
+            ),
+            request_id: 555,
+            args: vec![1, 2, 3, 4],
+        }
+    }
+
+    fn tul() -> TransactionUpdateLight<v1::BsatnFormat> {
+        TransactionUpdateLight {
+            request_id: 11,
+            update: DatabaseUpdate {
+                tables: vec![TableUpdate {
+                    table_id: 0.into(),
+                    table_name: "chat_message_state".to_string().into_boxed_str(),
+                    num_rows: 1,
+                    updates: smallvec::smallvec![CompressableQueryUpdate::Uncompressed(
+                        QueryUpdate {
+                            deletes: BsatnRowList::new(
+                                RowSizeHint::FixedSize(0),
+                                Default::default(),
+                            ),
+                            inserts: BsatnRowList::new(
+                                RowSizeHint::RowOffsets(vec![0].into()),
+                                bytes::Bytes::from_static(b"hello"),
+                            ),
+                        }
+                    )],
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn synthesizes_full_tu_from_tul_plus_meta() {
+        let frame = synthesize_v1_tu_from_tul(tul(), meta());
+        let body = codec::body(&frame).unwrap();
+        let decoded: v1::ServerMessage<v1::BsatnFormat> = v1_bsatn::from_slice(body).unwrap();
+        let v1::ServerMessage::TransactionUpdate(tu) = decoded else {
+            panic!("expected TransactionUpdate, got something else");
+        };
+        assert_eq!(tu.reducer_call.reducer_name.as_ref(), "send_chat");
+        assert_eq!(tu.reducer_call.request_id, 555);
+        assert_eq!(tu.reducer_call.args.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(tu.caller_identity.to_byte_array(), [0x77u8; 32]);
+        assert_eq!(
+            tu.timestamp.to_micros_since_unix_epoch(),
+            1_700_000_000_000_000
+        );
+        let v1::UpdateStatus::Committed(db) = tu.status else {
+            panic!("synthesised TU must be Committed");
+        };
+        assert_eq!(db.tables.len(), 1);
+        assert_eq!(db.tables[0].table_name.as_ref(), "chat_message_state");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
