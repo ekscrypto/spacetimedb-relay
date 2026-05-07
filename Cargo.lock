@@ -1682,7 +1682,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "relay"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "relay-mirror-driver"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "relay-protocol"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "bytes",
  "hex",
@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "relay-publisher"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "relay-test-harness"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "relay-upstream"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2378,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "spike-replay"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bytes",
