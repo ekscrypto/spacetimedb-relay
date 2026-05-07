@@ -21,10 +21,12 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::Semaphore;
 use http::header::{HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
-use spacetimedb_client_api_messages::websocket::v2::{CallReducer, CallReducerFlags, ClientMessage};
+use spacetimedb_client_api_messages::websocket::v2::{
+    CallReducer, CallReducerFlags, ClientMessage,
+};
 use spacetimedb_sats::bsatn;
+use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use url::Url;
@@ -69,7 +71,10 @@ async fn main() -> Result<()> {
 
     let snapshots = collect_snapshots(&args.snapshot_dir, &args.only)?;
     if snapshots.is_empty() {
-        return Err(anyhow!("no snapshot files in {}", args.snapshot_dir.display()));
+        return Err(anyhow!(
+            "no snapshot files in {}",
+            args.snapshot_dir.display()
+        ));
     }
     tracing::info!("found {} snapshot files", snapshots.len());
 
@@ -113,8 +118,7 @@ async fn main() -> Result<()> {
             .to_string();
         let reducer = format!("relay_insert_{table}");
         let t0 = Instant::now();
-        let (rows, bytes) =
-            replay_file(&mut sink, &reducer, path, &request_id, &in_flight).await?;
+        let (rows, bytes) = replay_file(&mut sink, &reducer, path, &request_id, &in_flight).await?;
         grand_rows += rows;
         grand_bytes += bytes;
         tracing::info!(
@@ -157,9 +161,8 @@ fn collect_snapshots(dir: &std::path::Path, only: &[String]) -> Result<Vec<PathB
     Ok(out)
 }
 
-type Conn = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Conn =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn open_connection(host: &Url, database: &str) -> Result<Conn> {
     let mut url = host.clone();

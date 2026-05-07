@@ -110,7 +110,9 @@ pub async fn run(
         fingerprint = %outcome.fingerprint,
         "mirror module ready"
     );
-    metrics.publisher.record(&outcome.fingerprint, outcome.republished);
+    metrics
+        .publisher
+        .record(&outcome.fingerprint, outcome.republished);
 
     // 2. Open the WS link to local stdb. The token comes either from
     //    an explicit override on cfg.identity_token, or from a token
@@ -189,8 +191,7 @@ pub async fn run(
         protocol: cfg.upstream_protocol,
     };
 
-    let sequential =
-        cfg.subscribe_chunk_size == 1 && cfg.upstream_protocol == ProtocolVersion::V1;
+    let sequential = cfg.subscribe_chunk_size == 1 && cfg.upstream_protocol == ProtocolVersion::V1;
     if sequential {
         tracing::info!(
             target: "relay::stdb_mode",
@@ -301,10 +302,9 @@ pub async fn run(
                             "failed to decode ServerMessage"
                         ),
                     }
-                    metrics.available_permits.store(
-                        driver.available_permits() as u64,
-                        Ordering::Relaxed,
-                    );
+                    metrics
+                        .available_permits
+                        .store(driver.available_permits() as u64, Ordering::Relaxed);
                     if let Some(limit) = cfg.frame_limit {
                         if frames >= limit {
                             tracing::info!(target: "relay::stdb_mode", frames, "frame limit reached");

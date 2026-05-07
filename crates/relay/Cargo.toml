@@ -13,6 +13,7 @@ relay-protocol.workspace = true
 relay-upstream.workspace = true
 relay-publisher.workspace = true
 relay-mirror-driver.workspace = true
+relay-frontend.workspace = true
 
 tokio.workspace = true
 clap.workspace = true

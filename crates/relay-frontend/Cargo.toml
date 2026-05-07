@@ -1,0 +1,30 @@
+[package]
+name = "relay-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+http.workspace = true
+url.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+serde.workspace = true
+uuid.workspace = true
+
+relay-protocol.workspace = true
+spacetimedb-sats.workspace = true
+spacetimedb-client-api-messages.workspace = true
+spacetimedb-client-api-messages-v1.workspace = true
+spacetimedb-lib-v1.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

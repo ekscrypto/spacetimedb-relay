@@ -16,6 +16,8 @@ path = "src/main.rs"
 spacetimedb-sats.workspace = true
 spacetimedb-client-api-messages.workspace = true
 spacetimedb-lib.workspace = true
+spacetimedb-client-api-messages-v1.workspace = true
+spacetimedb-lib-v1.workspace = true
 
 tokio.workspace = true
 tokio-tungstenite.workspace = true

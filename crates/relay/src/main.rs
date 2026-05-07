@@ -66,7 +66,11 @@ struct Args {
     /// timeouts during the (multi-minute, multi-hundred-MB) initial
     /// dump. `0` (default) means no chunking — one connection
     /// subscribes to all tables.
-    #[arg(long = "subscribe-chunk-size", env = "RELAY_SUBSCRIBE_CHUNK_SIZE", default_value_t = 0)]
+    #[arg(
+        long = "subscribe-chunk-size",
+        env = "RELAY_SUBSCRIBE_CHUNK_SIZE",
+        default_value_t = 0
+    )]
     subscribe_chunk_size: usize,
 
     /// SpacetimeDB WebSocket subprotocol version of the upstream.
@@ -78,12 +82,20 @@ struct Args {
 
     /// Local SpacetimeDB URL the relay publishes the mirror module to
     /// and connects to as the writer.
-    #[arg(long = "stdb-url", env = "RELAY_STDB_URL", default_value = "ws://127.0.0.1:3000")]
+    #[arg(
+        long = "stdb-url",
+        env = "RELAY_STDB_URL",
+        default_value = "ws://127.0.0.1:3000"
+    )]
     stdb_url: Url,
 
     /// spacetime CLI server alias (run `spacetime server add ...` once
     /// to register the local SpacetimeDB before running the relay).
-    #[arg(long = "stdb-server-alias", env = "RELAY_STDB_SERVER_ALIAS", default_value = "local")]
+    #[arg(
+        long = "stdb-server-alias",
+        env = "RELAY_STDB_SERVER_ALIAS",
+        default_value = "local"
+    )]
     stdb_server_alias: String,
 
     /// Mirror database name. Defaults to a sanitized form of
@@ -116,12 +128,20 @@ struct Args {
     codegen_script: Option<PathBuf>,
 
     /// Path to the `spacetime` CLI binary.
-    #[arg(long = "spacetime-bin", env = "RELAY_SPACETIME_BIN", default_value = "spacetime")]
+    #[arg(
+        long = "spacetime-bin",
+        env = "RELAY_SPACETIME_BIN",
+        default_value = "spacetime"
+    )]
     spacetime_bin: PathBuf,
 
     /// Bind address for the in-process dashboard (HTML + /metrics JSON).
     /// Empty string disables the dashboard.
-    #[arg(long = "dashboard-bind", env = "RELAY_DASHBOARD_BIND", default_value = "127.0.0.1:3001")]
+    #[arg(
+        long = "dashboard-bind",
+        env = "RELAY_DASHBOARD_BIND",
+        default_value = "127.0.0.1:3001"
+    )]
     dashboard_bind: String,
 
     /// File where the relay persists the local-stdb identity token
@@ -131,6 +151,40 @@ struct Args {
     /// `<data-dir>/relay-stdb-identity.token`.
     #[arg(long = "identity-token-file", env = "RELAY_IDENTITY_TOKEN_FILE")]
     identity_token_file: Option<PathBuf>,
+
+    /// Public-facing WebSocket bind address for the frontend proxy.
+    /// Downstream clients connect here; the proxy forwards each
+    /// connection to `--stdb-url` (loopback) and — for v1 clients —
+    /// rewrites `relay_apply_<table>` `TransactionUpdate`s so they
+    /// look like upstream's. Empty string disables the frontend; in
+    /// that case downstream clients must connect directly to the
+    /// local SpacetimeDB.
+    #[arg(
+        long = "frontend-bind",
+        env = "RELAY_FRONTEND_BIND",
+        default_value = "0.0.0.0:3009"
+    )]
+    frontend_bind: String,
+
+    /// Maximum number of concurrent downstream clients on the
+    /// frontend listener. Connections beyond this cap are dropped at
+    /// accept time.
+    #[arg(
+        long = "frontend-max-clients",
+        env = "RELAY_FRONTEND_MAX_CLIENTS",
+        default_value_t = 1024
+    )]
+    frontend_max_clients: usize,
+
+    /// How long the frontend waits between WS pings on idle client
+    /// connections (seconds). Smaller values keep NAT/middleboxes
+    /// from dropping idle TCP flows.
+    #[arg(
+        long = "frontend-idle-secs",
+        env = "RELAY_FRONTEND_IDLE_SECS",
+        default_value_t = 30
+    )]
+    frontend_idle_secs: u64,
 }
 
 #[tokio::main]
@@ -206,6 +260,47 @@ async fn main() -> Result<()> {
         DEFAULT_MAX_IN_FLIGHT,
         event_ring,
     );
+
+    if !args.frontend_bind.trim().is_empty() {
+        match args.frontend_bind.parse::<std::net::SocketAddr>() {
+            Ok(bind) => {
+                let frontend_metrics =
+                    relay_frontend::FrontendMetrics::new(args.frontend_bind.clone());
+                let active_clients = relay_frontend::ActiveClients::new();
+                metrics.install_frontend(dashboard::FrontendHandles {
+                    metrics: frontend_metrics.clone(),
+                    clients: active_clients.clone(),
+                });
+                let cfg = relay_frontend::Config {
+                    bind,
+                    local_url: args.stdb_url.clone(),
+                    local_database: args
+                        .mirror_database
+                        .clone()
+                        .unwrap_or_else(|| mirror_database.clone()),
+                    local_token: None,
+                    max_clients: args.frontend_max_clients,
+                    idle_timeout: std::time::Duration::from_secs(args.frontend_idle_secs),
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = relay_frontend::run(cfg, frontend_metrics, active_clients).await
+                    {
+                        tracing::error!(
+                            target: "relay::frontend",
+                            error = %e,
+                            "frontend listener exited"
+                        );
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(
+                target: "relay",
+                bind = %args.frontend_bind,
+                error = %e,
+                "invalid --frontend-bind; frontend disabled"
+            ),
+        }
+    }
 
     if !args.dashboard_bind.trim().is_empty() {
         match args.dashboard_bind.parse::<std::net::SocketAddr>() {

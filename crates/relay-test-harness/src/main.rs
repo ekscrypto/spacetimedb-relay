@@ -25,12 +25,14 @@
 //! that invariant in the architecture.
 
 mod stdb_client;
+mod stdb_client_v1;
 
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rand::Rng;
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -39,6 +41,7 @@ use crate::stdb_client::{
     open_connection, recv_server_message, send_subscribe,
 };
 use spacetimedb_client_api_messages::websocket::v2::ServerMessage;
+use spacetimedb_client_api_messages_v1::websocket as v1;
 
 #[derive(Debug, Parser)]
 #[command(name = "relay-test-harness", version)]
@@ -54,6 +57,20 @@ struct Args {
     /// Local relay URL (where D connects).
     #[arg(long, env = "TEST_RELAY", default_value = "ws://127.0.0.1:3001")]
     relay: Url,
+
+    /// If set, route the subscriber through the relay frontend proxy
+    /// at this URL instead of `--relay`. Use this to exercise the
+    /// frontend's per-client metrics + v1 rewrite path.
+    #[arg(long, env = "TEST_VIA_FRONTEND")]
+    via_frontend: Option<Url>,
+
+    /// Subprotocol the subscriber speaks. `v2` (default) is plain
+    /// passthrough; `v1` exercises the frontend's rewrite of
+    /// `relay_apply_<table>` `TransactionUpdate`s into upstream-shaped
+    /// frames. v1 mode adds strict assertions on `reducer_call`,
+    /// `caller_identity`, and `caller_connection_id`.
+    #[arg(long = "subscriber-protocol", env = "TEST_SUBSCRIBER_PROTOCOL", value_enum, default_value_t = SubscriberProtocol::V2)]
+    subscriber_protocol: SubscriberProtocol,
 
     /// SpacetimeDB database name (set via --database or TEST_DATABASE).
     #[arg(long, env = "TEST_DATABASE")]
@@ -85,6 +102,12 @@ struct Args {
     timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SubscriberProtocol {
+    V1,
+    V2,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -114,7 +137,11 @@ async fn main() -> Result<()> {
 
     let timeout = Duration::from_secs(args.timeout_secs);
     let database = args.database.clone();
-    let relay_url = args.relay.clone();
+    let subscriber_url = args
+        .via_frontend
+        .clone()
+        .unwrap_or_else(|| args.relay.clone());
+    let subscriber_protocol = args.subscriber_protocol;
     let upstream_url = args.upstream.clone();
     let table = args.table.clone();
     let reducer = args.reducer.clone();
@@ -126,17 +153,42 @@ async fn main() -> Result<()> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        return run_subscribe_only(relay_url, database, tables, timeout).await;
+        return run_subscribe_only(subscriber_url, database, tables, timeout).await;
     }
 
+    // Subscriber may want the writer's upstream identity to assert
+    // that the rewritten v1 TransactionUpdate's `caller_identity` is
+    // the upstream's, not the relay's local-stdb one. We forward it
+    // via a oneshot — `None` for v2 (no such assertion).
+    let (writer_identity_tx, writer_identity_rx) = oneshot::channel::<[u8; 32]>();
+    let sub_reducer = reducer.clone();
+    let sub_db = database.clone();
+
     let subscriber = tokio::spawn(async move {
-        run_subscriber(relay_url, database.clone(), table, expected, timeout).await
+        run_subscriber(
+            subscriber_url,
+            sub_db,
+            table,
+            expected,
+            timeout,
+            subscriber_protocol,
+            sub_reducer,
+            writer_identity_rx,
+        )
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let writer = tokio::spawn(async move {
-        run_writer(upstream_url, args.database.clone(), reducer, name).await
+        run_writer(
+            upstream_url,
+            args.database.clone(),
+            reducer,
+            name,
+            Some(writer_identity_tx),
+        )
+        .await
     });
 
     let writer_outcome = writer
@@ -250,7 +302,13 @@ async fn run_subscribe_only(
     Ok(())
 }
 
-async fn run_writer(upstream: Url, database: String, reducer: String, name: String) -> Result<()> {
+async fn run_writer(
+    upstream: Url,
+    database: String,
+    reducer: String,
+    name: String,
+    identity_tx: Option<oneshot::Sender<[u8; 32]>>,
+) -> Result<()> {
     tracing::info!(target: "harness::writer", "connecting to upstream");
     let mut conn = open_connection(&upstream, &database).await?;
     let initial = expect_initial_connection(&mut conn).await?;
@@ -259,6 +317,9 @@ async fn run_writer(upstream: Url, database: String, reducer: String, name: Stri
         identity = %initial.identity.to_hex().as_str(),
         "writer got InitialConnection"
     );
+    if let Some(tx) = identity_tx {
+        let _ = tx.send(initial.identity.to_byte_array());
+    }
 
     let args_bsatn = encode_string_arg(&name);
     tracing::info!(
@@ -296,14 +357,44 @@ async fn run_writer(upstream: Url, database: String, reducer: String, name: Stri
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_subscriber(
     relay: Url,
     database: String,
     table: String,
     expected_name: String,
     timeout: Duration,
+    protocol: SubscriberProtocol,
+    expected_reducer: String,
+    writer_identity_rx: oneshot::Receiver<[u8; 32]>,
 ) -> Result<bool> {
-    tracing::info!(target: "harness::subscriber", "connecting to relay");
+    match protocol {
+        SubscriberProtocol::V2 => {
+            run_subscriber_v2(relay, database, table, expected_name, timeout).await
+        }
+        SubscriberProtocol::V1 => {
+            run_subscriber_v1(
+                relay,
+                database,
+                table,
+                expected_name,
+                timeout,
+                expected_reducer,
+                writer_identity_rx,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_subscriber_v2(
+    relay: Url,
+    database: String,
+    table: String,
+    expected_name: String,
+    timeout: Duration,
+) -> Result<bool> {
+    tracing::info!(target: "harness::subscriber", "connecting via v2");
     let mut conn = open_connection(&relay, &database).await?;
     let initial = expect_initial_connection(&mut conn).await?;
     tracing::info!(
@@ -367,6 +458,146 @@ async fn run_subscriber(
     }
 }
 
+/// v1 subscriber — only valid when going through the relay frontend
+/// proxy, since that's the only place that produces upstream-shaped v1
+/// TransactionUpdates from the local SpacetimeDB stream.
+///
+/// On match, asserts that the reducer name + caller identity are the
+/// upstream's. If those asserts fail we treat it as a hard PASS=false
+/// (the relay frontend's rewrite is broken).
+async fn run_subscriber_v1(
+    relay: Url,
+    database: String,
+    table: String,
+    expected_name: String,
+    timeout: Duration,
+    expected_reducer: String,
+    writer_identity_rx: oneshot::Receiver<[u8; 32]>,
+) -> Result<bool> {
+    tracing::info!(target: "harness::subscriber", "connecting via v1");
+    let mut conn = stdb_client_v1::open_connection(&relay, &database).await?;
+    let id_tok = stdb_client_v1::expect_identity_token(&mut conn).await?;
+    tracing::info!(
+        target: "harness::subscriber",
+        identity = %hex::encode(id_tok.identity.to_byte_array()),
+        "subscriber got v1 IdentityToken"
+    );
+
+    let query = format!("SELECT * FROM {table}");
+    stdb_client_v1::send_subscribe(&mut conn, 100, vec![query]).await?;
+
+    // We don't strictly need the writer's identity to match a row in
+    // the initial subscription — only later TransactionUpdates. So
+    // start the wait now and pull the writer identity in parallel.
+    let writer_identity = match writer_identity_rx.await {
+        Ok(id) => Some(id),
+        Err(_) => {
+            tracing::warn!(
+                target: "harness::subscriber",
+                "writer identity oneshot dropped — skipping caller-identity assertion"
+            );
+            None
+        }
+    };
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let msg =
+            match tokio::time::timeout(remaining, stdb_client_v1::recv_server_message(&mut conn))
+                .await
+            {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => return Err(anyhow!("v1 subscriber recv error: {e}")),
+                Err(_) => return Ok(false),
+            };
+        match msg {
+            v1::ServerMessage::InitialSubscription(is) => {
+                if database_update_contains_string(&is.database_update, &expected_name) {
+                    tracing::info!(
+                        target: "harness::subscriber",
+                        "expected name already present in v1 InitialSubscription — counting as PASS"
+                    );
+                    return Ok(true);
+                }
+            }
+            v1::ServerMessage::SubscribeMultiApplied(sma) => {
+                if database_update_contains_string(&sma.update, &expected_name) {
+                    tracing::info!(
+                        target: "harness::subscriber",
+                        "expected name already present in v1 SubscribeMultiApplied — counting as PASS"
+                    );
+                    return Ok(true);
+                }
+            }
+            v1::ServerMessage::TransactionUpdate(tu) => {
+                if !v1_tu_contains_string(&tu, &expected_name) {
+                    continue;
+                }
+                tracing::info!(
+                    target: "harness::subscriber",
+                    reducer = %tu.reducer_call.reducer_name,
+                    request_id = tu.reducer_call.request_id,
+                    "subscriber v1 TransactionUpdate matched expected name"
+                );
+                let actual_reducer = tu.reducer_call.reducer_name.as_ref();
+                if actual_reducer != expected_reducer {
+                    tracing::error!(
+                        target: "harness::subscriber",
+                        expected = %expected_reducer,
+                        got = %actual_reducer,
+                        "rewrite assertion failed: reducer_name mismatch"
+                    );
+                    return Ok(false);
+                }
+                if let Some(want_id) = writer_identity {
+                    let got_id = tu.caller_identity.to_byte_array();
+                    if got_id != want_id {
+                        tracing::error!(
+                            target: "harness::subscriber",
+                            expected = %hex::encode(want_id),
+                            got = %hex::encode(got_id),
+                            "rewrite assertion failed: caller_identity is not the upstream writer"
+                        );
+                        return Ok(false);
+                    }
+                }
+                tracing::info!(
+                    target: "harness::subscriber",
+                    "v1 rewrite assertions passed (reducer + caller_identity)"
+                );
+                return Ok(true);
+            }
+            other => {
+                tracing::debug!(
+                    target: "harness::subscriber",
+                    kind = v1_variant_name(&other),
+                    "subscriber v1 other frame"
+                );
+            }
+        }
+    }
+}
+
+fn v1_variant_name(msg: &v1::ServerMessage<v1::BsatnFormat>) -> &'static str {
+    match msg {
+        v1::ServerMessage::InitialSubscription(_) => "InitialSubscription",
+        v1::ServerMessage::TransactionUpdate(_) => "TransactionUpdate",
+        v1::ServerMessage::TransactionUpdateLight(_) => "TransactionUpdateLight",
+        v1::ServerMessage::IdentityToken(_) => "IdentityToken",
+        v1::ServerMessage::OneOffQueryResponse(_) => "OneOffQueryResponse",
+        v1::ServerMessage::SubscribeApplied(_) => "SubscribeApplied",
+        v1::ServerMessage::UnsubscribeApplied(_) => "UnsubscribeApplied",
+        v1::ServerMessage::SubscriptionError(_) => "SubscriptionError",
+        v1::ServerMessage::SubscribeMultiApplied(_) => "SubscribeMultiApplied",
+        v1::ServerMessage::UnsubscribeMultiApplied(_) => "UnsubscribeMultiApplied",
+        v1::ServerMessage::ProcedureResult(_) => "ProcedureResult",
+    }
+}
+
 fn any_row_contains_string(
     applied: &spacetimedb_client_api_messages::websocket::v2::SubscribeApplied,
     needle: &str,
@@ -418,4 +649,33 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn v1_tu_contains_string(tu: &v1::TransactionUpdate<v1::BsatnFormat>, needle: &str) -> bool {
+    let v1::UpdateStatus::Committed(db) = &tu.status else {
+        return false;
+    };
+    database_update_contains_string(db, needle)
+}
+
+fn database_update_contains_string(db: &v1::DatabaseUpdate<v1::BsatnFormat>, needle: &str) -> bool {
+    use spacetimedb_client_api_messages_v1::websocket::{CompressableQueryUpdate, RowListLen};
+    let needle_bytes = needle.as_bytes();
+    for table in db.tables.iter() {
+        for upd in table.updates.iter() {
+            let CompressableQueryUpdate::Uncompressed(qu) = upd else {
+                continue;
+            };
+            for list in [&qu.inserts, &qu.deletes] {
+                for i in 0..list.len() {
+                    if let Some(row) = list.get(i) {
+                        if bytes_contain(&row, needle_bytes) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }

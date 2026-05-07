@@ -257,8 +257,7 @@ pub async fn connect_and_run(
         max_frame_size: None,
         ..Default::default()
     };
-    let connect_fut =
-        tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false);
+    let connect_fut = tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false);
     let (ws_stream, response) = tokio::time::timeout(config.connect_timeout, connect_fut)
         .await
         .map_err(|_| UpstreamError::Connect("connect timeout".into()))?
