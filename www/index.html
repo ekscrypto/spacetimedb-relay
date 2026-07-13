@@ -155,6 +155,34 @@
   }
   button.refresh:hover { background: #30363d; }
 
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 8px;
+    margin: 4px 0 14px;
+  }
+  .stats[hidden] { display: none; }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+  }
+  .stat-label {
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .stat-value {
+    font-size: 18px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    margin-top: 2px;
+    white-space: nowrap;
+  }
+  .stat-sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
   .loading { color: var(--muted); padding: 18px 14px; font-size: 13px; }
   .empty { color: var(--muted); padding: 18px 14px; font-size: 13px; text-align: center; }
 
@@ -208,6 +236,32 @@
   <div class="meta-row">
     <span class="left"><b id="src-count">–</b> sources mirrored &middot; fetched <span id="fetched-at">never</span></span>
     <button class="refresh" id="refresh-btn" type="button">Refresh</button>
+  </div>
+  <div class="stats" id="sys-stats" hidden>
+    <div class="stat">
+      <div class="stat-label">Load 1 min</div>
+      <div class="stat-value" id="stat-load1">–</div>
+      <div class="stat-sub" id="stat-load1-sub"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Load 5 min</div>
+      <div class="stat-value" id="stat-load5">–</div>
+      <div class="stat-sub" id="stat-load5-sub"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Load 15 min</div>
+      <div class="stat-value" id="stat-load15">–</div>
+      <div class="stat-sub" id="stat-load15-sub"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Network in</div>
+      <div class="stat-value" id="stat-net-in">–</div>
+      <div class="stat-sub" id="stat-net-sub"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Network out</div>
+      <div class="stat-value" id="stat-net-out">–</div>
+    </div>
   </div>
   <div class="panel">
     <table>
@@ -339,6 +393,7 @@
   var srcCount = document.getElementById("src-count");
   var fetchedAt = document.getElementById("fetched-at");
   var refreshBtn = document.getElementById("refresh-btn");
+  var sysStats = document.getElementById("sys-stats");
   var lastFetched = null;
   var timer = null;
 
@@ -476,6 +531,50 @@
     }
   }
 
+  function formatBytes(bps) {
+    // bytes/sec → binary-scale rate (KB/s, MB/s, …).
+    var units = ["B/s", "KB/s", "MB/s", "GB/s"];
+    var v = bps, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    if (i === 0) return Math.round(v) + " " + units[i];
+    return v.toFixed(v < 10 ? 1 : 0) + " " + units[i];
+  }
+
+  function setText(id, text) {
+    var node = document.getElementById(id);
+    if (node) node.textContent = text;
+  }
+
+  function renderSystem(system) {
+    var cpu = system && system.cpu;
+    var net = system && system.network;
+    if (!cpu || !cpu.load_average || !net) {
+      sysStats.hidden = true;
+      return;
+    }
+    var la = cpu.load_average;
+    var cpus = cpu.num_cpus || 0;
+    function ratio(v) {
+      if (!cpus) return "";
+      var r = v / cpus;
+      return "/ " + cpus + " CPUs \u00b7 " + r.toFixed(1) + "\u00d7";
+    }
+    setText("stat-load1", la.one.toFixed(2));
+    setText("stat-load1-sub", ratio(la.one));
+    setText("stat-load5", la.five.toFixed(2));
+    setText("stat-load5-sub", ratio(la.five));
+    setText("stat-load15", la.fifteen.toFixed(2));
+    setText("stat-load15-sub", ratio(la.fifteen));
+
+    setText("stat-net-in", "\u2193 " + formatBytes(net.bytes_per_sec_in));
+    setText("stat-net-out", "\u2191 " + formatBytes(net.bytes_per_sec_out));
+    var samples = net.samples != null ? net.samples : 0;
+    var win = net.window_seconds != null ? Math.round(net.window_seconds / 60) : 0;
+    setText("stat-net-sub", (win ? win + "-min avg" : "average") +
+      (samples ? " \u00b7 " + samples + " samples" : ""));
+    sysStats.hidden = false;
+  }
+
   function renderHealth(sources, schemaCount, allCached) {
     healthBody.innerHTML = "";
     if (!sources.length) {
@@ -509,6 +608,7 @@
   }
 
   function showFetchError() {
+    sysStats.hidden = true;
     overallPill.className = "pill bad";
     overallPill.textContent = "unreachable";
     overallText.textContent = "/health did not respond — showing the last known source list.";
@@ -549,6 +649,7 @@
         setFetched(true);
         renderRelays(sources, false);
         renderHealth(sources, schemaCount, allCached);
+        renderSystem(data && data.system);
       })
       .catch(function (err) {
         console.warn("health fetch failed:", err);
