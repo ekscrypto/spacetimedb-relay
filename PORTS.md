@@ -44,6 +44,35 @@ not use such IDs.
 | region 7 | 3007     | 3107      |
 | region 14| 3014     | 3114      |
 
+## Public exposure
+
+The frontend band `3000–3025` is exposed to the public internet, one
+TLS listener per port, fronted by nginx. Clients connect with
+
+```
+wss://relay.bitcraftsync.app:<port>/v1/database/<mirror-database>/subscribe
+```
+
+where `<port>` is `3000` for global and `3000 + regionID` for a region
+(the port *is* the region, same formula as everywhere else).
+
+- nginx binds the public IPs on each port `3000–3025`, terminates TLS
+  with the host's Let's Encrypt cert for `relay.bitcraftsync.app`, and
+  proxies plain WebSocket to the loopback relay on the same port number
+  (relay binds `127.0.0.1:<port>`, nginx binds `<pubip>:<port>` —
+  distinct addresses, so the two listeners coexist).
+- Each relay frontend is loopback-only; nginx is the only public
+  listener on these ports. Dashboards (`3100–3149`) and the shared
+  stdb (`3050`) remain strictly loopback.
+- UFW allows `3000:3025/tcp` (plus `22/80/443`). Ports with no relay
+  behind them (e.g. `3001` when region 1 isn't running) return nginx's
+  `502 Bad Gateway` — the port is reachable, the upstream isn't.
+  Standing up a new region in `1..25` makes it public with zero nginx
+  or UFW follow-up: nginx is already listening on its port.
+- Regions `26–49` (ports `3026–3049`) are **not** in the open band.
+  The first time one is needed, widen the nginx `listen` directives
+  and the UFW rule from `3025` up to the needed port.
+
 ## Local dev
 
 The single-instance defaults baked into the binary

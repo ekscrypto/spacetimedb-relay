@@ -46,9 +46,11 @@ dash_port() {
         | grep -oE '[0-9]+$' | head -1
 }
 
-# frontend port for a unit (for display).
+# frontend port for a unit (for display). The bind host varies by
+# deployment: `0.0.0.0` when the proxy faces the public directly,
+# `127.0.0.1` when nginx terminates TLS in front of it. Match either.
 frontend_port() {
-    grep -oE 'frontend-bind 0\.0\.0\.0:[0-9]+' "$UNIT_DIR/$1.service" 2>/dev/null \
+    grep -oE 'frontend-bind (0\.0\.0\.0|127\.0\.0\.1):[0-9]+' "$UNIT_DIR/$1.service" 2>/dev/null \
         | grep -oE '[0-9]+$' | head -1
 }
 
