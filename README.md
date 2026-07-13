@@ -256,6 +256,8 @@ v1 subscriber as if it had been talking to BitCraft directly.
 | `bc14-sdk-test`        | Standalone bin (excluded from the workspace) that vendors the v1.12.0 SpacetimeDB Rust SDK's WebSocket layer verbatim. Used to confirm large-scale subscribe issues against BitCraft are server/middlebox behavior, not relay-side regressions. See `crates/bc14-sdk-test/README.md`. |
 | `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table, each taking an `Option<UpstreamReducerInfo>` arg. |
 | `tools/mirror-template/` | `Cargo.toml` + `rust-toolchain.toml` copied into the publisher's workdir. |
+| `tools/fleet-status.sh` | Ops script for multi-instance hosts: auto-discovers every `relay-*` systemd unit, reads its dashboard port, and prints a per-instance sync-status table (upstream/stdb state, 1-min throughput). Run on the host: `./tools/fleet-status.sh` (one-shot) or `-w` to watch. |
+| `tools/relay-fleet-start.sh` | Sequencer invoked by `relay-fleet-sequencer.service` at boot: waits for the shared stdb's `/v1/health`, then starts each relay one at a time (waiting for `upstream.state == "up"` before the next) so concurrent schema-drift rebuilds don't OOM the host. Idempotent — safe to re-run. |
 
 ## Large databases
 
