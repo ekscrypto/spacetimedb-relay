@@ -8,6 +8,8 @@ Cargo.lock.bak
 .DS_Store
 .vscode/
 .idea/
+.claude/
+.zcode/
 *.swp
 /tmp/
 /.spacetimedb-relay-data/

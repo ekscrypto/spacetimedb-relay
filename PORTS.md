@@ -1,9 +1,9 @@
 # Port allocation
 
-The relay deployment runs **one global instance and up to 25 regional
-instances** on a single host, plus a single shared local SpacetimeDB.
-All listen ports are derived from a single base and an instance index
-so the entire fleet is predictable.
+The relay deployment runs **one global instance and one regional
+instance per BitCraft region** on a single host, plus a single shared
+local SpacetimeDB. Every listen port is derived from the in-game region
+ID so the mapping is self-describing — region 14 is always on `3014`.
 
 ## Formula
 
@@ -11,33 +11,38 @@ so the entire fleet is predictable.
 BASE = 3000
 
 GLOBAL        frontend = BASE              dashboard = BASE + 100
-REGIONAL      frontend = BASE + index      dashboard = BASE + 100 + index
+REGIONAL      frontend = BASE + regionID   dashboard = BASE + 100 + regionID
 SHARED STDB   BASE + 50   (loopback only, single instance)
 ```
 
-`index` is a 1-based sequential index **we assign** to each regional
-relay (1–25). It is *not* BitCraft's in-game region ID — see
-[Index mapping](#index-mapping) below.
+`regionID` is the BitCraft in-game region number (1–49). The port
+*is* the region ID, offset by the base. Global is the special case at
+offset 0.
 
 ## Bands
 
 | Band           | Ports         | Use                                   |
 |----------------|---------------|---------------------------------------|
-| Frontend (ws)  | `3000–3025`   | Public downstream WebSocket           |
+| Global         | `3000`        | Global/reference frontend             |
+| Regional (ws)  | `3001–3049`   | Public downstream WebSocket, one per region ID |
 | Shared infra   | `3050`        | Local SpacetimeDB (loopback)          |
-| Dashboard      | `3100–3125`   | Per-instance `/metrics` (loopback)    |
-| Reserved gap   | `3026–3049`   | Free — frontends if the fleet grows past 25 |
+| Dashboard      | `3100–3149`   | Per-instance `/metrics` (loopback)    |
+| Reserved gap   | `3051–3099`   | Free                                  |
 
 Each instance's frontend and dashboard share the same low byte:
-instance *N* → frontend `30NN`, dashboard `31NN`. Global is *N* = 0.
+region *N* → frontend `30NN`, dashboard `31NN`. Global is *N* = 0.
+Region IDs that share a low byte with the stdb (`3050`) or fall in the
+reserved gap do not collide because the high band differs; region 50
+itself is excluded (it would land on the stdb port) but BitCraft does
+not use such IDs.
 
-## Index mapping
+## Example
 
-Because the port encodes our index rather than the BitCraft region ID,
-the index → region assignment is recorded alongside the host-specific
-deployment notes (out of this public repo). The rule for assigning a
-new index is: **lowest free index, stable once given** — never renumber
-an existing instance, since downstream clients may have pinned the port.
+| Instance | frontend | dashboard |
+|----------|----------|-----------|
+| global   | 3000     | 3100      |
+| region 7 | 3007     | 3107      |
+| region 14| 3014     | 3114      |
 
 ## Local dev
 
