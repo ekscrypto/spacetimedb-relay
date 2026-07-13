@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>relay.bitcraftsync.app</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --good: #3fb950;
+    --bad: #f85149;
+    --warn: #d29922;
+    --link: #79c0ff;
+    --code-bg: #0d1117;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 24px 64px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header h1 { font-size: 24px; margin: 0 0 6px; }
+  header .lede { margin: 0 0 8px; color: var(--text); max-width: 76ch; }
+  header .disclaimer { color: var(--muted); font-size: 12px; margin: 0; }
+  header .disclaimer a { color: var(--muted); text-decoration: underline; }
+  .health-line {
+    margin-top: 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  h2 {
+    font-size: 13px;
+    margin: 36px 0 4px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+  .section-note { color: var(--muted); font-size: 13px; margin: 4px 0 12px; max-width: 92ch; }
+  .section-note code, p code, li code, td code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; font-size: 12.5px; }
+  a { color: var(--link); }
+
+  .pill {
+    font-size: 11px;
+    padding: 2px 9px;
+    border-radius: 12px;
+    background: #21262d;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    white-space: nowrap;
+  }
+  .pill.up { background: rgba(63, 185, 80, 0.18); color: var(--good); }
+  .pill.bad { background: rgba(248, 81, 73, 0.18); color: var(--bad); }
+  .pill.warn { background: rgba(210, 153, 34, 0.18); color: var(--warn); }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0;
+    overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    text-align: left;
+    padding: 10px 14px;
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    background: #161b22;
+    white-space: nowrap;
+  }
+  tbody td { padding: 9px 14px; border-bottom: 1px solid #21262d; vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #1c2128; }
+  td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .src { color: var(--link); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .instance-tag { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
+  .url-cell { display: flex; align-items: center; gap: 8px; }
+  .url-cell code { flex: 1 1 auto; overflow-x: auto; white-space: nowrap; display: block; }
+  button.copy {
+    background: #21262d;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 9px;
+    cursor: pointer;
+    font-size: 11px;
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+  button.copy:hover { background: #30363d; }
+  button.copy.ok { color: var(--good); border-color: rgba(63,185,80,0.4); }
+
+  .endpoints td p { margin: 2px 0 0; }
+  .endpoints .ep { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--link); }
+  .curl {
+    margin-top: 6px;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 9px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text);
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .curl .prompt { color: var(--muted); user-select: none; }
+
+  .banner {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 12px 0;
+    font-size: 13px;
+  }
+  .banner.bad { background: rgba(248, 81, 73, 0.08); border-color: rgba(248, 81, 73, 0.4); color: var(--bad); }
+  .banner.warn { background: rgba(210, 153, 34, 0.08); border-color: rgba(210, 153, 34, 0.4); color: var(--warn); }
+
+  .meta-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 4px 0 12px;
+  }
+  .meta-row .left { color: var(--muted); font-size: 12px; }
+  .meta-row .left b { color: var(--text); }
+  button.refresh {
+    background: #21262d;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button.refresh:hover { background: #30363d; }
+
+  .loading { color: var(--muted); padding: 18px 14px; font-size: 13px; }
+  .empty { color: var(--muted); padding: 18px 14px; font-size: 13px; text-align: center; }
+
+  footer {
+    margin-top: 48px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12px;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  footer a { color: var(--muted); text-decoration: underline; }
+
+  @media (max-width: 640px) {
+    body { padding: 20px 14px 48px; font-size: 13px; }
+    .hide-sm { display: none; }
+    thead th, tbody td { padding: 8px 10px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>relay.bitcraftsync.app</h1>
+    <p class="lede">
+      A community SpacetimeDB relay/proxy for <a href="https://bitcraftonline.com" target="_blank" rel="noopener">BitCraft</a>. It holds a single
+      persistent subscription to each upstream game region and fans it out to
+      any number of downstream clients from a sibling SpacetimeDB &mdash; so
+      community tools (BitCraftMap, BitCraftSync, BitJita, &hellip;) share one
+      upstream cost instead of each holding their own subscription. Point your
+      SpacetimeDB SDK at the addresses below; it&rsquo;s a drop-in
+      <code>wss://</code> replacement.
+    </p>
+    <p class="disclaimer">
+      Community project &mdash; not affiliated with Clockwork Labs.
+      SpacetimeDB&trade; is a trademark of
+      <a href="https://clockworklabs.io" target="_blank" rel="noopener">Clockwork Labs</a>.
+    </p>
+    <div class="health-line">
+      <span id="overall-pill" class="pill">fetching&hellip;</span>
+      <span id="overall-text" style="color: var(--muted); font-size: 13px;"></span>
+    </div>
+  </header>
+
+  <!-- Section 1: System health -->
+  <h2>System health</h2>
+  <div class="meta-row">
+    <span class="left"><b id="src-count">–</b> sources mirrored &middot; fetched <span id="fetched-at">never</span></span>
+    <button class="refresh" id="refresh-btn" type="button">Refresh</button>
+  </div>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr>
+          <th>Source</th>
+          <th>Port</th>
+          <th class="hide-sm">Database</th>
+          <th>Schema</th>
+        </tr>
+      </thead>
+      <tbody id="health-body">
+        <tr><td colspan="4" class="loading">Loading&hellip;</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="section-note" style="margin-top: 10px;">
+    Deeper per-instance metrics (upstream/stdb link state, throughput, host
+    memory and disk) are exposed to operators on each instance&rsquo;s loopback
+    dashboard and are not part of the public surface.
+  </p>
+
+  <!-- Section 2: SpacetimeDB relays (wss://) -->
+  <h2>SpacetimeDB relays</h2>
+  <p class="section-note">
+    Each row is a live mirrored region. Connect your SpacetimeDB SDK with the
+    <b>SDK address</b> as the host and the <b>Database</b> as the database name,
+    or open the full subscribe URL for raw-WebSocket testing. The frontend
+    negotiates whichever subprotocol the client offers &mdash;
+    <code>v1.bsatn.spacetimedb</code> (synthesises full upstream-flavored
+    <code>TransactionUpdate</code>s) or <code>v2.bsatn.spacetimedb</code> (plain
+    passthrough). See the
+    <a href="https://github.com/ekscrypto/spacetimedb-relay#connecting-downstream-clients" target="_blank" rel="noopener">README</a>
+    for protocol details. Ports with no relay behind them return nginx
+    <code>502</code>; only sources reported live by <code>/health</code> are listed.
+  </p>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr>
+          <th>Instance</th>
+          <th>Port</th>
+          <th class="hide-sm">Database (mirror)</th>
+          <th>SDK address</th>
+          <th>Full subscribe URL</th>
+        </tr>
+      </thead>
+      <tbody id="relays-body">
+        <tr><td colspan="5" class="loading">Loading live sources from <code>/health</code>&hellip;</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Section 3: Convenience HTTP endpoints -->
+  <h2>Convenience HTTP endpoints</h2>
+  <p class="section-note">
+    Read-only JSON endpoints for quick lookups across all mirrored regions.
+    Every result row carries an <code>__source</code> field naming the region it
+    came from. Lists are capped at 100 rows; narrow with the query params.
+  </p>
+  <div class="panel">
+    <table class="endpoints">
+      <thead>
+        <tr>
+          <th>Endpoint</th>
+          <th>Returns</th>
+          <th>Query params</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><a class="ep" href="/health" target="_blank" rel="noopener">/health</a></td>
+          <td>
+            Fleet source map: per-source <code>port</code>, mirror
+            <code>database</code> name, <code>schema_cached</code> flag, and
+            total <code>schema_count</code>.
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/health</div>
+          </td>
+          <td>&mdash;</td>
+        </tr>
+        <tr>
+          <td><a class="ep" href="/players" target="_blank" rel="noopener">/players</a></td>
+          <td>
+            Players across all regions:
+            <code>{count, players:[{entity_id, username, __source}]}</code>
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/players?q=Marshal'</div>
+          </td>
+          <td>
+            <code>?q=&lt;username&gt;</code> &mdash; substring filter<br>
+            <code>?source=bitcraft-live-&lt;N&gt;</code> &mdash; one region
+          </td>
+        </tr>
+        <tr>
+          <td><a class="ep" href="/claims" target="_blank" rel="noopener">/claims</a></td>
+          <td>
+            Land claims across all regions:
+            <code>{count, claims:[{entity_id, owner_player_entity_id, owner_building_entity_id, name, neutral, __source}]}</code>
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/claims?source=bitcraft-live-14'</div>
+          </td>
+          <td>
+            <code>?q=&lt;name&gt;</code> &mdash; substring filter<br>
+            <code>?source=bitcraft-live-&lt;N&gt;</code> &mdash; one region
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <footer>
+    <span>
+      <a href="https://github.com/ekscrypto/spacetimedb-relay" target="_blank" rel="noopener">GitHub &middot; ekscrypto/spacetimedb-relay</a>
+      &middot;
+      <a href="https://ko-fi.com/ekscrypto" target="_blank" rel="noopener">Donate</a>
+      &middot; community project, MIT licensed.
+    </span>
+    <span>Auto-refreshes every 60s.</span>
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var relaysBody = document.getElementById("relays-body");
+  var healthBody = document.getElementById("health-body");
+  var overallPill = document.getElementById("overall-pill");
+  var overallText = document.getElementById("overall-text");
+  var srcCount = document.getElementById("src-count");
+  var fetchedAt = document.getElementById("fetched-at");
+  var refreshBtn = document.getElementById("refresh-btn");
+  var lastFetched = null;
+  var timer = null;
+
+  // Known region set as a degraded fallback if /health is unreachable.
+  // Mirrors the live-instance table in the repo (CLAUDE.local.md). Clearly
+  // marked stale when shown. Kept to the public 3000-3025 band.
+  var FALLBACK_SOURCES = [
+    { name: "global",            port: 3000, database: "relay-mirror-bc-global" },
+    { name: "bitcraft-live-3",   port: 3003, database: "relay-mirror-bc3"  },
+    { name: "bitcraft-live-7",   port: 3007, database: "relay-mirror-bc7"  },
+    { name: "bitcraft-live-8",   port: 3008, database: "relay-mirror-bc8"  },
+    { name: "bitcraft-live-9",   port: 3009, database: "relay-mirror-bc9"  },
+    { name: "bitcraft-live-11",  port: 3011, database: "relay-mirror-bc11" },
+    { name: "bitcraft-live-12",  port: 3012, database: "relay-mirror-bc12" },
+    { name: "bitcraft-live-13",  port: 3013, database: "relay-mirror-bc13" },
+    { name: "bitcraft-live-14",  port: 3014, database: "relay-mirror-bc14" },
+    { name: "bitcraft-live-15",  port: 3015, database: "relay-mirror-bc15" },
+    { name: "bitcraft-live-17",  port: 3017, database: "relay-mirror-bc17" },
+    { name: "bitcraft-live-18",  port: 3018, database: "relay-mirror-bc18" },
+    { name: "bitcraft-live-19",  port: 3019, database: "relay-mirror-bc19" },
+    { name: "bitcraft-live-23",  port: 3023, database: "relay-mirror-bc23" }
+  ];
+
+  function el(tag, cls, html) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html != null) e.innerHTML = html;
+    return e;
+  }
+
+  function regionNumber(name, port) {
+    if (name === "global") return 0;
+    var m = /-(\d+)$/.exec(name);
+    if (m) return parseInt(m[1], 10);
+    return port - 3000;
+  }
+
+  function sortSources(arr) {
+    return arr.slice().sort(function (a, b) {
+      var ra = regionNumber(a.name, a.port);
+      var rb = regionNumber(b.name, b.port);
+      if (ra !== rb) return ra - rb;
+      return a.name.localeCompare(b.name);
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function instanceLabel(name, port) {
+    if (name === "global") {
+      return '<span class="src">global</span>' +
+        '<div class="instance-tag">reference data &middot; port = 3000</div>';
+    }
+    var r = regionNumber(name, port);
+    return '<span class="src">' + escapeHtml(name) + '</span>' +
+      '<div class="instance-tag">region ' + r + ' &middot; port = 3000 + ' + r + '</div>';
+  }
+
+  function subscribeUrl(port, database) {
+    return "wss://relay.bitcraftsync.app:" + port +
+      "/v1/database/" + encodeURIComponent(database) + "/subscribe";
+  }
+
+  function sdkAddress(port) {
+    return "wss://relay.bitcraftsync.app:" + port;
+  }
+
+  function copyButton(text) {
+    var btn = el("button", "copy", "copy");
+    btn.type = "button";
+    btn.addEventListener("click", function () {
+      var done = function () {
+        btn.textContent = "copied";
+        btn.classList.add("ok");
+        setTimeout(function () {
+          btn.textContent = "copy";
+          btn.classList.remove("ok");
+        }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {
+          // fall through to legacy
+          legacyCopy(text); done();
+        });
+      } else {
+        legacyCopy(text); done();
+      }
+    });
+    return btn;
+  }
+
+  function legacyCopy(text) {
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  function renderRelays(sources, stale) {
+    relaysBody.innerHTML = "";
+    if (!sources.length) {
+      relaysBody.appendChild(el("tr", null,
+        '<td colspan="5" class="empty">No sources reported.</td>'));
+      return;
+    }
+    sortSources(sources).forEach(function (s) {
+      var tr = document.createElement("tr");
+      tr.appendChild(el("td", null, instanceLabel(s.name, s.port)));
+      tr.appendChild(el("td", "num mono", String(s.port)));
+      tr.appendChild(el("td", "mono hide-sm", escapeHtml(s.database || "—")));
+      tr.appendChild(el("td", "mono", escapeHtml(sdkAddress(s.port))));
+
+      var urlTd = el("td");
+      var urlWrap = el("div", "url-cell");
+      urlWrap.appendChild(el("code", null, escapeHtml(subscribeUrl(s.port, s.database))));
+      urlWrap.appendChild(copyButton(subscribeUrl(s.port, s.database)));
+      urlTd.appendChild(urlWrap);
+      tr.appendChild(urlTd);
+      relaysBody.appendChild(tr);
+    });
+    if (stale) {
+      var tr = el("tr", null,
+        '<td colspan="5" class="empty" style="color: var(--warn);">' +
+        'Live <code>/health</code> unreachable — showing the last known ' +
+        'source list from this page. Operators: check the host.</td>');
+      relaysBody.appendChild(tr);
+    }
+  }
+
+  function renderHealth(sources, schemaCount, allCached) {
+    healthBody.innerHTML = "";
+    if (!sources.length) {
+      healthBody.appendChild(el("tr", null,
+        '<td colspan="4" class="empty">No sources reported.</td>'));
+      return;
+    }
+    sortSources(sources).forEach(function (s) {
+      var tr = document.createElement("tr");
+      tr.appendChild(el("td", "src", escapeHtml(s.name)));
+      tr.appendChild(el("td", "num mono", String(s.port)));
+      tr.appendChild(el("td", "mono hide-sm", escapeHtml(s.database || "—")));
+      var cached = s.schema_cached === true;
+      tr.appendChild(el("td", null,
+        '<span class="pill ' + (cached ? "up" : "bad") + '">' +
+        (cached ? "cached" : "uncached") + "</span>"));
+      healthBody.appendChild(tr);
+    });
+
+    srcCount.textContent = String(schemaCount != null ? schemaCount : sources.length);
+    overallPill.className = "pill " + (allCached ? "up" : "bad");
+    overallPill.textContent = allCached ? "all cached" : "degraded";
+    overallText.textContent = allCached
+      ? "every mirrored source’s schema is cached (steady state)."
+      : "one or more sources report an uncached schema — a republish may be in progress.";
+  }
+
+  function setFetched(ok) {
+    lastFetched = new Date();
+    fetchedAt.textContent = lastFetched.toLocaleTimeString();
+  }
+
+  function showFetchError() {
+    overallPill.className = "pill bad";
+    overallPill.textContent = "unreachable";
+    overallText.textContent = "/health did not respond — showing the last known source list.";
+    healthBody.innerHTML = "";
+    healthBody.appendChild(el("tr", null,
+      '<td colspan="4" class="empty" style="color: var(--bad);">' +
+      '<code>/health</code> unreachable.</td>'));
+    renderRelays(FALLBACK_SOURCES, true);
+    srcCount.textContent = String(FALLBACK_SOURCES.length);
+  }
+
+  function refresh() {
+    var started = Date.now();
+    fetch("/health", { cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        var sources = [];
+        if (data && data.sources && typeof data.sources === "object") {
+          Object.keys(data.sources).forEach(function (name) {
+            var s = data.sources[name];
+            if (!s || typeof s !== "object") return;
+            sources.push({
+              name: name,
+              port: s.port,
+              database: s.database,
+              schema_cached: s.schema_cached === true
+            });
+          });
+        }
+        var schemaCount = (typeof data.schema_count === "number")
+          ? data.schema_count : sources.length;
+        var allCached = sources.length > 0 && sources.every(function (s) {
+          return s.schema_cached === true;
+        });
+        setFetched(true);
+        renderRelays(sources, false);
+        renderHealth(sources, schemaCount, allCached);
+      })
+      .catch(function (err) {
+        console.warn("health fetch failed:", err);
+        setFetched(false);
+        showFetchError();
+      });
+  }
+
+  refreshBtn.addEventListener("click", function () {
+    refresh();
+    // nudge the auto-refresh cadence so a manual refresh resets the timer.
+    if (timer) { clearTimeout(timer); timer = null; schedule(); }
+  });
+
+  function schedule() {
+    timer = setTimeout(function () {
+      refresh();
+      schedule();
+    }, 60000);
+  }
+
+  refresh();
+  schedule();
+})();
+</script>
+</body>
+</html>
