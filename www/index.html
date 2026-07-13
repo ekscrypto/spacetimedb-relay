@@ -270,18 +270,20 @@
           <th>Source</th>
           <th>Port</th>
           <th class="hide-sm">Database</th>
-          <th>Schema</th>
+          <th>Status</th>
+          <th class="hide-sm">Throughput</th>
         </tr>
       </thead>
       <tbody id="health-body">
-        <tr><td colspan="4" class="loading">Loading&hellip;</td></tr>
+        <tr><td colspan="5" class="loading">Loading&hellip;</td></tr>
       </tbody>
     </table>
   </div>
   <p class="section-note" style="margin-top: 10px;">
-    Deeper per-instance metrics (upstream/stdb link state, throughput, host
-    memory and disk) are exposed to operators on each instance&rsquo;s loopback
-    dashboard and are not part of the public surface.
+    Status reflects each region&rsquo;s live upstream connection; throughput is
+    incoming data over the last minute. Deeper per-instance metrics
+    (disconnect reasons, 30-minute windows, host memory and disk) remain on
+    each instance&rsquo;s loopback dashboard and are not part of the public surface.
   </p>
 
   <!-- Section 2: SpacetimeDB relays (wss://) -->
@@ -336,7 +338,8 @@
           <td><a class="ep" href="/health" target="_blank" rel="noopener">/health</a></td>
           <td>
             Fleet source map: per-source <code>port</code>, mirror
-            <code>database</code> name, <code>schema_cached</code> flag, and
+            <code>database</code> name, <code>schema_cached</code> flag,
+            live <code>metrics.upstream.state</code> and throughput, and
             total <code>schema_count</code>.
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/health</div>
           </td>
@@ -575,11 +578,45 @@
     sysStats.hidden = false;
   }
 
-  function renderHealth(sources, schemaCount, allCached) {
+  function formatUnits(n) {
+    if (n == null || isNaN(n)) return "—";
+    if (n < 1000) return String(n);
+    var units = ["", "k", "M", "B"];
+    var v = n, i = 0;
+    while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+    return v.toFixed(v < 10 ? 1 : 0) + units[i];
+  }
+
+  // Incoming throughput (units/s and bytes/s) over the upstream 1-minute
+  // window. Falls back to "—" when metrics aren't present (older /health).
+  function upstreamThroughput(s) {
+    var up = s.metrics && s.metrics.upstream;
+    if (!up) return "";
+    var unitsPerSec = up.units_1m != null ? up.units_1m / 60 : null;
+    var bytesPerSec = up.bytes_1m != null ? up.bytes_1m / 60 : null;
+    var main = "", title = [];
+    if (unitsPerSec != null) {
+      main = formatUnits(Math.round(unitsPerSec)) + " units/s";
+    }
+    if (bytesPerSec != null) {
+      main = main ? main + " · " : "";
+      main += formatBytes(bytesPerSec);
+    }
+    if (up.units_5m != null) {
+      title.push("5-min avg: " + Math.round(up.units_5m / 60) + " units/s");
+    }
+    if (up.bytes_5m != null) {
+      title.push("5-min avg: " + formatBytes(up.bytes_5m / 60));
+    }
+    return main ? '<span class="mono" title="' + escapeHtml(title.join("\n")) +
+      '">' + main + "</span>" : "";
+  }
+
+  function renderHealth(sources, schemaCount) {
     healthBody.innerHTML = "";
     if (!sources.length) {
       healthBody.appendChild(el("tr", null,
-        '<td colspan="4" class="empty">No sources reported.</td>'));
+        '<td colspan="5" class="empty">No sources reported.</td>'));
       return;
     }
     sortSources(sources).forEach(function (s) {
@@ -587,19 +624,63 @@
       tr.appendChild(el("td", "src", escapeHtml(s.name)));
       tr.appendChild(el("td", "num mono", String(s.port)));
       tr.appendChild(el("td", "mono hide-sm", escapeHtml(s.database || "—")));
-      var cached = s.schema_cached === true;
+
+      // Status: driven by the live upstream (and local-stdb) connection
+      // state, not by schema cache. "up" requires both links up; "down"
+      // if either is down; otherwise "initial".
+      var m = s.metrics || {};
+      var upState = (m.upstream && m.upstream.state) || "";
+      var lsState = (m.local_stdb && m.local_stdb.state) || "";
+      var state, cls, label;
+      if (upState === "up" && lsState === "up") {
+        state = "up"; cls = "up"; label = "up";
+      } else if (upState === "down" || lsState === "down") {
+        state = "down"; cls = "bad"; label = "down";
+      } else {
+        state = "initial"; cls = "warn"; label = upState || lsState || "initial";
+      }
       tr.appendChild(el("td", null,
-        '<span class="pill ' + (cached ? "up" : "bad") + '">' +
-        (cached ? "cached" : "uncached") + "</span>"));
+        '<span class="pill ' + cls + '" title="' +
+        escapeHtml("upstream: " + (upState || "—") + "\nlocal_stdb: " + (lsState || "—")) +
+        '">' + escapeHtml(label) + "</span>"));
+
+      tr.appendChild(el("td", "num hide-sm", upstreamThroughput(s)));
       healthBody.appendChild(tr);
     });
 
+    // Overall header pill: now reflects real up/down across all sources,
+    // derived from upstream/local_stdb state. Falls back to schema_cached
+    // only when no metrics are reported (older /health).
+    var upCount = 0, downCount = 0, hasMetrics = false;
+    sources.forEach(function (s) {
+      var m = s.metrics && s.metrics.upstream;
+      if (!m) return;
+      hasMetrics = true;
+      if (m.state === "up") upCount++;
+      else if (m.state === "down") downCount++;
+    });
     srcCount.textContent = String(schemaCount != null ? schemaCount : sources.length);
-    overallPill.className = "pill " + (allCached ? "up" : "bad");
-    overallPill.textContent = allCached ? "all cached" : "degraded";
-    overallText.textContent = allCached
-      ? "every mirrored source’s schema is cached (steady state)."
-      : "one or more sources report an uncached schema — a republish may be in progress.";
+    if (hasMetrics) {
+      if (downCount === 0 && upCount === sources.length) {
+        overallPill.className = "pill up";
+        overallPill.textContent = "all up";
+        overallText.textContent = "every region’s upstream connection is live.";
+      } else if (downCount > 0) {
+        overallPill.className = "pill bad";
+        overallPill.textContent = downCount + " down";
+        overallText.textContent = downCount + " of " + sources.length +
+          " sources report a down upstream connection.";
+      } else {
+        overallPill.className = "pill warn";
+        overallPill.textContent = "connecting";
+        overallText.textContent = "one or more sources are still initialising.";
+      }
+    } else {
+      // Legacy /health without metrics — keep a neutral pill.
+      overallPill.className = "pill " + (sources.length ? "up" : "bad");
+      overallPill.textContent = sources.length ? "listed" : "no sources";
+      overallText.textContent = "";
+    }
   }
 
   function setFetched(ok) {
@@ -637,18 +718,16 @@
               name: name,
               port: s.port,
               database: s.database,
-              schema_cached: s.schema_cached === true
+              schema_cached: s.schema_cached === true,
+              metrics: s.metrics || null
             });
           });
         }
         var schemaCount = (typeof data.schema_count === "number")
           ? data.schema_count : sources.length;
-        var allCached = sources.length > 0 && sources.every(function (s) {
-          return s.schema_cached === true;
-        });
         setFetched(true);
         renderRelays(sources, false);
-        renderHealth(sources, schemaCount, allCached);
+        renderHealth(sources, schemaCount);
         renderSystem(data && data.system);
       })
       .catch(function (err) {
