@@ -116,9 +116,13 @@ Logs you should see, in order:
 6. `SubscribeApplied n_tables=…` — initial bulk-load is streaming
    `relay_apply_<table>` calls into the local SpacetimeDB
 
-Downstream clients connect to the **frontend proxy** at
-`ws://relay-host:3009/v1/database/<mirror-database>/subscribe` —
-see the next section for v1 and v2 examples.
+Downstream clients connect to the **frontend proxy**. In production on
+`relay.bitcraftsync.app`, nginx terminates TLS in front of each loopback
+relay, so the public address is
+`wss://relay.bitcraftsync.app:<port>/v1/database/<mirror-database>/subscribe`
+where `<port>` is `3000` (global) or `3000 + regionID`. See the next
+section for v1 and v2 examples, and `PORTS.md` for the full exposure
+scheme.
 
 ## Connecting downstream clients
 
@@ -135,13 +139,14 @@ reducer info, regardless of what's upstream).
 
 ```
 GET /v1/database/<mirror-database>/subscribe?compression=None HTTP/1.1
-Host: relay-host:3009
+Host: relay.bitcraftsync.app:<port>
 Upgrade: websocket
 Sec-WebSocket-Protocol: v2.bsatn.spacetimedb
 ```
 
 Drop-in replacement for the official SpacetimeDB Rust/TS/C# SDK
-configured against `ws://relay-host:3009`. No code changes.
+configured against `wss://relay.bitcraftsync.app:<port>`. No code
+changes.
 
 ### v1.bsatn.spacetimedb (full upstream-flavored TransactionUpdates)
 
@@ -160,7 +165,7 @@ when the upstream is v1; against a v2 upstream the registry stores
 
 ```
 GET /v1/database/<mirror-database>/subscribe?compression=None HTTP/1.1
-Host: relay-host:3009
+Host: relay.bitcraftsync.app:<port>
 Upgrade: websocket
 Sec-WebSocket-Protocol: v1.bsatn.spacetimedb
 ```
