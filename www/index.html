@@ -300,6 +300,14 @@
     for protocol details. Ports with no relay behind them return nginx
     <code>502</code>; only sources reported live by <code>/health</code> are listed.
   </p>
+  <div class="banner warn">
+    <b>Subscriptions only.</b> <code>OneOffQuery</code> is not supported through
+    this relay. Issuing a one-off query will return an error immediately. Use
+    SDK table subscriptions instead &mdash; subscribe to the tables your tool
+    needs and read rows from the local cache. For ad-hoc lookups across all
+    regions, use the convenience HTTP endpoints below (<code>/players</code>,
+    <code>/claims</code>, &hellip;).
+  </div>
   <div class="panel">
     <table>
       <thead>
