@@ -183,7 +183,7 @@
   </div>
 
   <div class="panel" id="local-panel">
-    <h3>Local SpacetimeDB <span id="local-state" class="pill">—</span></h3>
+    <h3>Local SpacetimeDB <span id="local-state" class="pill">—</span> <span id="local-module-dead" style="display:none; font-size:11px; color:var(--warn); margin-left:4px">⚠ module deaths: <span id="local-module-death-count">0</span></span></h3>
     <table>
       <tr><td class="label">database</td><td class="value" id="local-db">—</td></tr>
       <tr><td class="label">last connected</td><td class="value" id="local-up">—</td></tr>
@@ -388,6 +388,9 @@
       document.getElementById('local-db').textContent = m.mirror_database;
       fillLink('upstream', m.upstream, m.now);
       fillLink('local', m.local_stdb, m.now);
+      var mdc = m.local_stdb.module_death_count || 0;
+      document.getElementById('local-module-dead').style.display = mdc > 0 ? '' : 'none';
+      document.getElementById('local-module-death-count').textContent = mdc;
       document.getElementById('local-inflight').textContent =
         fmt.format(m.in_flight.max - m.in_flight.available) +
         ' / ' + fmt.format(m.in_flight.max);

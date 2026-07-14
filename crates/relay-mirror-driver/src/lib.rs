@@ -13,6 +13,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::watch;
+
 pub mod registry;
 pub use registry::{MetaEntry, MetaRegistry};
 
@@ -118,6 +120,10 @@ pub struct MirrorDriver {
     /// Optional so callers that don't need it (tests, spikes) can
     /// pass `None`.
     meta_registry: Option<Arc<MetaRegistry>>,
+    /// Fires `true` when `drain_responses` detects a module-level
+    /// fatal error ("The instance encountered a fatal error.").
+    /// stdb_mode selects on a clone of this to trigger auto-republish.
+    module_dead: watch::Receiver<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,7 +144,12 @@ impl MirrorDriver {
         let captured = read_initial_connection(&mut conn).await?;
         let (sink, stream) = conn.split();
         let in_flight = Arc::new(Semaphore::new(cfg.max_in_flight));
-        let drain_handle = Some(tokio::spawn(drain_responses(stream, in_flight.clone())));
+        let (dead_tx, module_dead) = watch::channel(false);
+        let drain_handle = Some(tokio::spawn(drain_responses(
+            stream,
+            in_flight.clone(),
+            dead_tx,
+        )));
         Ok(Self {
             sink,
             in_flight,
@@ -148,7 +159,15 @@ impl MirrorDriver {
             max_bytes_per_apply: cfg.max_bytes_per_apply,
             captured: Some(captured),
             meta_registry: None,
+            module_dead,
         })
+    }
+
+    /// Returns a receiver that fires `true` when the local stdb mirror
+    /// module has suffered a fatal internal error (WASM panic).
+    /// `stdb_mode` selects on this to trigger an automatic republish.
+    pub fn module_dead_receiver(&self) -> watch::Receiver<bool> {
+        self.module_dead.clone()
     }
 
     /// Wire a [`MetaRegistry`] into this driver. Subsequent
@@ -346,17 +365,28 @@ async fn open_ws(cfg: &DriverConfig) -> Result<Conn, DriverError> {
     Ok(ws)
 }
 
-async fn drain_responses(mut stream: Stream, in_flight: Arc<Semaphore>) {
+async fn drain_responses(
+    mut stream: Stream,
+    in_flight: Arc<Semaphore>,
+    dead_tx: watch::Sender<bool>,
+) {
     let mut warn_budget = 5u8;
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(Message::Binary(bytes)) => {
                 in_flight.add_permits(1);
-                decode_reducer_errors(&bytes);
+                if decode_reducer_errors(&bytes) && !*dead_tx.borrow() {
+                    // A single "fatal error" from stdb means the WASM
+                    // module has crashed and been unregistered. Signal
+                    // stdb_mode to force-republish.
+                    let _ = dead_tx.send(true);
+                }
             }
             Ok(Message::Text(bytes)) => {
                 in_flight.add_permits(1);
-                decode_reducer_errors(bytes.as_bytes());
+                if decode_reducer_errors(bytes.as_bytes()) && !*dead_tx.borrow() {
+                    let _ = dead_tx.send(true);
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -370,21 +400,19 @@ async fn drain_responses(mut stream: Stream, in_flight: Arc<Semaphore>) {
     tracing::debug!(target: "relay::mirror_driver", "drainer task exited");
 }
 
-/// Inspect a local-stdb response for a failed reducer and log it. The
-/// stdb sends a `ReducerResult` with `result=Err(...)` or
-/// `InternalError(msg)` when a `relay_apply_<table>` reducer errors.
-/// Without this the exact failure reason is invisible — `apply()`
-/// already returned Ok (the WS send succeeded), and the only sign of
-/// failure is the connection dropping shortly after.
-fn decode_reducer_errors(bytes: &[u8]) {
+/// Inspect a local-stdb response for a failed reducer and log it.
+/// Returns `true` if the error indicates the WASM module has suffered
+/// a fatal/unrecoverable crash ("The instance encountered a fatal
+/// error."). The caller uses this to signal that a republish is needed.
+fn decode_reducer_errors(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
-        return;
+        return false;
     }
     // Strip the 1-byte compression tag (we negotiated compression=None,
     // so byte 0 should be 0x00).
     let body = if bytes[0] == 0 { &bytes[1..] } else { bytes };
     let Ok(server_msg) = bsatn::from_slice::<ServerMessage>(body) else {
-        return;
+        return false;
     };
     if let ServerMessage::ReducerResult(rr) = &server_msg {
         match &rr.result {
@@ -403,10 +431,17 @@ fn decode_reducer_errors(bytes: &[u8]) {
                     error = %msg,
                     "local stdb reducer failed (internal error / panic)"
                 );
+                // SpacetimeDB emits this exact phrase when the WASM
+                // module panics and is terminated. It is never a
+                // transient or per-row condition — the module is dead.
+                if msg.contains("fatal error") {
+                    return true;
+                }
             }
             _ => {}
         }
     }
+    false
 }
 
 /// Split the row lists so each chunk obeys both `max_rows` and

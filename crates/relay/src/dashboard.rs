@@ -145,6 +145,10 @@ pub struct LinkMetrics {
     /// Per-window byte / unit counts for the last 30 minutes.
     bytes_window: SlidingCounter,
     units_window: SlidingCounter,
+    /// Lifetime count of times the local mirror module was detected
+    /// dead (WASM panic) and a force-republish was triggered.
+    /// Only meaningful on `local_stdb`; always 0 on `upstream`.
+    pub module_death_count: AtomicU64,
 }
 
 impl LinkMetrics {
@@ -158,7 +162,12 @@ impl LinkMetrics {
             total_units: AtomicU64::new(0),
             bytes_window: SlidingCounter::new(),
             units_window: SlidingCounter::new(),
+            module_death_count: AtomicU64::new(0),
         }
+    }
+
+    pub fn mark_module_dead(&self) {
+        self.module_death_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn mark_up(&self) {
@@ -394,6 +403,7 @@ fn link_snapshot(m: &LinkMetrics) -> LinkSnapshot {
         units_1m: m.units_window.last_minutes(1),
         units_5m: m.units_window.last_minutes(5),
         units_30m: m.units_window.last_minutes(30),
+        module_death_count: m.module_death_count.load(Ordering::Relaxed),
     }
 }
 
@@ -433,6 +443,14 @@ pub struct LinkSnapshot {
     pub units_1m: u64,
     pub units_5m: u64,
     pub units_30m: u64,
+    /// Lifetime count of module-fatal-error events; nonzero means
+    /// at least one WASM panic was detected this run.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub module_death_count: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize)]
