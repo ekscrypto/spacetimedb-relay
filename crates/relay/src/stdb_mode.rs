@@ -21,7 +21,6 @@
 //!   exponential backoff on disconnect.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -247,6 +246,55 @@ pub async fn run(
             };
         }
 
+        // --- Decoupled apply pipeline ---
+        //
+        // The upstream WS read path and the local-stdb apply path run on
+        // separate tasks connected by an unbounded channel. The reader
+        // task (the 'reconnect inner loop below) drains the upstream
+        // socket immediately and pushes ApplyJobs to the channel without
+        // ever blocking on the local stdb. The applier task owns the
+        // MirrorDriver and drains the channel at its own pace.
+        //
+        // Why unbounded: if the apply channel were bounded and the
+        // applier fell behind, the reader would block on channel.send(),
+        // the upstream WS read buffer would fill, and the upstream would
+        // kill the connection for being unresponsive — the exact failure
+        // this decoupling prevents. Memory is bounded by Bytes
+        // refcounts and the driver's own 8K in-flight semaphore.
+        let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<ApplyJob>();
+        let metrics_clone = metrics.clone();
+        let mut apply_driver = driver;
+        let apply_handle = tokio::spawn(async move {
+            loop {
+                let Some(job) = apply_rx.recv().await else { break };
+                let stats = match apply_driver
+                    .apply(&job.table, job.meta.as_ref(), job.deletes, job.inserts)
+                    .await
+                {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        // Log but do NOT tear down the connection. One
+                        // bad table (e.g. a missing reducer from a schema
+                        // mismatch) should not kill the subscription for
+                        // all other tables.
+                        tracing::warn!(
+                            target: "relay::stdb_mode",
+                            table = %job.table,
+                            error = %e,
+                            "apply failed for table — skipping, connection stays up"
+                        );
+                        continue;
+                    }
+                };
+                metrics_clone
+                    .local_stdb
+                    .record_traffic(stats.bytes_sent, stats.calls);
+            }
+            // Channel closed (reader dropped the sender) — return the
+            // driver so the reconnect loop can reuse it.
+            apply_driver
+        });
+
         let mut connected_at: Option<std::time::Instant> = None;
         let exit_reason = loop {
             let event = tokio::select! {
@@ -271,45 +319,20 @@ pub async fn run(
                     let protocol = frame.protocol;
                     match frame.decode() {
                         Ok((message, meta)) => {
-                            let mode = if sequential {
-                                SubscribeMode::Sequential(&mut sequential_progress)
-                            } else {
-                                SubscribeMode::All
-                            };
-                            if let Err(e) = handle_message(
+                            // Lightweight: decode + extract apply jobs +
+                            // advance subscribe state. Never blocks on
+                            // the local stdb — all apply work goes to
+                            // the channel.
+                            dispatch_message(
                                 message,
                                 meta,
                                 &subscribe_tables,
                                 &cmd_tx,
-                                &mut driver,
-                                &metrics,
-                                mode,
+                                &apply_tx,
+                                &mut sequential_progress,
+                                sequential,
                             )
-                            .await
-                            {
-                                // Print the full error chain, not just the
-                                // top-level context. The `.with_context()`
-                                // wrappers add "driver.apply for <table>"
-                                // but the underlying cause — WS reset,
-                                // decode failure, etc. — lives in the source
-                                // chain and is the part we actually need to
-                                // diagnose the failure.
-                                let mut chain = String::new();
-                                let mut source: Option<&dyn std::error::Error> = e.source();
-                                while let Some(s) = source {
-                                    chain.push_str(" → ");
-                                    chain.push_str(&s.to_string());
-                                    source = s.source();
-                                }
-                                tracing::error!(
-                                    target: "relay::stdb_mode",
-                                    error = %e,
-                                    source_chain = %chain,
-                                    "failed to apply upstream message"
-                                );
-                                metrics.local_stdb.mark_down(Some(format!("{e}")));
-                                break InnerExit::UpstreamGone;
-                            }
+                            .await;
                         }
                         Err(e) => tracing::warn!(
                             target: "relay::stdb_mode",
@@ -319,9 +342,6 @@ pub async fn run(
                             "failed to decode ServerMessage"
                         ),
                     }
-                    metrics
-                        .available_permits
-                        .store(driver.available_permits() as u64, Ordering::Relaxed);
                     if let Some(limit) = cfg.frame_limit {
                         if frames >= limit {
                             tracing::info!(target: "relay::stdb_mode", frames, "frame limit reached");
@@ -339,9 +359,24 @@ pub async fn run(
             }
         };
 
+        // Shut down the upstream connection.
         let _ = cmd_tx.send(UpstreamCommand::Shutdown).await;
         drop(cmd_tx);
         let _ = upstream_handle.await;
+
+        // Drain the apply pipeline and recover the driver.
+        drop(apply_tx);
+        driver = match apply_handle.await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(
+                    target: "relay::stdb_mode",
+                    error = %e,
+                    "apply task panicked — cannot recover driver"
+                );
+                return Err(anyhow!("apply task panicked: {e}"));
+            }
+        };
 
         match exit_reason {
             InnerExit::Shutdown => {
@@ -385,12 +420,14 @@ struct SequentialState {
     in_flight_query_id: Option<u32>,
 }
 
-enum SubscribeMode<'a> {
-    /// Single set-replace `Subscribe` with all tables (legacy).
-    All,
-    /// Sequential per-table `SubscribeMulti`. The state tracks
-    /// progress through the table list.
-    Sequential(&'a mut SequentialState),
+/// One unit of work for the applier task: apply a batch of row changes
+/// for a single table to the local stdb. Produced by the reader task
+/// from decoded `SubscribeApplied` and `TransactionUpdate` frames.
+struct ApplyJob {
+    table: String,
+    meta: Option<UpstreamReducerMeta>,
+    deletes: Vec<Bytes>,
+    inserts: Vec<Bytes>,
 }
 
 fn load_identity_token(path: &std::path::Path) -> Option<String> {
@@ -443,15 +480,23 @@ fn save_identity_token(path: &std::path::Path, token: &str) -> std::io::Result<(
     Ok(())
 }
 
-async fn handle_message(
+/// Lightweight dispatch of a decoded upstream `ServerMessage`. Runs on
+/// the reader task — must never block on the local stdb. Extracts row
+/// data into `ApplyJob`s pushed to the apply channel, and handles
+/// subscribe-state-machine advancement inline.
+///
+/// `apply_tx` is unbounded, so `send()` never blocks. This is what
+/// keeps the upstream socket draining even when the local-stdb applier
+/// is slow.
+async fn dispatch_message(
     message: ServerMessage,
     meta: Option<UpstreamReducerMeta>,
     subscribe_tables: &[String],
     cmd_tx: &mpsc::Sender<UpstreamCommand>,
-    driver: &mut MirrorDriver,
-    metrics: &Arc<Metrics>,
-    mut mode: SubscribeMode<'_>,
-) -> Result<()> {
+    apply_tx: &mpsc::UnboundedSender<ApplyJob>,
+    sequential_progress: &mut SequentialState,
+    sequential: bool,
+) {
     match message {
         ServerMessage::InitialConnection(ic) => {
             tracing::info!(
@@ -462,24 +507,28 @@ async fn handle_message(
                 "InitialConnection"
             );
             if !subscribe_tables.is_empty() {
-                match &mut mode {
-                    SubscribeMode::All => {
-                        let queries: Vec<String> = subscribe_tables
-                            .iter()
-                            .map(|t| format!("SELECT * FROM {t}"))
-                            .collect();
-                        cmd_tx
-                            .send(UpstreamCommand::Subscribe {
-                                request_id: 1,
-                                query_set_id: 1,
-                                queries,
-                            })
-                            .await
-                            .map_err(|_| anyhow!("upstream command channel closed"))?;
+                if sequential {
+                    if let Err(e) =
+                        send_next_sequential(sequential_progress, subscribe_tables, cmd_tx).await
+                    {
+                        tracing::error!(
+                            target: "relay::stdb_mode",
+                            error = %e,
+                            "failed to send first sequential subscribe"
+                        );
                     }
-                    SubscribeMode::Sequential(state) => {
-                        send_next_sequential(state, subscribe_tables, cmd_tx).await?;
-                    }
+                } else {
+                    let queries: Vec<String> = subscribe_tables
+                        .iter()
+                        .map(|t| format!("SELECT * FROM {t}"))
+                        .collect();
+                    let _ = cmd_tx
+                        .send(UpstreamCommand::Subscribe {
+                            request_id: 1,
+                            query_set_id: 1,
+                            queries,
+                        })
+                        .await;
                 }
             }
         }
@@ -491,6 +540,7 @@ async fn handle_message(
                 n_tables = sa.rows.tables.len(),
                 "SubscribeApplied"
             );
+            // Extract row data into apply jobs — no blocking apply here.
             for table in sa.rows.tables.iter() {
                 let upstream_name: &str = table.table.as_ref();
                 let inserts: Vec<Bytes> = table.rows.into_iter().collect();
@@ -501,25 +551,36 @@ async fn handle_message(
                     target: "relay::stdb_mode",
                     table = %upstream_name,
                     rows = inserts.len(),
-                    "applying initial subscribe rows"
+                    "queuing initial subscribe rows"
                 );
-                // Initial subscribe-applied has no upstream reducer
-                // cause — pass None so downstream sees the raw apply
-                // call only.
-                let stats = driver
-                    .apply(upstream_name, None, Vec::new(), inserts)
-                    .await
-                    .with_context(|| format!("driver.apply for {upstream_name}"))?;
-                metrics
-                    .local_stdb
-                    .record_traffic(stats.bytes_sent, stats.calls);
+                let _ = apply_tx.send(ApplyJob {
+                    table: upstream_name.to_string(),
+                    meta: None,
+                    deletes: Vec::new(),
+                    inserts,
+                });
             }
-            // Sequential mode: this SubscribeApplied acks the in-flight
-            // SubscribeMulti — advance to the next table.
-            if let SubscribeMode::Sequential(state) = &mut mode {
-                state.in_flight_query_id = None;
-                if state.next_idx < subscribe_tables.len() {
-                    send_next_sequential(state, subscribe_tables, cmd_tx).await?;
+            // Advance the sequential subscribe state machine
+            // immediately — do NOT wait for the apply to finish before
+            // requesting the next table. This lets the upstream send
+            // the next table's data sooner and keeps the read path
+            // moving.
+            if sequential {
+                sequential_progress.in_flight_query_id = None;
+                if sequential_progress.next_idx < subscribe_tables.len() {
+                    if let Err(e) = send_next_sequential(
+                        sequential_progress,
+                        subscribe_tables,
+                        cmd_tx,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            target: "relay::stdb_mode",
+                            error = %e,
+                            "failed to send next sequential subscribe"
+                        );
+                    }
                 } else {
                     tracing::info!(
                         target: "relay::stdb_mode",
@@ -530,11 +591,7 @@ async fn handle_message(
             }
         }
         ServerMessage::TransactionUpdate(tu) => {
-            // The same upstream meta (caller / timestamp / reducer
-            // name / args) covers every TableUpdate inside this v1
-            // TransactionUpdate, so we forward `meta` to each per-
-            // table apply call. v2 upstreams produce `meta = None`
-            // (no caller info on the wire).
+            // Extract per-table row changes into apply jobs.
             for set in tu.query_sets.iter() {
                 for table in set.tables.iter() {
                     let upstream_name: &str = table.table_name.as_ref();
@@ -554,13 +611,12 @@ async fn handle_message(
                     if deletes.is_empty() && inserts.is_empty() {
                         continue;
                     }
-                    let stats = driver
-                        .apply(upstream_name, meta.as_ref(), deletes, inserts)
-                        .await
-                        .with_context(|| format!("driver.apply for {upstream_name}"))?;
-                    metrics
-                        .local_stdb
-                        .record_traffic(stats.bytes_sent, stats.calls);
+                    let _ = apply_tx.send(ApplyJob {
+                        table: upstream_name.to_string(),
+                        meta: meta.clone(),
+                        deletes,
+                        inserts,
+                    });
                 }
             }
         }
@@ -568,7 +624,6 @@ async fn handle_message(
         // not propagated to the local stdb.
         _ => {}
     }
-    Ok(())
 }
 
 /// Send the next pending `SubscribeMulti` for the table at
