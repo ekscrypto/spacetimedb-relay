@@ -99,6 +99,9 @@ if u.get("state") != "up":
     notes.append("upstream=%s" % u.get("state"))
 if l.get("state") != "up":
     notes.append("stdb=%s" % l.get("state"))
+mdc = l.get("module_death_count", 0)
+if mdc:
+    notes.append("module_deaths=%d" % mdc)
 reason = u.get("last_disconnect_reason")
 if reason:
     notes.append("last_reason=%s" % reason)

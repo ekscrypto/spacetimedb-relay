@@ -157,6 +157,7 @@ pub async fn run(
         .await
         .context("relay_bind_writer on local stdb")?;
     tracing::info!(target: "relay::stdb_mode", database = %cfg.mirror_database, "bound writer on local stdb");
+    let mut module_dead = driver.module_dead_receiver();
 
     // 3. Resolve the table list to subscribe to upstream — same logic
     //    as the legacy path: explicit `--subscribe-table` wins,
@@ -213,6 +214,7 @@ pub async fn run(
         Shutdown,
         UpstreamGone,
         FrameLimitReached,
+        ModuleDead,
     }
 
     // Sequential-mode state. Outside the reconnect loop so it persists
@@ -300,6 +302,15 @@ pub async fn run(
             let event = tokio::select! {
                 biased;
                 _ = shutdown.as_mut() => break InnerExit::Shutdown,
+                r = module_dead.changed() => {
+                    // Fires when drain_responses detected a WASM fatal error.
+                    // Also fires (Err) if the sender was dropped (driver
+                    // disconnected) — only treat as ModuleDead on Ok + true.
+                    if r.is_ok() && *module_dead.borrow() {
+                        break InnerExit::ModuleDead;
+                    }
+                    continue;
+                }
                 event = event_rx.recv() => match event {
                     Some(e) => e,
                     None => break InnerExit::UpstreamGone,
@@ -384,6 +395,82 @@ pub async fn run(
                 break 'reconnect;
             }
             InnerExit::FrameLimitReached => break 'reconnect,
+            InnerExit::ModuleDead => {
+                tracing::error!(
+                    target: "relay::stdb_mode",
+                    database = %cfg.mirror_database,
+                    "local stdb module fatal — forcing republish and reconnect"
+                );
+                metrics.upstream.mark_down(Some("module dead — republishing".into()));
+                metrics.local_stdb.mark_down(Some("module dead".into()));
+                metrics.local_stdb.mark_module_dead();
+
+                // Close the dead driver.
+                let _ = driver.close().await;
+
+                // Delete the cached fingerprint so publish_if_drifted
+                // treats this as a fresh run and re-publishes unconditionally.
+                let fp_path = cfg.publisher_workdir.join("fingerprint.json");
+                if let Err(e) = std::fs::remove_file(&fp_path) {
+                    tracing::warn!(
+                        target: "relay::stdb_mode",
+                        path = %fp_path.display(),
+                        error = %e,
+                        "could not remove fingerprint before force-republish"
+                    );
+                }
+
+                let outcome = publisher
+                    .publish_if_drifted(&raw_schema)
+                    .await
+                    .context("force republish after module death")?;
+                tracing::info!(
+                    target: "relay::stdb_mode",
+                    republished = outcome.republished,
+                    fingerprint = %outcome.fingerprint,
+                    "force-republish complete"
+                );
+                metrics.publisher.record(&outcome.fingerprint, outcome.republished);
+
+                // Reconnect driver with the same (persisted) identity token.
+                let identity_token = if cfg.identity_token.is_some() {
+                    cfg.identity_token.clone()
+                } else {
+                    load_identity_token(&cfg.identity_token_file)
+                };
+                driver = MirrorDriver::connect(DriverConfig {
+                    stdb_url: cfg.stdb_url.clone(),
+                    database: cfg.mirror_database.clone(),
+                    identity_token,
+                    ..Default::default()
+                })
+                .await
+                .context("reconnect to local stdb after force-republish")?;
+                driver.set_meta_registry(meta_registry.clone());
+                metrics.local_stdb.mark_up();
+                if let Some(captured) = driver.captured() {
+                    if let Err(e) = save_identity_token(&cfg.identity_token_file, &captured.token) {
+                        tracing::warn!(
+                            target: "relay::stdb_mode",
+                            error = %e,
+                            "failed to persist identity token after reconnect"
+                        );
+                    }
+                }
+                driver
+                    .bind_writer()
+                    .await
+                    .context("relay_bind_writer after force-republish")?;
+                module_dead = driver.module_dead_receiver();
+
+                tracing::info!(
+                    target: "relay::stdb_mode",
+                    database = %cfg.mirror_database,
+                    "driver reconnected after force-republish — restarting upstream subscription"
+                );
+                backoff_secs = 1;
+                continue 'reconnect;
+            }
             InnerExit::UpstreamGone => {
                 let stayed_up = connected_at.map(|t| t.elapsed()).unwrap_or_default();
                 if stayed_up >= STABLE_THRESHOLD {
