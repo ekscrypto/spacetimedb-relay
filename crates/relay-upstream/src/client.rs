@@ -193,6 +193,8 @@ pub enum UpstreamError {
     Decode(String),
     #[error("BSATN encode failed: {0}")]
     Encode(String),
+    #[error("liveness probe timed out — upstream did not respond to OneOffQuery within {0}s")]
+    ProbeTimeout(u64),
 }
 
 pub fn server_tag_name(tag: u8, protocol: ProtocolVersion) -> &'static str {
@@ -344,6 +346,40 @@ pub async fn connect_and_run(
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // --- Liveness probe ---
+    //
+    // WS-level Pings/Pongs only prove the TCP flow (or a proxy in
+    // between) is alive — they don't prove the upstream *application*
+    // is processing requests. Every PROBE_INTERVAL we send a v1
+    // OneOffQuery ("SELECT 1"); if we don't receive any frame within
+    // PROBE_TIMEOUT seconds, the connection is presumed dead and we
+    // force a reconnect. This catches the "up but silent" failure mode
+    // where the WebSocket stays open but the game server behind it has
+    // stopped sending data.
+    const PROBE_INTERVAL: Duration = Duration::from_secs(60);
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+    const PROBE_MESSAGE_ID: &[u8] = b"RELAY_PROBE";
+    // v1 server tag for OneOffQueryResponse is 4, v2 is 5.
+    const V1_TAG_ONE_OFF_QUERY_RESPONSE: u8 = 4;
+    const V2_TAG_ONE_OFF_QUERY_RESULT: u8 = 5;
+    let probe_response_tag = match config.protocol {
+        ProtocolVersion::V1 => V1_TAG_ONE_OFF_QUERY_RESPONSE,
+        ProtocolVersion::V2 => V2_TAG_ONE_OFF_QUERY_RESULT,
+    };
+    let mut probe_interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + PROBE_INTERVAL, PROBE_INTERVAL);
+    probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // probe_answered = true means no probe is in-flight (either we
+    // haven't sent the first one yet, or the last one was answered).
+    // false means we sent a probe and are awaiting a response.
+    let mut probe_answered = true;
+    let mut probe_sent_at: Option<std::time::Instant> = None;
+    // Poll every 5s — cheap, and fine-grained enough for a 30s timeout.
+    let mut deadline_poll = tokio::time::interval(Duration::from_secs(5));
+    deadline_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Don't fire immediately (tick 0); first poll after 5s.
+    deadline_poll.tick().await;
+
     let result: Result<(), UpstreamError> = async {
         loop {
             iter_count.fetch_add(1, Ordering::Relaxed);
@@ -357,6 +393,21 @@ pub async fn connect_and_run(
                             last_event_ms.store(now_ms(), Ordering::Relaxed);
                             match decode_frame(&data, config.compression, config.protocol) {
                                 Ok(frame) => {
+                                    // Intercept probe responses — don't
+                                    // forward them downstream. Any
+                                    // OneOffQuery response means our probe
+                                    // was answered.
+                                    if frame.server_tag() == probe_response_tag {
+                                        if !probe_answered {
+                                            debug!(
+                                                target: "relay::upstream",
+                                                "probe response received"
+                                            );
+                                            probe_answered = true;
+                                            probe_sent_at = None;
+                                        }
+                                        continue;
+                                    }
                                     debug!(
                                         target: "relay::upstream",
                                         tag = frame.server_tag(),
@@ -465,6 +516,41 @@ pub async fn connect_and_run(
                                 .send(UpstreamEvent::Disconnected { reason: "shutdown".into() })
                                 .await;
                             return Ok(());
+                        }
+                    }
+                }
+                _ = probe_interval.tick() => {
+                    // Send the liveness probe. Any frame received before
+                    // the deadline resets probe_answered.
+                    let frame = match config.protocol {
+                        ProtocolVersion::V1 => {
+                            v1_compat::encode_one_off_query(PROBE_MESSAGE_ID, "SELECT 1")?
+                        }
+                        ProtocolVersion::V2 => {
+                            return Err(UpstreamError::Encode(
+                                "probe not implemented for v2 protocol".into(),
+                            ));
+                        }
+                    };
+                    debug!(target: "relay::upstream", "sending liveness probe");
+                    sock.send(Message::Binary(frame)).await?;
+                    probe_answered = false;
+                    probe_sent_at = Some(std::time::Instant::now());
+                }
+                _ = deadline_poll.tick() => {
+                    // Check if the probe has timed out. This poll fires
+                    // every 5s; we only act when a probe is in-flight
+                    // and the timeout has elapsed.
+                    if !probe_answered {
+                        if let Some(sent_at) = probe_sent_at {
+                            if sent_at.elapsed() >= PROBE_TIMEOUT {
+                                warn!(
+                                    target: "relay::upstream",
+                                    timeout_secs = PROBE_TIMEOUT.as_secs(),
+                                    "liveness probe timed out — forcing reconnect"
+                                );
+                                return Err(UpstreamError::ProbeTimeout(PROBE_TIMEOUT.as_secs()));
+                            }
                         }
                     }
                 }

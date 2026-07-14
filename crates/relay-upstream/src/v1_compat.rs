@@ -92,6 +92,18 @@ pub fn encode_subscribe_multi(
     spacetimedb_lib_v1::bsatn::to_vec(&msg).map_err(|e| UpstreamError::Encode(e.to_string()))
 }
 
+/// Encode a v1 `OneOffQuery` — used for the liveness probe. The
+/// `message_id` is echoed back in the `OneOffQueryResponse` so the
+/// caller can correlate request and response (though the relay is the
+/// only sender on this connection, so any response is necessarily ours).
+pub fn encode_one_off_query(message_id: &[u8], query: &str) -> Result<Vec<u8>, UpstreamError> {
+    let msg = v1::ClientMessage::<Box<[u8]>>::OneOffQuery(v1::OneOffQuery {
+        message_id: message_id.to_vec().into_boxed_slice(),
+        query_string: query.to_string().into_boxed_str(),
+    });
+    spacetimedb_lib_v1::bsatn::to_vec(&msg).map_err(|e| UpstreamError::Encode(e.to_string()))
+}
+
 fn translate_server_message(
     msg: v1::ServerMessage<v1::BsatnFormat>,
 ) -> Result<(v2::ServerMessage, Option<UpstreamReducerMeta>), UpstreamError> {
@@ -171,10 +183,36 @@ fn translate_server_message(
                 None,
             ))
         }
+        v1::ServerMessage::OneOffQueryResponse(oqr) => {
+            // Translate the v1 OneOffQueryResponse to v2
+            // OneOffQueryResult. The relay's liveness probe intercepts
+            // this frame in connect_and_run before it reaches the
+            // translate layer, but we handle it here for correctness.
+            let result = match oqr.error {
+                Some(err) => Err(err),
+                None => Ok(v2::QueryRows {
+                    tables: oqr
+                        .tables
+                        .iter()
+                        .map(|t| v2::SingleTableRows {
+                            table: String::from(&*t.table_name).into(),
+                            rows: merge_v1_lists(&[t.rows.clone()]),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                }),
+            };
+            Ok((
+                v2::ServerMessage::OneOffQueryResult(v2::OneOffQueryResult {
+                    request_id: TRANSLATED_REQUEST_ID,
+                    result,
+                }),
+                None,
+            ))
+        }
         v1::ServerMessage::SubscribeApplied(_)
         | v1::ServerMessage::UnsubscribeApplied(_)
         | v1::ServerMessage::UnsubscribeMultiApplied(_)
-        | v1::ServerMessage::OneOffQueryResponse(_)
         | v1::ServerMessage::ProcedureResult(_) => Err(UpstreamError::Decode(format!(
             "unexpected v1 ServerMessage variant: {}",
             v1_variant_name(&msg)
