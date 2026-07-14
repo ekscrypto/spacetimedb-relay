@@ -22,7 +22,7 @@ use futures_util::{SinkExt, StreamExt};
 use http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 pub use relay_protocol::UpstreamReducerMeta;
 use spacetimedb_client_api_messages::websocket::v2::{
-    CallReducer, CallReducerFlags, ClientMessage, ServerMessage,
+    CallReducer, CallReducerFlags, ClientMessage, ReducerOutcome, ServerMessage,
 };
 use spacetimedb_sats::bsatn;
 use thiserror::Error;
@@ -350,8 +350,13 @@ async fn drain_responses(mut stream: Stream, in_flight: Arc<Semaphore>) {
     let mut warn_budget = 5u8;
     while let Some(msg) = stream.next().await {
         match msg {
-            Ok(Message::Binary(_)) | Ok(Message::Text(_)) => {
+            Ok(Message::Binary(bytes)) => {
                 in_flight.add_permits(1);
+                decode_reducer_errors(&bytes);
+            }
+            Ok(Message::Text(bytes)) => {
+                in_flight.add_permits(1);
+                decode_reducer_errors(bytes.as_bytes());
             }
             Ok(_) => {}
             Err(e) => {
@@ -363,6 +368,45 @@ async fn drain_responses(mut stream: Stream, in_flight: Arc<Semaphore>) {
         }
     }
     tracing::debug!(target: "relay::mirror_driver", "drainer task exited");
+}
+
+/// Inspect a local-stdb response for a failed reducer and log it. The
+/// stdb sends a `ReducerResult` with `result=Err(...)` or
+/// `InternalError(msg)` when a `relay_apply_<table>` reducer errors.
+/// Without this the exact failure reason is invisible — `apply()`
+/// already returned Ok (the WS send succeeded), and the only sign of
+/// failure is the connection dropping shortly after.
+fn decode_reducer_errors(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    // Strip the 1-byte compression tag (we negotiated compression=None,
+    // so byte 0 should be 0x00).
+    let body = if bytes[0] == 0 { &bytes[1..] } else { &bytes[..] };
+    let Ok(server_msg) = bsatn::from_slice::<ServerMessage>(body) else {
+        return;
+    };
+    if let ServerMessage::ReducerResult(rr) = &server_msg {
+        match &rr.result {
+            ReducerOutcome::Err(err_bytes) => {
+                tracing::error!(
+                    target: "relay::mirror_driver",
+                    request_id = rr.request_id,
+                    error_bytes_len = err_bytes.len(),
+                    "local stdb reducer returned a structured error"
+                );
+            }
+            ReducerOutcome::InternalError(msg) => {
+                tracing::error!(
+                    target: "relay::mirror_driver",
+                    request_id = rr.request_id,
+                    error = %msg,
+                    "local stdb reducer failed (internal error / panic)"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Split the row lists so each chunk obeys both `max_rows` and
