@@ -708,15 +708,14 @@
     fetchError.style.display = "";
     sysStats.hidden = true;
     if (!everFetched) {
-      // No prior data — give the tables a meaningful initial state.
-      healthBody.innerHTML =
-        '<tr><td colspan="5" class="empty" style="color:var(--bad);">' +
-        '<code>/health</code> unreachable.</td></tr>';
+      // No prior data for the relay table — show the hardcoded fallback
+      // addresses so users can still try to connect. The health table is
+      // left as "Loading…"; the pill + error badge above it are enough.
       renderRelays(FALLBACK_SOURCES, true);
       srcCount.textContent = String(FALLBACK_SOURCES.length);
     }
-    // When we do have prior data, leave the tables intact so users can
-    // still read the last-known state.
+    // With prior data both tables are left intact — users keep the last
+    // known state while waiting for /health to recover.
   }
 
   function refresh() {
