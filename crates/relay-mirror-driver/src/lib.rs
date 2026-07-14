@@ -382,7 +382,7 @@ fn decode_reducer_errors(bytes: &[u8]) {
     }
     // Strip the 1-byte compression tag (we negotiated compression=None,
     // so byte 0 should be 0x00).
-    let body = if bytes[0] == 0 { &bytes[1..] } else { &bytes[..] };
+    let body = if bytes[0] == 0 { &bytes[1..] } else { bytes };
     let Ok(server_msg) = bsatn::from_slice::<ServerMessage>(body) else {
         return;
     };
