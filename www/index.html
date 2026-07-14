@@ -234,7 +234,7 @@
   <!-- Section 1: System health -->
   <h2>System health</h2>
   <div class="meta-row">
-    <span class="left"><b id="src-count">–</b> sources mirrored &middot; fetched <span id="fetched-at">never</span></span>
+    <span class="left"><b id="src-count">–</b> sources mirrored &middot; fetched <span id="fetched-at">never</span><span id="fetch-error" style="display:none; color:var(--bad); margin-left:6px; font-size:12px;"></span></span>
     <button class="refresh" id="refresh-btn" type="button">Refresh</button>
   </div>
   <div class="stats" id="sys-stats" hidden>
@@ -397,7 +397,9 @@
   var fetchedAt = document.getElementById("fetched-at");
   var refreshBtn = document.getElementById("refresh-btn");
   var sysStats = document.getElementById("sys-stats");
+  var fetchError = document.getElementById("fetch-error");
   var lastFetched = null;
+  var everFetched = false;
   var timer = null;
 
   // Known region set as a degraded fallback if /health is unreachable.
@@ -587,7 +589,7 @@
     return v.toFixed(v < 10 ? 1 : 0) + units[i];
   }
 
-  // Incoming throughput (units/s and bytes/s) over the upstream 1-minute
+  // Incoming throughput (updates/s and bytes/s) over the upstream 1-minute
   // window. Falls back to "—" when metrics aren't present (older /health).
   function upstreamThroughput(s) {
     var up = s.metrics && s.metrics.upstream;
@@ -596,14 +598,14 @@
     var bytesPerSec = up.bytes_1m != null ? up.bytes_1m / 60 : null;
     var main = "", title = [];
     if (unitsPerSec != null) {
-      main = formatUnits(Math.round(unitsPerSec)) + " units/s";
+      main = formatUnits(Math.round(unitsPerSec)) + " updates/s";
     }
     if (bytesPerSec != null) {
       main = main ? main + " · " : "";
       main += formatBytes(bytesPerSec);
     }
     if (up.units_5m != null) {
-      title.push("5-min avg: " + Math.round(up.units_5m / 60) + " units/s");
+      title.push("5-min avg: " + Math.round(up.units_5m / 60) + " updates/s");
     }
     if (up.bytes_5m != null) {
       title.push("5-min avg: " + formatBytes(up.bytes_5m / 60));
@@ -683,22 +685,30 @@
     }
   }
 
-  function setFetched(ok) {
+  function setFetched() {
+    everFetched = true;
     lastFetched = new Date();
     fetchedAt.textContent = lastFetched.toLocaleTimeString();
+    fetchError.style.display = "none";
   }
 
   function showFetchError() {
-    sysStats.hidden = true;
     overallPill.className = "pill bad";
     overallPill.textContent = "unreachable";
-    overallText.textContent = "/health did not respond — showing the last known source list.";
-    healthBody.innerHTML = "";
-    healthBody.appendChild(el("tr", null,
-      '<td colspan="4" class="empty" style="color: var(--bad);">' +
-      '<code>/health</code> unreachable.</td>'));
-    renderRelays(FALLBACK_SOURCES, true);
-    srcCount.textContent = String(FALLBACK_SOURCES.length);
+    overallText.textContent = "/health did not respond.";
+    fetchError.textContent = "· fetch failed";
+    fetchError.style.display = "";
+    sysStats.hidden = true;
+    if (!everFetched) {
+      // No prior data — give the tables a meaningful initial state.
+      healthBody.innerHTML =
+        '<tr><td colspan="5" class="empty" style="color:var(--bad);">' +
+        '<code>/health</code> unreachable.</td></tr>';
+      renderRelays(FALLBACK_SOURCES, true);
+      srcCount.textContent = String(FALLBACK_SOURCES.length);
+    }
+    // When we do have prior data, leave the tables intact so users can
+    // still read the last-known state.
   }
 
   function refresh() {
@@ -725,28 +735,28 @@
         }
         var schemaCount = (typeof data.schema_count === "number")
           ? data.schema_count : sources.length;
-        setFetched(true);
+        setFetched();
         renderRelays(sources, false);
         renderHealth(sources, schemaCount);
         renderSystem(data && data.system);
       })
       .catch(function (err) {
         console.warn("health fetch failed:", err);
-        setFetched(false);
         showFetchError();
       });
   }
 
   refreshBtn.addEventListener("click", function () {
+    // Reset the 60s cadence from now, then fetch.
+    if (timer) { clearTimeout(timer); timer = null; }
+    schedule();
     refresh();
-    // nudge the auto-refresh cadence so a manual refresh resets the timer.
-    if (timer) { clearTimeout(timer); timer = null; schedule(); }
   });
 
   function schedule() {
     timer = setTimeout(function () {
+      schedule(); // re-arm before any async work so a failure can't break the loop
       refresh();
-      schedule();
     }, 60000);
   }
 
