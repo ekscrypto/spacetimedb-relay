@@ -123,6 +123,19 @@ async fn drive(
                             "client→local frame"
                         );
                         observe_inbound(&ctx.metrics, stats, &bytes);
+                        // Reject OneOffQuery before it reaches local stdb.
+                        // Large result sets (e.g. SELECT * FROM player_state)
+                        // force stdb to serialize all rows into one frame,
+                        // exhausting the shared stdb instance's memory under
+                        // concurrent load and crashing all relay instances.
+                        // Clients should subscribe to tables they need instead.
+                        if codec::message_tag(&bytes) == Some(relay_protocol::tags::CLIENT_ONE_OFF_QUERY) {
+                            if let Some(err_frame) = reject_one_off_query(&bytes, ctx.subprotocol, stats) {
+                                downstream.send(Message::Binary(err_frame)).await
+                                    .map_err(ClientError::DownstreamWs)?;
+                            }
+                            continue;
+                        }
                         local.send(Message::Binary(bytes.to_vec())).await
                             .map_err(ClientError::LocalWs)?;
                     }
@@ -416,6 +429,61 @@ pub enum ClientError {
     LocalConnect(String),
     #[error("local handshake: {0}")]
     LocalHandshake(String),
+}
+
+/// Synthesise an error response for a OneOffQuery client message. Returns
+/// the framed bytes to send back to the client, or `None` if decoding the
+/// request fails (encoding errors are also treated as None). The caller must
+/// always skip forwarding the original message to local stdb regardless of
+/// whether a response frame is returned.
+fn reject_one_off_query(bytes: &Bytes, subprotocol: Subprotocol, stats: &ClientStats) -> Option<Vec<u8>> {
+    const ERR: &str = "OneOffQuery is not supported through the relay frontend; subscribe to the table instead";
+
+    let body = codec::body(bytes).ok()?;
+
+    match subprotocol {
+        Subprotocol::V2 => {
+            use spacetimedb_client_api_messages::websocket::v2;
+            let v2::ClientMessage::OneOffQuery(q) = sats_bsatn::from_slice::<v2::ClientMessage>(body).ok()? else {
+                return None;
+            };
+            tracing::warn!(
+                target: "relay::frontend",
+                client_id = %stats.id,
+                request_id = q.request_id,
+                query = %q.query_string,
+                "rejecting OneOffQuery — use subscriptions"
+            );
+            let reply = v2::ServerMessage::OneOffQueryResult(v2::OneOffQueryResult {
+                request_id: q.request_id,
+                result: Err(ERR.into()),
+            });
+            let encoded = sats_bsatn::to_vec(&reply).ok()?;
+            Some(codec::wrap_uncompressed(encoded))
+        }
+        Subprotocol::V1 => {
+            use spacetimedb_client_api_messages_v1::websocket as v1;
+            let v1::ClientMessage::OneOffQuery(q) =
+                spacetimedb_lib_v1::bsatn::from_slice::<v1::ClientMessage<Box<[u8]>>>(body).ok()?
+            else {
+                return None;
+            };
+            tracing::warn!(
+                target: "relay::frontend",
+                client_id = %stats.id,
+                query = %q.query_string,
+                "rejecting OneOffQuery — use subscriptions"
+            );
+            let reply = v1::ServerMessage::<v1::BsatnFormat>::OneOffQueryResponse(v1::OneOffQueryResponse {
+                message_id: q.message_id,
+                error: Some(ERR.into()),
+                tables: Box::new([]),
+                total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::from_micros(0),
+            });
+            let encoded = spacetimedb_lib_v1::bsatn::to_vec(&reply).ok()?;
+            Some(codec::wrap_uncompressed(encoded))
+        }
+    }
 }
 
 async fn connect_local(

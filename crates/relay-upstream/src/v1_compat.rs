@@ -196,7 +196,7 @@ fn translate_server_message(
                         .iter()
                         .map(|t| v2::SingleTableRows {
                             table: String::from(&*t.table_name).into(),
-                            rows: merge_v1_lists(&[t.rows.clone()]),
+                            rows: merge_v1_lists(std::slice::from_ref(&t.rows)),
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice(),
