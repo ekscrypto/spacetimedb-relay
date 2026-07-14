@@ -287,9 +287,24 @@ pub async fn run(
                             )
                             .await
                             {
+                                // Print the full error chain, not just the
+                                // top-level context. The `.with_context()`
+                                // wrappers add "driver.apply for <table>"
+                                // but the underlying cause — WS reset,
+                                // decode failure, etc. — lives in the source
+                                // chain and is the part we actually need to
+                                // diagnose the failure.
+                                let mut chain = String::new();
+                                let mut source: Option<&dyn std::error::Error> = e.source();
+                                while let Some(s) = source {
+                                    chain.push_str(" → ");
+                                    chain.push_str(&s.to_string());
+                                    source = s.source();
+                                }
                                 tracing::error!(
                                     target: "relay::stdb_mode",
                                     error = %e,
+                                    source_chain = %chain,
                                     "failed to apply upstream message"
                                 );
                                 metrics.local_stdb.mark_down(Some(format!("{e}")));
