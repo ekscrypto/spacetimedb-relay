@@ -30,3 +30,7 @@ spike/mirror/schema.json
 # dhat profiler output
 dhat-heap.json
 .claude/
+
+# Python bytecode for tools/ tests
+__pycache__/
+*.pyc
