@@ -444,8 +444,35 @@ class Codegen:
         else:
             self.warnings.append(
                 f"table {upstream_name}: {len(pk_col_indices)} PK columns — emitting insert-only "
-                f"(no delete/update/apply reducer)"
+                f"(no delete/update reducer; apply is insert-only)"
             )
+            # Emit a relay_apply_* even for multi-/no-PK tables: the driver
+            # calls relay_apply_<table> for every table that receives an
+            # upstream change, and a missing reducer fails with "no such
+            # reducer". Without a single-column PK index we can't pair
+            # deletes with inserts or safely delete by key, so we insert
+            # all inserts and drop deletes (reduced fidelity for these
+            # tables, but the module no longer errors). Such tables are
+            # typically low-churn descriptors/state.
+            delete_update_apply += "\n".join([
+                "",
+                f"#[spacetimedb::reducer]",
+                f"pub fn relay_apply_{rust_name}(",
+                f"    ctx: &ReducerContext,",
+                f"    upstream: Option<UpstreamReducerInfo>,",
+                f"    deletes: Vec<Vec<u8>>,",
+                f"    inserts: Vec<Vec<u8>>,",
+                f") -> Result<(), Box<str>> {{",
+                f"    let _ = (upstream, deletes);",
+                f"    assert_writer(ctx)?;",
+                f"    for b in &inserts {{",
+                f"        let r: {struct_name} = spacetimedb::sats::bsatn::from_slice(b)",
+                f"            .map_err(|e| format!(\"bsatn decode {rust_name} insert: {{e}}\").into_boxed_str())?;",
+                f"        ctx.db.{rust_name}().insert(r);",
+                f"    }}",
+                f"    Ok(())",
+                f"}}\n",
+            ])
 
         return "\n".join(lines) + "\n" + insert_reducer + delete_update_apply
 
