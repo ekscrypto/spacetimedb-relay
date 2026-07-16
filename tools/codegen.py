@@ -418,7 +418,18 @@ class Codegen:
                 f"            }}",
                 f"        }}",
                 f"        if paired {{",
-                f"            ctx.db.{rust_name}().{pk_field_name}().update(new);",
+                # delete + insert, not .update(): update() panics
+                # (errno 15 "row was not found") when the paired row
+                # isn't actually present in the local mirror — which
+                # happens during resubscribe after a republish, when an
+                # upstream update for a not-yet-inserted (or already-
+                # deleted) row arrives. delete() returns bool and never
+                # panics, so delete+insert is idempotent whether or not
+                # the row existed. This mirrors what relay_update_ does
+                # and works for every PK type (find() would require a
+                # FilterableValue bound that custom/inline PK types lack).
+                f"            ctx.db.{rust_name}().{pk_field_name}().delete(&new.{pk_field_name});",
+                f"            ctx.db.{rust_name}().insert(new);",
                 f"        }} else {{",
                 f"            ctx.db.{rust_name}().insert(new);",
                 f"        }}",
