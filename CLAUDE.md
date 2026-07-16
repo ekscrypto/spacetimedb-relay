@@ -182,6 +182,20 @@ These shape every change. Don't break them without explicit instruction.
    publisher's identity into the private `_relay_meta` singleton; only
    that identity may write the mirror. Downstream clients connecting
    to the local SpacetimeDB cannot forge writes.
+7. **Served schema matches the running mirror by construction.** The
+   frontend answers plain-HTTP `GET /v1/database/<db>/schema` from the
+   **same cached upstream schema bytes** the publisher hashed to
+   codegen+publish the running module (`raw_schema: Arc<[u8]>` flows
+   from `main` into both the publisher and the frontend `Config`). It
+   is never proxied live from upstream — that would serve the *new*
+   schema during the drift window while the mirror still serves
+   old-shape rows. It's the upstream schema, so it omits the mirror's
+   own `_relay_meta` / `relay_apply_*` / `UpstreamReducerInfo`; those
+   are correct columns/types for decoding mirrored rows. The HTTP path
+   multiplexes onto the WS listener via a non-destructive `peek` of
+   the first request bytes (tungstenite rejects non-Upgrade requests
+   before its handshake callback runs, so pre-handshake peek is the
+   only place to intercept); WS upgrades always fall through untouched.
 
 ## Upstream protocol versions
 
@@ -286,6 +300,14 @@ upstream the registry stores `None` and TULs pass through verbatim
 `_relay_meta` traffic (the writer-bind reducer's transactions) is
 hidden from v1 subscribers as a side-effect — clients should never
 see relay-internal reducers like `relay_bind_writer`.
+
+**Schema endpoint.** The same listener also answers plain-HTTP
+`GET /v1/database/<db>/schema` from the cached upstream schema bytes
+(see invariant #7). `handle_accept` peeks the first request bytes
+before handing the socket to tungstenite; a non-Upgrade schema `GET`
+is answered inline and the connection closed, everything else falls
+through to the WS handshake byte-identically. `version=9` is the only
+cached format.
 
 ### Meta registry
 
