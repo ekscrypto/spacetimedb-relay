@@ -109,5 +109,58 @@ class ApplyReducerToleranceTests(unittest.TestCase):
         self.assertNotIn(".find(", body)
 
 
+class InsertOnlyApplyReducerTests(unittest.TestCase):
+    """Tables without a single-column PK still need a relay_apply_*
+    reducer.
+
+    Background: the driver calls relay_apply_<table> for EVERY table
+    that receives an upstream change (stdb_mode::dispatch_message
+    sends an ApplyJob unconditionally). Tables with 0 or composite PK
+    columns used to get only relay_insert_* and no apply reducer, so
+    any upstream update/delete for them failed with "no such reducer"
+    — observed firing ~90x/min on relay-global for blocked_player_state
+    and official_translators. The apply reducer for these tables is
+    insert-only (no PK index to delete/update by), which is reduced
+    fidelity but stops the error storm.
+    """
+
+    def _generate_no_pk(self) -> str:
+        elements = [
+            {"name": {"some": "label"}, "algebraic_type": {"String": []}},
+            {"name": {"some": "value"}, "algebraic_type": {"I32": []}},
+        ]
+        schema = {
+            "typespace": _typespace_with_product(elements),
+            "tables": [_table("tag", elements, pk_cols=[])],  # no PK
+            "reducers": [],
+            "types": [],
+            "misc_exports": [],
+            "row_level_security": [],
+        }
+        return codegen.Codegen(schema).run()
+
+    def test_no_pk_table_emits_apply_reducer(self):
+        """A 0-PK table must still get relay_apply_* so the driver's
+        unconditional apply call doesn't hit 'no such reducer'."""
+        src = self._generate_no_pk()
+        self.assertIn("pub fn relay_apply_tag(", src)
+
+    def test_no_pk_apply_reducer_is_insert_only(self):
+        """The insert-only apply reducer must insert all inserts and
+        drop deletes (no safe delete path without a PK index)."""
+        start = self._generate_no_pk().index("pub fn relay_apply_tag")
+        body = self._generate_no_pk()[start:start + 600]
+        # accepts the same (upstream, deletes, inserts) signature as PK tables
+        self.assertIn("deletes: Vec<Vec<u8>>", body)
+        self.assertIn("inserts: Vec<Vec<u8>>", body)
+        # inserts everything, drops deletes
+        self.assertIn("for b in &inserts", body)
+        self.assertIn("ctx.db.tag().insert(r);", body)
+        self.assertIn("let _ = (upstream, deletes);", body)
+        # no update/delete-by-pk (none possible without PK index)
+        self.assertNotIn(".update(", body)
+        self.assertNotIn(".delete(&", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
