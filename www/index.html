@@ -613,10 +613,10 @@
       main += formatBytes(bytesPerSec);
     }
     if (up.units_5m != null) {
-      title.push("5-min avg: " + Math.round(up.units_5m / 60) + " updates/s");
+      title.push("5-min avg: " + Math.round(up.units_5m / 300) + " updates/s");
     }
     if (up.bytes_5m != null) {
-      title.push("5-min avg: " + formatBytes(up.bytes_5m / 60));
+      title.push("5-min avg: " + formatBytes(up.bytes_5m / 300));
     }
     return main ? '<span class="mono" title="' + escapeHtml(title.join("\n")) +
       '">' + main + "</span>" : "";
