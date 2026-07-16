@@ -226,7 +226,7 @@ async fn main() -> Result<()> {
         "spacetimedb-relay starting"
     );
 
-    let raw_schema = fetch_schema(&args.upstream, &args.database).await?;
+    let raw_schema: Arc<[u8]> = Arc::from(fetch_schema(&args.upstream, &args.database).await?);
     let schema = parse_schema(&raw_schema)?;
     log_schema(&schema);
 
@@ -308,6 +308,10 @@ async fn main() -> Result<()> {
                     max_clients: args.frontend_max_clients,
                     idle_timeout: std::time::Duration::from_secs(args.frontend_idle_secs),
                     meta_registry: Some(meta_registry.clone()),
+                    // Expose the cached upstream schema as plain HTTP on
+                    // the frontend port so tokenless clients can
+                    // discover the row shape the mirror is serving.
+                    schema: Some(raw_schema.clone()),
                 };
                 tokio::spawn(async move {
                     if let Err(e) = relay_frontend::run(cfg, frontend_metrics, active_clients).await
@@ -366,7 +370,14 @@ async fn main() -> Result<()> {
         codegen_script,
         spacetime_bin: args.spacetime_bin,
     };
-    stdb_mode::run(cfg, raw_schema, Arc::new(schema), metrics, meta_registry).await
+    stdb_mode::run(
+        cfg,
+        raw_schema.clone(),
+        Arc::new(schema),
+        metrics,
+        meta_registry,
+    )
+    .await
 }
 
 fn sanitize_db_name(name: &str) -> String {

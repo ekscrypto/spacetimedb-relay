@@ -85,7 +85,7 @@ pub struct StdbModeConfig {
 
 pub async fn run(
     cfg: StdbModeConfig,
-    raw_schema: Vec<u8>,
+    raw_schema: Arc<[u8]>,
     schema: Arc<MirroredSchema>,
     metrics: Arc<Metrics>,
     meta_registry: Arc<MetaRegistry>,
@@ -268,7 +268,9 @@ pub async fn run(
         let mut apply_driver = driver;
         let apply_handle = tokio::spawn(async move {
             loop {
-                let Some(job) = apply_rx.recv().await else { break };
+                let Some(job) = apply_rx.recv().await else {
+                    break;
+                };
                 let stats = match apply_driver
                     .apply(&job.table, job.meta.as_ref(), job.deletes, job.inserts)
                     .await
@@ -401,7 +403,9 @@ pub async fn run(
                     database = %cfg.mirror_database,
                     "local stdb module fatal — forcing republish and reconnect"
                 );
-                metrics.upstream.mark_down(Some("module dead — republishing".into()));
+                metrics
+                    .upstream
+                    .mark_down(Some("module dead — republishing".into()));
                 metrics.local_stdb.mark_down(Some("module dead".into()));
                 metrics.local_stdb.mark_module_dead();
 
@@ -430,7 +434,9 @@ pub async fn run(
                     fingerprint = %outcome.fingerprint,
                     "force-republish complete"
                 );
-                metrics.publisher.record(&outcome.fingerprint, outcome.republished);
+                metrics
+                    .publisher
+                    .record(&outcome.fingerprint, outcome.republished);
 
                 // Reconnect driver with the same (persisted) identity token.
                 let identity_token = if cfg.identity_token.is_some() {
@@ -655,12 +661,8 @@ async fn dispatch_message(
             if sequential {
                 sequential_progress.in_flight_query_id = None;
                 if sequential_progress.next_idx < subscribe_tables.len() {
-                    if let Err(e) = send_next_sequential(
-                        sequential_progress,
-                        subscribe_tables,
-                        cmd_tx,
-                    )
-                    .await
+                    if let Err(e) =
+                        send_next_sequential(sequential_progress, subscribe_tables, cmd_tx).await
                     {
                         tracing::error!(
                             target: "relay::stdb_mode",

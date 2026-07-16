@@ -40,6 +40,12 @@ pub struct Config {
     /// TransactionUpdates from local stdb's TransactionUpdateLight
     /// broadcasts. None disables synthesis (TUL passes through).
     pub meta_registry: Option<Arc<MetaRegistry>>,
+    /// Cached upstream schema bytes the relay used to codegen+publish
+    /// the mirror module. When `Some`, a plain-HTTP
+    /// `GET /v1/database/<local_database>/schema` (no WS upgrade) is
+    /// answered inline with these bytes; everything else falls through
+    /// to the WebSocket handshake. `None` disables the schema endpoint.
+    pub schema: Option<Arc<[u8]>>,
 }
 
 /// Accept loop. Returns when the listener errors or is dropped.
@@ -86,12 +92,33 @@ pub async fn run(cfg: Config, metrics: Arc<FrontendMetrics>, clients: ActiveClie
 }
 
 async fn handle_accept(
-    stream: TcpStream,
+    mut stream: TcpStream,
     peer: SocketAddr,
     cfg: Config,
     metrics: Arc<FrontendMetrics>,
     clients: ActiveClients,
 ) {
+    // Serve the cached schema as plain HTTP on the same port as the WS
+    // listener. `probe` peeks without consuming, so a WebSocket upgrade
+    // (or anything we're unsure about) falls through untouched to the
+    // normal handshake.
+    if let Some(schema) = cfg.schema.as_deref() {
+        if matches!(
+            crate::http::probe(&stream).await,
+            crate::http::HttpProbe::Schema
+        ) {
+            if let Err(e) = crate::http::serve_schema(&mut stream, schema).await {
+                tracing::warn!(
+                    target: "relay::frontend",
+                    peer = %peer,
+                    error = %e,
+                    "failed to write schema HTTP response"
+                );
+            }
+            return;
+        }
+    }
+
     let mut chosen: Option<Subprotocol> = None;
     let cb = SubprotocolNegotiator {
         chosen: &mut chosen,

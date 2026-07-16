@@ -219,6 +219,38 @@ like:
 — which is the upstream player's actual chat reducer, surfaced to a
 v1 subscriber as if it had been talking to BitCraft directly.
 
+## Schema endpoint
+
+Each relay serves its upstream's schema over plain HTTP on the same port
+as the WebSocket frontend, so downstream clients without a developer
+token can discover the row shape the mirror is serving:
+
+```
+GET /v1/database/<mirror-database>/schema?version=9
+```
+
+```sh
+curl http://relay.bitcraftsync.app:<port>/v1/database/<mirror-database>/schema?version=9
+```
+
+The bytes returned are the **exact schema the relay used to codegen and
+publish the running mirror module** — fetched from upstream at startup
+and cached in memory. This means the schema always matches the data
+the mirror is currently serving, even during the window between an
+upstream schema change and the relay's drift-triggered republish (a
+live proxy to upstream would serve the new schema while the mirror
+still serves old-shape rows). It's the upstream schema, so it does
+**not** include the mirror's own `_relay_meta` table or `relay_apply_*`
+reducers — only the public tables and types, which is what clients
+decoding mirrored rows need.
+
+The endpoint multiplexes onto the WebSocket listener: a plain HTTP
+`GET .../schema` (no `Upgrade: websocket`) is answered inline;
+everything else (real WS upgrades, `/subscribe`, etc.) falls through to
+the normal handshake untouched. `version=9` is accepted but ignored —
+only the v9 schema format is cached, which is what every current client
+requests. Responses carry a 60-second `Cache-Control` hint.
+
 ## Configuration
 
 | Flag                       | Env var                            | Default                                      | Notes |
@@ -255,7 +287,7 @@ v1 subscriber as if it had been talking to BitCraft directly.
 | `relay-upstream`       | Owns the single upstream WebSocket. Single un-split `tokio::select!` over read / 30 s idle Ping / cmd arms (matches the SpacetimeDB SDK). Emits a 2 s watchdog heartbeat with iteration counters on `relay::upstream::watchdog`. |
 | `relay-publisher`      | Codegen → cargo build → `spacetime publish -y --delete-data`, keyed by SHA-256 fingerprint of the upstream schema. No-op when fingerprint unchanged. |
 | `relay-mirror-driver`  | v2 WS client to local SpacetimeDB; sends `relay_apply_<table>(upstream, deletes, inserts)` calls with semaphore backpressure and chunking. Hosts the `MetaRegistry` the frontend reads to synthesise full v1 TUs. |
-| `relay-frontend`       | Public-facing WS proxy: subprotocol negotiation, per-client metrics, hides `_relay_meta` traffic, and synthesises full v1 `TransactionUpdate`s from local stdb's `TransactionUpdateLight` broadcasts via the mirror-driver's meta registry. |
+| `relay-frontend`       | Public-facing WS proxy: subprotocol negotiation, per-client metrics, hides `_relay_meta` traffic, synthesises full v1 `TransactionUpdate`s from local stdb's `TransactionUpdateLight` broadcasts via the mirror-driver's meta registry, and serves the cached upstream schema over plain HTTP on the same port (`GET /v1/database/<db>/schema`). |
 | `relay`                | Binary. Args, schema fetch, dashboard, dispatches to `stdb_mode`. |
 | `relay-test-harness`   | Standalone v2 client; useful for end-to-end testing against either the local SpacetimeDB or a remote upstream. |
 | `bc14-sdk-test`        | Standalone bin (excluded from the workspace) that vendors the v1.12.0 SpacetimeDB Rust SDK's WebSocket layer verbatim. Used to confirm large-scale subscribe issues against BitCraft are server/middlebox behavior, not relay-side regressions. See `crates/bc14-sdk-test/README.md`. |

@@ -19,6 +19,7 @@ pub mod rewrite;
 pub mod state;
 
 mod client;
+mod http;
 mod listener;
 
 pub use listener::{run, Config};

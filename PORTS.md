@@ -56,6 +56,17 @@ wss://relay.bitcraftsync.app:<port>/v1/database/<mirror-database>/subscribe
 where `<port>` is `3000` for global and `3000 + regionID` for a region
 (the port *is* the region, same formula as everywhere else).
 
+The same port also serves the upstream schema over plain HTTP (no new
+nginx route — nginx already proxies HTTP on these ports):
+
+```
+https://relay.bitcraftsync.app:<port>/v1/database/<mirror-database>/schema?version=9
+```
+
+The schema bytes are the ones the relay cached at startup and used to
+codegen+publish the running mirror, so they always match the served
+data. See README §"Schema endpoint".
+
 - nginx binds the public IPs on each port `3000–3025`, terminates TLS
   with the host's Let's Encrypt cert for `relay.bitcraftsync.app`, and
   proxies plain WebSocket to the loopback relay on the same port number
