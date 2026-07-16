@@ -130,6 +130,15 @@ pub struct ClientStats {
     /// upstream meta. v1 clients only — v2 clients always see zero
     /// here.
     pub rewrites: AtomicU64,
+
+    /// CallReducer frames rejected at the frontend. The relay is
+    /// read-only; reducer calls are never forwarded to local stdb
+    /// (see `reject_call_reducer`). Counts both v1 and v2 clients.
+    pub call_reducers: AtomicU64,
+
+    /// CallProcedure frames rejected at the frontend, same rationale
+    /// as `call_reducers`.
+    pub call_procedures: AtomicU64,
 }
 
 impl ClientStats {
@@ -151,6 +160,8 @@ impl ClientStats {
             one_off_queries: AtomicU64::new(0),
             subscriptions: Mutex::new(BTreeSet::new()),
             rewrites: AtomicU64::new(0),
+            call_reducers: AtomicU64::new(0),
+            call_procedures: AtomicU64::new(0),
         }
     }
 
@@ -182,6 +193,8 @@ impl ClientStats {
             subscriptions: self.subscriptions.lock().iter().cloned().collect(),
             one_off_queries: self.one_off_queries.load(Ordering::Relaxed),
             rewrites: self.rewrites.load(Ordering::Relaxed),
+            call_reducers: self.call_reducers.load(Ordering::Relaxed),
+            call_procedures: self.call_procedures.load(Ordering::Relaxed),
             total_bytes_in: self.total_bytes_in.load(Ordering::Relaxed),
             total_bytes_out: self.total_bytes_out.load(Ordering::Relaxed),
             total_frames_in: self.total_frames_in.load(Ordering::Relaxed),
@@ -294,6 +307,8 @@ pub struct ClientSnapshot {
     pub subscriptions: Vec<String>,
     pub one_off_queries: u64,
     pub rewrites: u64,
+    pub call_reducers: u64,
+    pub call_procedures: u64,
     pub total_bytes_in: u64,
     pub total_bytes_out: u64,
     pub total_frames_in: u64,

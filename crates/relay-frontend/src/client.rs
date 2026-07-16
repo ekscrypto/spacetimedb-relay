@@ -122,7 +122,7 @@ async fn drive(
                             tag = ?bytes.first().copied(),
                             "client→local frame"
                         );
-                        observe_inbound(&ctx.metrics, stats, &bytes);
+                        observe_inbound(&ctx.metrics, stats, &bytes, ctx.subprotocol);
                         // Reject OneOffQuery before it reaches local stdb.
                         // Large result sets (e.g. SELECT * FROM player_state)
                         // force stdb to serialize all rows into one frame,
@@ -131,6 +131,28 @@ async fn drive(
                         // Clients should subscribe to tables they need instead.
                         if codec::message_tag(&bytes) == Some(relay_protocol::tags::CLIENT_ONE_OFF_QUERY) {
                             if let Some(err_frame) = reject_one_off_query(&bytes, ctx.subprotocol, stats) {
+                                downstream.send(Message::Binary(err_frame)).await
+                                    .map_err(ClientError::DownstreamWs)?;
+                            }
+                            continue;
+                        }
+                        // Reject CallReducer / CallProcedure before they
+                        // reach local stdb. The relay is read-only fan-out;
+                        // clients that need to mutate state call reducers
+                        // directly on the upstream. Forwarding these would
+                        // also expose the writer-bind race on
+                        // `relay_bind_writer` (first-caller-wins) during
+                        // the startup pre-bind window.
+                        if let Some(kind) = inbound_write_tag(&bytes, ctx.subprotocol) {
+                            let frame = match kind {
+                                WriteTag::CallReducer => {
+                                    reject_call_reducer(&bytes, ctx.subprotocol, stats)
+                                }
+                                WriteTag::CallProcedure => {
+                                    reject_call_procedure(&bytes, ctx.subprotocol, stats)
+                                }
+                            };
+                            if let Some(err_frame) = frame {
                                 downstream.send(Message::Binary(err_frame)).await
                                     .map_err(ClientError::DownstreamWs)?;
                             }
@@ -223,11 +245,16 @@ async fn drive(
     }
 }
 
-fn observe_inbound(metrics: &FrontendMetrics, stats: &ClientStats, bytes: &Bytes) {
+fn observe_inbound(
+    metrics: &FrontendMetrics,
+    stats: &ClientStats,
+    bytes: &Bytes,
+    subprotocol: Subprotocol,
+) {
     let n = bytes.len() as u64;
     metrics.record_inbound(n);
     stats.record_inbound(n);
-    inspect_client_message(stats, bytes);
+    inspect_client_message(stats, bytes, subprotocol);
 }
 
 fn observe_outbound(metrics: &FrontendMetrics, stats: &ClientStats, bytes: &Bytes) {
@@ -239,7 +266,25 @@ fn observe_outbound(metrics: &FrontendMetrics, stats: &ClientStats, bytes: &Byte
 /// Decode just the message tag of a frame from the client and bump the
 /// matching counter. Subscribes are also captured so the dashboard can
 /// list each client's active queries.
-fn inspect_client_message(stats: &ClientStats, bytes: &Bytes) {
+fn inspect_client_message(stats: &ClientStats, bytes: &Bytes, subprotocol: Subprotocol) {
+    // CallReducer / CallProcedure have different BSATN discriminants in
+    // v1 vs v2 (v1's `ClientMessage` enum orders them differently), so
+    // we dispatch those via the subprotocol-aware `inbound_write_tag`.
+    // OneOffQuery and Subscribe share the same tag in both protocols.
+    if let Some(kind) = inbound_write_tag(bytes, subprotocol) {
+        match kind {
+            WriteTag::CallReducer => {
+                stats
+                    .call_reducers
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            WriteTag::CallProcedure => {
+                stats
+                    .call_procedures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     let Some(tag) = codec::message_tag(bytes) else {
         return;
     };
@@ -436,15 +481,22 @@ pub enum ClientError {
 /// request fails (encoding errors are also treated as None). The caller must
 /// always skip forwarding the original message to local stdb regardless of
 /// whether a response frame is returned.
-fn reject_one_off_query(bytes: &Bytes, subprotocol: Subprotocol, stats: &ClientStats) -> Option<Vec<u8>> {
-    const ERR: &str = "OneOffQuery is not supported through the relay frontend; subscribe to the table instead";
+fn reject_one_off_query(
+    bytes: &Bytes,
+    subprotocol: Subprotocol,
+    stats: &ClientStats,
+) -> Option<Vec<u8>> {
+    const ERR: &str =
+        "OneOffQuery is not supported through the relay frontend; subscribe to the table instead";
 
     let body = codec::body(bytes).ok()?;
 
     match subprotocol {
         Subprotocol::V2 => {
             use spacetimedb_client_api_messages::websocket::v2;
-            let v2::ClientMessage::OneOffQuery(q) = sats_bsatn::from_slice::<v2::ClientMessage>(body).ok()? else {
+            let v2::ClientMessage::OneOffQuery(q) =
+                sats_bsatn::from_slice::<v2::ClientMessage>(body).ok()?
+            else {
                 return None;
             };
             tracing::warn!(
@@ -474,12 +526,187 @@ fn reject_one_off_query(bytes: &Bytes, subprotocol: Subprotocol, stats: &ClientS
                 query = %q.query_string,
                 "rejecting OneOffQuery — use subscriptions"
             );
-            let reply = v1::ServerMessage::<v1::BsatnFormat>::OneOffQueryResponse(v1::OneOffQueryResponse {
-                message_id: q.message_id,
-                error: Some(ERR.into()),
-                tables: Box::new([]),
-                total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::from_micros(0),
+            let reply = v1::ServerMessage::<v1::BsatnFormat>::OneOffQueryResponse(
+                v1::OneOffQueryResponse {
+                    message_id: q.message_id,
+                    error: Some(ERR.into()),
+                    tables: Box::new([]),
+                    total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::from_micros(0),
+                },
+            );
+            let encoded = spacetimedb_lib_v1::bsatn::to_vec(&reply).ok()?;
+            Some(codec::wrap_uncompressed(encoded))
+        }
+    }
+}
+
+/// Which write-path client message a frame carries, if any. The relay
+/// is read-only and refuses both: `CallReducer` (which would let a
+/// downstream client invoke `relay_bind_writer` or any mirror reducer)
+/// and `CallProcedure` (the sibling side-effecting call).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteTag {
+    CallReducer,
+    CallProcedure,
+}
+
+/// Returns the write-path kind of an inbound frame under the
+/// connection's subprotocol, or `None` if it's not a CallReducer /
+/// CallProcedure.
+///
+/// V1 and V2 assign different BSATN discriminants to these variants:
+/// v2's `ClientMessage` orders them `CallReducer=3, CallProcedure=4`,
+/// while v1's orders them `CallReducer=0, CallProcedure=7`. The tag
+/// check must therefore be subprotocol-aware — a naive compare against
+/// the v2 constants would miss every v1 reducer/procedure call.
+fn inbound_write_tag(bytes: &Bytes, subprotocol: Subprotocol) -> Option<WriteTag> {
+    let tag = codec::message_tag(bytes)?;
+    Some(match subprotocol {
+        Subprotocol::V2 => match tag {
+            relay_protocol::tags::CLIENT_CALL_REDUCER => WriteTag::CallReducer,
+            relay_protocol::tags::CLIENT_CALL_PROCEDURE => WriteTag::CallProcedure,
+            _ => return None,
+        },
+        Subprotocol::V1 => match tag {
+            0x00 => WriteTag::CallReducer,
+            0x07 => WriteTag::CallProcedure,
+            _ => return None,
+        },
+    })
+}
+
+/// Synthesise an error response for a CallReducer client message, mirroring
+/// [`reject_one_off_query`]. Returns the framed bytes to send back to the
+/// client, or `None` if decoding the request fails. The caller must always
+/// skip forwarding the original message to local stdb regardless of whether
+/// a response frame is returned.
+fn reject_call_reducer(
+    bytes: &Bytes,
+    subprotocol: Subprotocol,
+    stats: &ClientStats,
+) -> Option<Vec<u8>> {
+    const ERR: &str =
+        "CallReducer is not supported through the relay frontend; the relay is read-only";
+
+    let body = codec::body(bytes).ok()?;
+
+    match subprotocol {
+        Subprotocol::V2 => {
+            use spacetimedb_client_api_messages::websocket::v2;
+            let v2::ClientMessage::CallReducer(cr) =
+                sats_bsatn::from_slice::<v2::ClientMessage>(body).ok()?
+            else {
+                return None;
+            };
+            tracing::warn!(
+                target: "relay::frontend",
+                client_id = %stats.id,
+                request_id = cr.request_id,
+                reducer = %cr.reducer,
+                "rejecting CallReducer — the relay is read-only"
+            );
+            let reply = v2::ServerMessage::ReducerResult(v2::ReducerResult {
+                request_id: cr.request_id,
+                timestamp: relay_protocol::lib::Timestamp::UNIX_EPOCH,
+                result: v2::ReducerOutcome::InternalError(ERR.into()),
             });
+            let encoded = sats_bsatn::to_vec(&reply).ok()?;
+            Some(codec::wrap_uncompressed(encoded))
+        }
+        Subprotocol::V1 => {
+            use spacetimedb_client_api_messages_v1::websocket as v1;
+            let v1::ClientMessage::CallReducer(cr) =
+                spacetimedb_lib_v1::bsatn::from_slice::<v1::ClientMessage<Box<[u8]>>>(body).ok()?
+            else {
+                return None;
+            };
+            tracing::warn!(
+                target: "relay::frontend",
+                client_id = %stats.id,
+                request_id = cr.request_id,
+                reducer = %cr.reducer,
+                "rejecting CallReducer — the relay is read-only"
+            );
+            let reply = v1::ServerMessage::<v1::BsatnFormat>::TransactionUpdate(
+                v1::TransactionUpdate {
+                    status: v1::UpdateStatus::Failed(ERR.into()),
+                    timestamp: spacetimedb_lib_v1::Timestamp::UNIX_EPOCH,
+                    caller_identity: spacetimedb_lib_v1::Identity::ZERO,
+                    caller_connection_id: spacetimedb_lib_v1::ConnectionId::ZERO,
+                    reducer_call: v1::ReducerCallInfo {
+                        reducer_name: cr.reducer,
+                        reducer_id: 0,
+                        args: cr.args,
+                        request_id: cr.request_id,
+                    },
+                    energy_quanta_used: spacetimedb_client_api_messages_v1::energy::EnergyQuanta::ZERO,
+                    total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::from_micros(0),
+                },
+            );
+            let encoded = spacetimedb_lib_v1::bsatn::to_vec(&reply).ok()?;
+            Some(codec::wrap_uncompressed(encoded))
+        }
+    }
+}
+
+/// Synthesise an error response for a CallProcedure client message. Same
+/// contract as [`reject_call_reducer`].
+fn reject_call_procedure(
+    bytes: &Bytes,
+    subprotocol: Subprotocol,
+    stats: &ClientStats,
+) -> Option<Vec<u8>> {
+    const ERR: &str =
+        "CallProcedure is not supported through the relay frontend; the relay is read-only";
+
+    let body = codec::body(bytes).ok()?;
+
+    match subprotocol {
+        Subprotocol::V2 => {
+            use spacetimedb_client_api_messages::websocket::v2;
+            let v2::ClientMessage::CallProcedure(cp) =
+                sats_bsatn::from_slice::<v2::ClientMessage>(body).ok()?
+            else {
+                return None;
+            };
+            tracing::warn!(
+                target: "relay::frontend",
+                client_id = %stats.id,
+                request_id = cp.request_id,
+                procedure = %cp.procedure,
+                "rejecting CallProcedure — the relay is read-only"
+            );
+            let reply = v2::ServerMessage::ProcedureResult(v2::ProcedureResult {
+                status: v2::ProcedureStatus::InternalError(ERR.into()),
+                timestamp: relay_protocol::lib::Timestamp::UNIX_EPOCH,
+                total_host_execution_duration: relay_protocol::lib::TimeDuration::from_micros(0),
+                request_id: cp.request_id,
+            });
+            let encoded = sats_bsatn::to_vec(&reply).ok()?;
+            Some(codec::wrap_uncompressed(encoded))
+        }
+        Subprotocol::V1 => {
+            use spacetimedb_client_api_messages_v1::websocket as v1;
+            let v1::ClientMessage::CallProcedure(cp) =
+                spacetimedb_lib_v1::bsatn::from_slice::<v1::ClientMessage<Box<[u8]>>>(body).ok()?
+            else {
+                return None;
+            };
+            tracing::warn!(
+                target: "relay::frontend",
+                client_id = %stats.id,
+                request_id = cp.request_id,
+                procedure = %cp.procedure,
+                "rejecting CallProcedure — the relay is read-only"
+            );
+            let reply = v1::ServerMessage::<v1::BsatnFormat>::ProcedureResult(
+                v1::ProcedureResult {
+                    status: v1::ProcedureStatus::InternalError(ERR.into()),
+                    timestamp: spacetimedb_lib_v1::Timestamp::UNIX_EPOCH,
+                    total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::from_micros(0),
+                    request_id: cp.request_id,
+                },
+            );
             let encoded = spacetimedb_lib_v1::bsatn::to_vec(&reply).ok()?;
             Some(codec::wrap_uncompressed(encoded))
         }
@@ -531,4 +758,274 @@ async fn connect_local(
         }
     }
     Ok(ws)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::ClientStats;
+
+    /// Build a `ClientStats` for tests — address and id are arbitrary.
+    fn fake_stats(sp: Subprotocol) -> ClientStats {
+        ClientStats::new("127.0.0.1:9999".parse().unwrap(), sp)
+    }
+
+    /// Decode a v2 reply frame (strip compression byte, bsatn-decode).
+    fn decode_v2_reply(frame: &[u8]) -> Option<spacetimedb_client_api_messages::websocket::v2::ServerMessage> {
+        let body = codec::body(frame).ok()?;
+        sats_bsatn::from_slice(body).ok()
+    }
+
+    /// Decode a v1 reply frame.
+    fn decode_v1_reply(
+        frame: &[u8],
+    ) -> Option<
+        spacetimedb_client_api_messages_v1::websocket::ServerMessage<
+            spacetimedb_client_api_messages_v1::websocket::BsatnFormat,
+        >,
+    > {
+        let body = codec::body(frame).ok()?;
+        spacetimedb_lib_v1::bsatn::from_slice(body).ok()
+    }
+
+    // ---- inbound_write_tag: the V1/V2 discriminant asymmetry ----
+
+    #[test]
+    fn v2_call_reducer_tag_is_0x03() {
+        use spacetimedb_client_api_messages::websocket::v2;
+        let msg = v2::ClientMessage::CallReducer(v2::CallReducer {
+            request_id: 42,
+            flags: v2::CallReducerFlags::Default,
+            reducer: "relay_bind_writer".into(),
+            args: bytes::Bytes::new(),
+        });
+        let body = sats_bsatn::to_vec(&msg).unwrap();
+        let frame = codec::wrap_uncompressed(body);
+        assert_eq!(
+            inbound_write_tag(&Bytes::from(frame), Subprotocol::V2),
+            Some(WriteTag::CallReducer)
+        );
+    }
+
+    #[test]
+    fn v2_call_procedure_tag_is_0x04() {
+        use spacetimedb_client_api_messages::websocket::v2;
+        let msg = v2::ClientMessage::CallProcedure(v2::CallProcedure {
+            request_id: 7,
+            flags: v2::CallProcedureFlags::Default,
+            procedure: "do_thing".into(),
+            args: bytes::Bytes::new(),
+        });
+        let body = sats_bsatn::to_vec(&msg).unwrap();
+        let frame = codec::wrap_uncompressed(body);
+        assert_eq!(
+            inbound_write_tag(&Bytes::from(frame), Subprotocol::V2),
+            Some(WriteTag::CallProcedure)
+        );
+    }
+
+    #[test]
+    fn v1_call_reducer_tag_is_0x00_not_0x03() {
+        // V1's ClientMessage puts CallReducer at discriminant 0, so a
+        // naive v2-constant compare would miss it. This test exists to
+        // fail loudly if either the wire format or the helper changes.
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        let msg: v1::ClientMessage<Box<[u8]>> = v1::ClientMessage::CallReducer(v1::CallReducer {
+            reducer: "relay_bind_writer".into(),
+            args: Box::new([]),
+            request_id: 1,
+            flags: v1::CallReducerFlags::FullUpdate,
+        });
+        let body = spacetimedb_lib_v1::bsatn::to_vec(&msg).unwrap();
+        assert_eq!(body.first().copied(), Some(0x00));
+        let frame = codec::wrap_uncompressed(body);
+        assert_eq!(
+            inbound_write_tag(&Bytes::from(frame), Subprotocol::V1),
+            Some(WriteTag::CallReducer)
+        );
+    }
+
+    #[test]
+    fn v1_call_procedure_tag_is_0x07() {
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        let msg: v1::ClientMessage<Box<[u8]>> =
+            v1::ClientMessage::CallProcedure(v1::CallProcedure {
+                procedure: "do_thing".into(),
+                args: Box::new([]),
+                request_id: 1,
+                flags: v1::CallProcedureFlags::Default,
+            });
+        let body = spacetimedb_lib_v1::bsatn::to_vec(&msg).unwrap();
+        assert_eq!(body.first().copied(), Some(0x07));
+        let frame = codec::wrap_uncompressed(body);
+        assert_eq!(
+            inbound_write_tag(&Bytes::from(frame), Subprotocol::V1),
+            Some(WriteTag::CallProcedure)
+        );
+    }
+
+    #[test]
+    fn subscribe_is_not_a_write_tag() {
+        use spacetimedb_client_api_messages::websocket::v2;
+        let msg = v2::ClientMessage::Subscribe(v2::Subscribe {
+            request_id: 0,
+            query_set_id: v2::QuerySetId::new(0),
+            query_strings: vec!["SELECT * FROM foo".into()].into(),
+        });
+        let body = sats_bsatn::to_vec(&msg).unwrap();
+        let frame = codec::wrap_uncompressed(body);
+        assert_eq!(
+            inbound_write_tag(&Bytes::from(frame), Subprotocol::V2),
+            None
+        );
+    }
+
+    // ---- reject_call_reducer: response shape and request_id echo ----
+
+    #[test]
+    fn reject_call_reducer_v2_returns_internal_error_result() {
+        use spacetimedb_client_api_messages::websocket::v2;
+        let msg = v2::ClientMessage::CallReducer(v2::CallReducer {
+            request_id: 1234,
+            flags: v2::CallReducerFlags::Default,
+            reducer: "relay_bind_writer".into(),
+            args: bytes::Bytes::new(),
+        });
+        let body = sats_bsatn::to_vec(&msg).unwrap();
+        let frame = Bytes::from(codec::wrap_uncompressed(body));
+        let stats = fake_stats(Subprotocol::V2);
+        let reply = reject_call_reducer(&frame, Subprotocol::V2, &stats).expect("v2 reply");
+
+        let decoded = decode_v2_reply(&reply).expect("decodable v2 reply");
+        match decoded {
+            v2::ServerMessage::ReducerResult(rr) => {
+                assert_eq!(rr.request_id, 1234);
+                match rr.result {
+                    v2::ReducerOutcome::InternalError(msg) => {
+                        assert!(msg.contains("read-only"), "got: {msg}");
+                    }
+                    other => panic!("expected InternalError, got {other:?}"),
+                }
+            }
+            other => panic!("expected ReducerResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_call_reducer_v1_returns_failed_transaction_update() {
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        let msg: v1::ClientMessage<Box<[u8]>> = v1::ClientMessage::CallReducer(v1::CallReducer {
+            reducer: "relay_bind_writer".into(),
+            args: Box::new([9, 9, 9]),
+            request_id: 5678,
+            flags: v1::CallReducerFlags::FullUpdate,
+        });
+        let body = spacetimedb_lib_v1::bsatn::to_vec(&msg).unwrap();
+        let frame = Bytes::from(codec::wrap_uncompressed(body));
+        let stats = fake_stats(Subprotocol::V1);
+        let reply = reject_call_reducer(&frame, Subprotocol::V1, &stats).expect("v1 reply");
+
+        let decoded = decode_v1_reply(&reply).expect("decodable v1 reply");
+        match decoded {
+            v1::ServerMessage::TransactionUpdate(tu) => {
+                assert_eq!(tu.reducer_call.request_id, 5678);
+                assert_eq!(tu.reducer_call.reducer_name.as_ref(), "relay_bind_writer");
+                // Args echoed back.
+                assert_eq!(tu.reducer_call.args.as_ref(), &[9, 9, 9]);
+                match tu.status {
+                    v1::UpdateStatus::Failed(msg) => {
+                        assert!(msg.contains("read-only"), "got: {msg}");
+                    }
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+            }
+            _ => panic!("expected TransactionUpdate, got a different variant"),
+        }
+    }
+
+    // ---- reject_call_procedure ----
+
+    #[test]
+    fn reject_call_procedure_v2_returns_internal_error_result() {
+        use spacetimedb_client_api_messages::websocket::v2;
+        let msg = v2::ClientMessage::CallProcedure(v2::CallProcedure {
+            request_id: 99,
+            flags: v2::CallProcedureFlags::Default,
+            procedure: "do_thing".into(),
+            args: bytes::Bytes::new(),
+        });
+        let body = sats_bsatn::to_vec(&msg).unwrap();
+        let frame = Bytes::from(codec::wrap_uncompressed(body));
+        let stats = fake_stats(Subprotocol::V2);
+        let reply = reject_call_procedure(&frame, Subprotocol::V2, &stats).expect("v2 reply");
+
+        let decoded = decode_v2_reply(&reply).expect("decodable v2 reply");
+        match decoded {
+            v2::ServerMessage::ProcedureResult(pr) => {
+                assert_eq!(pr.request_id, 99);
+                match pr.status {
+                    v2::ProcedureStatus::InternalError(msg) => {
+                        assert!(msg.contains("read-only"), "got: {msg}");
+                    }
+                    other => panic!("expected InternalError, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProcedureResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_call_procedure_v1_returns_failed_procedure_result() {
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        let msg: v1::ClientMessage<Box<[u8]>> =
+            v1::ClientMessage::CallProcedure(v1::CallProcedure {
+                procedure: "do_thing".into(),
+                args: Box::new([]),
+                request_id: 31337,
+                flags: v1::CallProcedureFlags::Default,
+            });
+        let body = spacetimedb_lib_v1::bsatn::to_vec(&msg).unwrap();
+        let frame = Bytes::from(codec::wrap_uncompressed(body));
+        let stats = fake_stats(Subprotocol::V1);
+        let reply = reject_call_procedure(&frame, Subprotocol::V1, &stats).expect("v1 reply");
+
+        let decoded = decode_v1_reply(&reply).expect("decodable v1 reply");
+        match decoded {
+            v1::ServerMessage::ProcedureResult(pr) => {
+                assert_eq!(pr.request_id, 31337);
+                match pr.status {
+                    v1::ProcedureStatus::InternalError(msg) => {
+                        assert!(msg.contains("read-only"), "got: {msg}");
+                    }
+                    other => panic!("expected InternalError, got {other:?}"),
+                }
+            }
+            _ => panic!("expected ProcedureResult, got a different variant"),
+        }
+    }
+
+    // ---- decode-failure path: returns None, original still dropped by caller ----
+
+    #[test]
+    fn reject_call_reducer_returns_none_on_garbage() {
+        let frame = Bytes::from(codec::wrap_uncompressed(vec![0xFF, 0xFF, 0xFF]));
+        let stats = fake_stats(Subprotocol::V2);
+        assert!(reject_call_reducer(&frame, Subprotocol::V2, &stats).is_none());
+    }
+
+    #[test]
+    fn reject_call_producer_returns_none_on_wrong_variant() {
+        // A Subscribe frame is not a CallProcedure; the helper must
+        // return None rather than misinterpreting the bytes.
+        use spacetimedb_client_api_messages::websocket::v2;
+        let msg = v2::ClientMessage::Subscribe(v2::Subscribe {
+            request_id: 0,
+            query_set_id: v2::QuerySetId::new(0),
+            query_strings: vec!["SELECT 1".into()].into(),
+        });
+        let body = sats_bsatn::to_vec(&msg).unwrap();
+        let frame = Bytes::from(codec::wrap_uncompressed(body));
+        let stats = fake_stats(Subprotocol::V2);
+        assert!(reject_call_procedure(&frame, Subprotocol::V2, &stats).is_none());
+    }
 }
