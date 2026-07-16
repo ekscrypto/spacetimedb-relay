@@ -597,26 +597,21 @@
     return v.toFixed(v < 10 ? 1 : 0) + units[i];
   }
 
-  // Incoming throughput (updates/s and bytes/s) over the upstream 1-minute
-  // window. Falls back to "—" when metrics aren't present (older /health).
+  // Incoming throughput (updates/s) over the upstream 1-minute window.
+  // Falls back to "—" when metrics aren't present (older /health). Only
+  // updates/s is shown: bytes/s is deliberately omitted because the
+  // upstream byte counters measure application-layer (BSATN) payload,
+  // which isn't comparable to the host NIC bandwidth shown above and
+  // invited misleading cross-comparisons.
   function upstreamThroughput(s) {
     var up = s.metrics && s.metrics.upstream;
     if (!up) return "";
-    var unitsPerSec = up.units_1m != null ? up.units_1m / 60 : null;
-    var bytesPerSec = up.bytes_1m != null ? up.bytes_1m / 60 : null;
     var main = "", title = [];
-    if (unitsPerSec != null) {
-      main = formatUnits(Math.round(unitsPerSec)) + " updates/s";
-    }
-    if (bytesPerSec != null) {
-      main = main ? main + " · " : "";
-      main += formatBytes(bytesPerSec);
+    if (up.units_1m != null) {
+      main = formatUnits(Math.round(up.units_1m / 60)) + " updates/s";
     }
     if (up.units_5m != null) {
       title.push("5-min avg: " + Math.round(up.units_5m / 300) + " updates/s");
-    }
-    if (up.bytes_5m != null) {
-      title.push("5-min avg: " + formatBytes(up.bytes_5m / 300));
     }
     return main ? '<span class="mono" title="' + escapeHtml(title.join("\n")) +
       '">' + main + "</span>" : "";
