@@ -216,6 +216,13 @@ pub async fn run(
 
     const BACKOFF_MAX_SECS: u64 = 30;
     const STABLE_THRESHOLD: Duration = Duration::from_secs(5);
+    // Hard timeout for joining the upstream task on reconnect. The task
+    // normally exits within milliseconds of event_rx being dropped (its
+    // parked events_tx.send() returns Err(ChannelClosed)); this backstop
+    // only fires if the task is wedged inside tungstenite mid-message
+    // reassembly, where no channel state change can reach it. Without it
+    // the reconnect loop would hang forever — the 2026-07-17 stall.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
     let mut backoff_secs: u64 = 1;
 
     // Separate backoff for local-stdb reconnects. Starts at 5s so we
@@ -563,9 +570,48 @@ pub async fn run(
         };
 
         // Shut down the upstream connection.
+        //
+        // Order is critical and was the root cause of the 2026-07-17
+        // fleet stall (7 of 14 sources wedged for 30+ minutes). The
+        // upstream task can be parked inside `events_tx.send(Frame).await`
+        // against a full 256-cap event channel whose receiver — this
+        // loop's `event_rx` — is still alive. While event_rx is alive the
+        // send blocks forever instead of returning Err, so awaiting the
+        // task hangs, and since the OneOffQuery probe is a select arm
+        // *inside* that parked task, nothing ever recovers it.
+        //
+        // Fix: drop event_rx FIRST. That turns the parked send into an
+        // immediate Err(ChannelClosed); the task returns via its
+        // EventChannelClosed path and the join completes. The Shutdown
+        // command is still sent as a graceful-close best effort for tasks
+        // currently polling the select (they'll process it and return Ok).
+        // The final `timeout` is a backstop for a task wedged inside
+        // tungstenite mid-message reassembly — no channel signal can
+        // reach it there, so we don't hang the reconnect loop on it.
         let _ = cmd_tx.send(UpstreamCommand::Shutdown).await;
         drop(cmd_tx);
-        let _ = upstream_handle.await;
+        drop(event_rx);
+        match tokio::time::timeout(SHUTDOWN_GRACE, upstream_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "relay::stdb_mode",
+                    error = %e,
+                    "upstream task join failed after shutdown"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "relay::stdb_mode",
+                    grace_secs = SHUTDOWN_GRACE.as_secs(),
+                    "upstream task did not exit within grace window — leaving it detached"
+                );
+                // The handle drops here without awaiting; tokio detaches
+                // the task. It cannot affect this connection's channels
+                // (all senders/receivers are dropped), so leaving it is
+                // safe — at worst it eventually errors out on its own.
+            }
+        }
 
         // On dead-driver exit paths, close the in-flight semaphore BEFORE
         // dropping apply_tx / awaiting the apply task. If the apply task is
@@ -709,6 +755,21 @@ pub async fn run(
                 // close the dead driver and reconnect with the same
                 // identity. Unlike ModuleDead, the fingerprint and
                 // published module are untouched.
+                //
+                // Mark BOTH links down here. The upstream task is being
+                // torn down above (event_rx dropped, task joined) and will
+                // reconnect after stdb comes back. Leaving upstream="up"
+                // during this window is what produced the misleading
+                // "up but 0 units_1m" /health state on 2026-07-17 — the
+                // www stalled pill then flagged these as a real error
+                // condition. Upstream recovers via the existing mark_up()
+                // on the Connected event after reconnect.
+                metrics
+                    .upstream
+                    .mark_down(Some("local-stdb reconnect".into()));
+                metrics
+                    .local_stdb
+                    .mark_down(Some("connection dead — reconnecting".into()));
                 let sleep_for = Duration::from_secs(stdb_backoff_secs);
                 stdb_backoff_secs = (stdb_backoff_secs * 2).min(STDB_BACKOFF_MAX_SECS);
                 tracing::warn!(
