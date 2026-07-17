@@ -245,11 +245,30 @@ async fn main() -> Result<()> {
     // the child is only killed after stdb_mode::run returns.
     let (stdb_url, stdb_server_ref, _stdb_process);
     if args.stdb_spawn {
-        let (url, http_base, proc) =
+        let (url, http_base, proc, is_fresh) =
             stdb_spawn::spawn(&args.spacetime_bin, &args.data_dir).await?;
         stdb_url = url;
         stdb_server_ref = http_base;
         _stdb_process = Some(proc);
+        // A fresh stdb data dir means the instance has no databases yet.
+        // Delete the publisher fingerprint so publish_if_drifted always
+        // republishes rather than skipping because the hash matches a
+        // previous run against a different (shared) stdb instance.
+        if is_fresh {
+            let fp = args
+                .publisher_workdir
+                .clone()
+                .unwrap_or_else(|| args.data_dir.join("mirror-publisher"))
+                .join("fingerprint.json");
+            if fp.exists() {
+                tracing::info!(
+                    target: "relay::stdb_spawn",
+                    path = %fp.display(),
+                    "fresh stdb data dir — deleting stale publisher fingerprint"
+                );
+                let _ = std::fs::remove_file(&fp);
+            }
+        }
     } else {
         stdb_url = args.stdb_url.clone();
         stdb_server_ref = args.stdb_server_alias.clone();
