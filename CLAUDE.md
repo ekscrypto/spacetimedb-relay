@@ -69,23 +69,35 @@ cp tools/mirror-template/{Cargo.toml,rust-toolchain.toml} /tmp/mirror/
 # Run the relay against the live BitCraft test region.
 # `--subscribe-chunk-size 1` is REQUIRED for BitCraft (or any v1
 # upstream with a large schema) — see "Subscribing at scale" below.
-# RELAY_STDB_IDENTITY_TOKEN is optional — on first run the relay
-# captures the local-stdb-issued token via InitialConnection and
-# persists it under --data-dir; subsequent runs reuse it.
-# Frontend proxy listens on 0.0.0.0:3009 by default — see
-# "Frontend proxy" below; downstream v1 clients connect there to get
-# upstream-flavored TUs synthesised from local stdb's TULs.
+# `--stdb-spawn` starts a private SpacetimeDB instance inside the relay
+# process using the `spacetime` binary. Each relay gets its own stdb
+# with data in `<data-dir>/stdb/`. This is the recommended mode for
+# production deployments with multiple relay instances.
+# Without `--stdb-spawn`, the relay uses an external stdb pointed at by
+# `--stdb-url` / `--stdb-server-alias` (the older shared-stdb mode).
 RELAY_UPSTREAM_TOKEN=$(cat .bitcraft-token) \
 cargo run -p relay --release -- \
   --upstream wss://bitcraft-early-access.spacetimedb.com \
   --database bitcraft-live-14 \
   --upstream-protocol v1 \
   --subscribe-chunk-size 1 \
-  --stdb-url ws://127.0.0.1:3010 \
-  --stdb-server-alias relay-local \
+  --stdb-spawn \
   --mirror-database relay-mirror-bc14 \
   --data-dir /var/lib/relay-bc14 \
   --frontend-bind 0.0.0.0:3009
+
+# Legacy mode (shared external stdb):
+# RELAY_UPSTREAM_TOKEN=$(cat .bitcraft-token) \
+# cargo run -p relay --release -- \
+#   --upstream wss://bitcraft-early-access.spacetimedb.com \
+#   --database bitcraft-live-14 \
+#   --upstream-protocol v1 \
+#   --subscribe-chunk-size 1 \
+#   --stdb-url ws://127.0.0.1:3010 \
+#   --stdb-server-alias relay-local \
+#   --mirror-database relay-mirror-bc14 \
+#   --data-dir /var/lib/relay-bc14 \
+#   --frontend-bind 0.0.0.0:3009
 
 # Smoke-test the frontend's v1 path against a running relay (above):
 # subscribes to chat_message_state and prints any synthesised v1 TU.
@@ -120,7 +132,21 @@ Other relay flags worth knowing:
 - `--data-dir` (env `RELAY_DATA_DIR`, default `data/`) — workdir for
   state safe to lose. Publisher workdir defaults to
   `<data-dir>/mirror-publisher`; persisted identity token defaults to
-  `<data-dir>/relay-stdb-identity.token`.
+  `<data-dir>/relay-stdb-identity.token`. With `--stdb-spawn`, the
+  local stdb data dir is `<data-dir>/stdb/`.
+- `--stdb-spawn` (env `RELAY_STDB_SPAWN`, default off) — spawn a
+  private `spacetime start` child process on a free loopback port.
+  Overrides `--stdb-url` and `--stdb-server-alias`. Recommended for
+  production multi-instance deployments: each relay gets its own stdb
+  with isolated WASM scheduling, eliminating cross-region queue
+  contention. Requires `spacetime` (≥ 2.x) on PATH or pointed at by
+  `--spacetime-bin`.
+- `--stdb-url` (env `RELAY_STDB_URL`, default `ws://127.0.0.1:3000`)
+  — URL of an external local stdb (ignored when `--stdb-spawn` is set).
+- `--stdb-server-alias` (env `RELAY_STDB_SERVER_ALIAS`, default
+  `local`) — `spacetime` CLI alias for the local stdb, used by
+  `spacetime publish -s` (ignored when `--stdb-spawn` is set; the
+  spawned instance's HTTP URL is passed directly).
 - `--dashboard-bind` (env `RELAY_DASHBOARD_BIND`, default
   `127.0.0.1:3001`) — see "Dashboard" below. Empty string disables.
 - `--frontend-bind` (env `RELAY_FRONTEND_BIND`, default

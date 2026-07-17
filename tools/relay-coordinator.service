@@ -1,0 +1,28 @@
+# Relay reconnect coordinator — serialises stdb initial-sync floods.
+# Start this before (or alongside) the relay instances. Each relay that
+# has --coordinator-socket set will queue here and be granted a permit
+# one at a time, preventing the shared local stdb from being hammered by
+# 14 concurrent initial syncs after a parallel restart.
+[Unit]
+Description=spacetimedb-relay reconnect coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+ExecStart=/srv/relay/spacetimedb-relay/target/release/relay-coordinator \
+    --socket /run/relay/coordinator.sock \
+    --max-concurrent 1
+RuntimeDirectory=relay
+RuntimeDirectoryMode=0750
+WorkingDirectory=/srv/relay/spacetimedb-relay
+Environment="PATH=/srv/relay/.local/bin:/srv/relay/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=relay_coordinator=info"
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
