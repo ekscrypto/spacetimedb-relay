@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::watch;
+use tokio::sync::Notify;
 
 pub mod registry;
 pub use registry::{MetaEntry, MetaRegistry};
@@ -121,8 +122,14 @@ pub struct MirrorDriver {
     meta_registry: Option<Arc<MetaRegistry>>,
     /// Fires `true` when `drain_responses` detects a module-level
     /// fatal error ("The instance encountered a fatal error.").
-    /// stdb_mode selects on a clone of this to trigger auto-republish.
+    /// stdb_mode selects on this to trigger auto-republish.
     module_dead: watch::Receiver<bool>,
+    /// Fires when `drain_responses` exits due to a WS read error (TCP
+    /// reset, protocol error, unclean close). This is a transport-level
+    /// failure distinct from a WASM panic — the module is likely still
+    /// alive, so the caller should reconnect WITHOUT republishing.
+    /// stdb_mode selects on this to trigger a reconnect-only path.
+    ws_dropped: Arc<Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,10 +151,12 @@ impl MirrorDriver {
         let (sink, stream) = conn.split();
         let in_flight = Arc::new(Semaphore::new(cfg.max_in_flight));
         let (dead_tx, module_dead) = watch::channel(false);
+        let ws_dropped = Arc::new(Notify::new());
         let drain_handle = Some(tokio::spawn(drain_responses(
             stream,
             in_flight.clone(),
             dead_tx,
+            ws_dropped.clone(),
         )));
         Ok(Self {
             sink,
@@ -159,6 +168,7 @@ impl MirrorDriver {
             captured: Some(captured),
             meta_registry: None,
             module_dead,
+            ws_dropped,
         })
     }
 
@@ -167,6 +177,15 @@ impl MirrorDriver {
     /// `stdb_mode` selects on this to trigger an automatic republish.
     pub fn module_dead_receiver(&self) -> watch::Receiver<bool> {
         self.module_dead.clone()
+    }
+
+    /// Returns a handle to the `Notify` that fires when the WS connection
+    /// to the local stdb drops (TCP reset, protocol error, unclean close).
+    /// Unlike [`module_dead_receiver`], this is a transport-level failure
+    /// — the WASM module is likely still alive. The caller should
+    /// reconnect WITHOUT republishing.
+    pub fn ws_dropped_notify(&self) -> &Arc<Notify> {
+        &self.ws_dropped
     }
 
     /// Wire a [`MetaRegistry`] into this driver. Subsequent
@@ -198,6 +217,17 @@ impl MirrorDriver {
     /// number should remember the configured cap themselves.
     pub fn available_permits(&self) -> usize {
         self.in_flight.available_permits()
+    }
+
+    /// Returns a cloned handle to the in-flight semaphore.
+    ///
+    /// Calling [`Semaphore::close`] on this unblocks any `acquire_owned()`
+    /// calls that are currently parked — they return `Err` which maps to
+    /// [`DriverError::Closed`] — allowing the apply task to exit cleanly
+    /// when the local-stdb connection is known dead. Capture this BEFORE
+    /// moving the driver into the apply task.
+    pub fn in_flight_semaphore(&self) -> Arc<Semaphore> {
+        self.in_flight.clone()
     }
 
     /// Apply one TableUpdate's worth of changes for `table`. Splits into
@@ -370,7 +400,12 @@ async fn open_ws(cfg: &DriverConfig) -> Result<Conn, DriverError> {
     Ok(ws)
 }
 
-async fn drain_responses<S>(mut stream: S, in_flight: Arc<Semaphore>, dead_tx: watch::Sender<bool>)
+async fn drain_responses<S>(
+    mut stream: S,
+    in_flight: Arc<Semaphore>,
+    dead_tx: watch::Sender<bool>,
+    ws_dropped: Arc<Notify>,
+)
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
@@ -381,7 +416,9 @@ where
                 if decode_reducer_errors(&bytes) && !*dead_tx.borrow() {
                     // A single "fatal error" from stdb means the WASM
                     // module has crashed and been unregistered. Signal
-                    // stdb_mode to force-republish.
+                    // stdb_mode to force-republish. This is distinct from
+                    // a WS connection drop — the module is dead, not just
+                    // the transport.
                     let _ = dead_tx.send(true);
                 }
             }
@@ -393,25 +430,24 @@ where
             }
             Ok(_) => {}
             Err(e) => {
-                // Any WS read error is connection-fatal: once the stream
-                // errors (IO reset, protocol error, peer closing
-                // uncleanly), tungstenite's `next()` keeps returning
-                // `Some(Err)` forever rather than terminating with `None`.
-                // Looping here used to spin at 100% CPU — the spin starved
-                // the upstream WS, the game server dropped us from its
-                // data feeds, and the relay sat on a live-but-empty
-                // connection indefinitely (the OneOffQuery liveness probe
-                // response couldn't be serviced because this task owned
-                // the core). Break and signal dead so stdb_mode's existing
-                // ModuleDead path force-republishes and reconnects.
+                // WS read error: the transport is broken (TCP reset,
+                // protocol error, peer closing uncleanly). Once the stream
+                // errors, tungstenite's `next()` keeps returning
+                // `Some(Err)` forever rather than terminating with `None`,
+                // so we must break to avoid a 100% CPU spin.
+                //
+                // This is NOT a WASM module panic — the module may still
+                // be alive on the stdb side. Signal ws_dropped so stdb_mode
+                // reconnects WITHOUT republishing (no --delete-data, no
+                // codegen, no re-subscribe). Routing this through dead_tx
+                // (the ModuleDead path) would wipe the mirror database and
+                // re-subscribe all tables on every transient TCP reset.
                 tracing::warn!(
                     target: "relay::mirror_driver",
                     error = %e,
-                    "ws recv error — treating as fatal, signalling reconnect"
+                    "ws recv error — connection dropped, signalling reconnect (no republish)"
                 );
-                if !*dead_tx.borrow() {
-                    let _ = dead_tx.send(true);
-                }
+                ws_dropped.notify_one();
                 break;
             }
         }
@@ -574,15 +610,16 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn drain_responses_terminates_and_signals_dead_on_stream_error() {
+    async fn drain_responses_terminates_on_stream_error_and_signals_ws_dropped() {
         // Regression: a WS read error (e.g. Connection reset by peer) used
-        // to leave the drainer spinning at 100% CPU. tungstenite's `next()`
-        // keeps returning `Some(Err)` after a fatal stream error rather
-        // than terminating with `None`, so the `while let Some` loop never
-        // exited. The fix breaks on the first Err and signals dead_tx so
-        // stdb_mode's ModuleDead path force-republishes + reconnects.
-        // This test feeds a stream of [Ok(Binary), Err, Err, Err] and
-        // asserts the drainer returns promptly (no spin) and sets dead.
+        // to leave the drainer spinning at 100% CPU. The fix breaks on the
+        // first Err and signals ws_dropped via notify_one() (NOT dead_tx /
+        // module_dead — a TCP reset does not mean the WASM module panicked).
+        // This test verifies:
+        //  1. drainer terminates promptly (no spin) on stream error
+        //  2. ws_dropped fires (transport-level signal); notify_one() stores a
+        //     permit so the assertion can consume it after drain_responses exits
+        //  3. dead_tx (module_dead) is NOT set — reserved for WASM panics only
         use futures_util::stream;
         use tokio_tungstenite::tungstenite::Error;
 
@@ -596,20 +633,31 @@ mod tests {
 
         let in_flight = Arc::new(Semaphore::new(8));
         let (dead_tx, dead_rx) = watch::channel(false);
+        let ws_dropped = Arc::new(Notify::new());
 
         // 2s deadline catches a regression spin instantly.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            drain_responses(stream, in_flight.clone(), dead_tx),
+            drain_responses(stream, in_flight.clone(), dead_tx, ws_dropped.clone()),
         )
         .await;
         assert!(
             outcome.is_ok(),
             "drain_responses did not terminate on stream error — likely spinning"
         );
+
+        // notify_one() stores a permit if no waiter is registered yet, so
+        // notified().await returns immediately here — no spawn needed.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            ws_dropped.notified(),
+        )
+        .await
+        .expect("ws_dropped should be notified on stream error");
+
         assert!(
-            *dead_rx.borrow(),
-            "dead_tx should be signalled true after a stream error"
+            !*dead_rx.borrow(),
+            "dead_tx (module_dead) must NOT be set on stream error — reserved for WASM panics"
         );
     }
 

@@ -2,6 +2,9 @@
 
 mod dashboard;
 mod stdb_mode;
+mod stdb_spawn;
+
+use relay_coordinator::CoordinatorClient;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,12 +94,23 @@ struct Args {
 
     /// spacetime CLI server alias (run `spacetime server add ...` once
     /// to register the local SpacetimeDB before running the relay).
+    /// Ignored when `--stdb-spawn` is set; the spawned instance's HTTP
+    /// URL is used directly.
     #[arg(
         long = "stdb-server-alias",
         env = "RELAY_STDB_SERVER_ALIAS",
         default_value = "local"
     )]
     stdb_server_alias: String,
+
+    /// When set, the relay spawns its own `spacetime start` child process
+    /// (using `--spacetime-bin`) on a free loopback port and manages its
+    /// lifecycle. Each relay instance gets an isolated SpacetimeDB with
+    /// data in `<data-dir>/stdb/`. Overrides `--stdb-url` and
+    /// `--stdb-server-alias`. Requires SpacetimeDB CLI ≥ 2.x on PATH or
+    /// pointed at by `--spacetime-bin`.
+    #[arg(long = "stdb-spawn", env = "RELAY_STDB_SPAWN", default_value_t = false)]
+    stdb_spawn: bool,
 
     /// Mirror database name. Defaults to a sanitized form of
     /// `relay-mirror-<upstream-database>`.
@@ -134,6 +148,13 @@ struct Args {
         default_value = "spacetime"
     )]
     spacetime_bin: PathBuf,
+
+    /// Unix socket path of the relay-coordinator daemon. When set the
+    /// relay acquires a permit from the coordinator before each stdb
+    /// reconnect and releases it once the initial sequential subscribe
+    /// completes. Absent = uncoordinated (stdb backoff only).
+    #[arg(long = "coordinator-socket", env = "RELAY_COORDINATOR_SOCKET")]
+    coordinator_socket: Option<PathBuf>,
 
     /// Bind address for the in-process dashboard (HTML + /metrics JSON).
     /// Empty string disables the dashboard.
@@ -216,12 +237,32 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Resolve the local-stdb URL and server reference (alias or HTTP URL
+    // for `spacetime publish -s`) — either by spawning our own instance or
+    // using the caller-supplied --stdb-url / --stdb-server-alias pair.
+    // The StdbProcess handle must stay alive for the duration of main so
+    // the child is only killed after stdb_mode::run returns.
+    let (stdb_url, stdb_server_ref, _stdb_process);
+    if args.stdb_spawn {
+        let (url, http_base, proc) =
+            stdb_spawn::spawn(&args.spacetime_bin, &args.data_dir).await?;
+        stdb_url = url;
+        stdb_server_ref = http_base;
+        _stdb_process = Some(proc);
+    } else {
+        stdb_url = args.stdb_url.clone();
+        stdb_server_ref = args.stdb_server_alias.clone();
+        _stdb_process = None;
+    }
+
     tracing::info!(
         target: "relay",
         upstream = %args.upstream,
         database = %args.database,
         protocol = %args.upstream_protocol,
-        stdb_url = %args.stdb_url,
+        stdb_url = %stdb_url,
+        stdb_spawn = args.stdb_spawn,
         subscribe_tables = ?args.subscribe_tables,
         "spacetimedb-relay starting"
     );
@@ -299,7 +340,7 @@ async fn main() -> Result<()> {
                 });
                 let cfg = relay_frontend::Config {
                     bind,
-                    local_url: args.stdb_url.clone(),
+                    local_url: stdb_url.clone(),
                     local_database: args
                         .mirror_database
                         .clone()
@@ -352,6 +393,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    let coordinator = args.coordinator_socket.map(|path| {
+        CoordinatorClient::new(path, mirror_database.clone())
+    });
+
     let cfg = stdb_mode::StdbModeConfig {
         upstream_host: args.upstream,
         upstream_database: args.database,
@@ -360,11 +405,12 @@ async fn main() -> Result<()> {
         frame_limit: args.frame_limit,
         subscribe_tables: args.subscribe_tables,
         subscribe_chunk_size: args.subscribe_chunk_size,
-        stdb_url: args.stdb_url,
+        stdb_url,
         mirror_database,
         identity_token: args.stdb_identity_token,
         identity_token_file,
-        stdb_server_alias: args.stdb_server_alias,
+        stdb_server_alias: stdb_server_ref,
+        coordinator,
         publisher_workdir,
         publisher_template_dir: template_dir,
         codegen_script,

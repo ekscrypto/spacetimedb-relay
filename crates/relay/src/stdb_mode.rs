@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use relay_coordinator::CoordinatorClient;
 use relay_mirror_driver::{DriverConfig, DriverError, MetaRegistry, MirrorDriver};
 use relay_protocol::api_messages::websocket::v2::{ServerMessage, TableUpdateRows};
 use relay_protocol::{MirroredSchema, UpstreamReducerMeta};
@@ -35,7 +36,6 @@ use relay_upstream::{
     UpstreamConfig, UpstreamEvent,
 };
 use tokio::sync::mpsc;
-use tokio::sync::Notify;
 use url::Url;
 
 use crate::dashboard::Metrics;
@@ -73,6 +73,13 @@ pub struct StdbModeConfig {
     pub identity_token_file: PathBuf,
     /// Server alias known to `spacetime` CLI (e.g. `relay-local`).
     pub stdb_server_alias: String,
+
+    /// Optional coordinator client. When present the relay acquires a
+    /// permit from the coordinator before each stdb reconnect and
+    /// releases it once all sequential subscriptions are applied.
+    /// `None` means uncoordinated — the stdb backoff alone governs
+    /// reconnect spacing.
+    pub coordinator: Option<CoordinatorClient>,
 
     /// Where to materialize the generated mirror crate.
     pub publisher_workdir: PathBuf,
@@ -211,13 +218,13 @@ pub async fn run(
     const STABLE_THRESHOLD: Duration = Duration::from_secs(5);
     let mut backoff_secs: u64 = 1;
 
-    // Signal fired by the applier task when apply() returns a connection-
-    // fatal error (the WS sink is dead). The reconnect loop selects on this
-    // so a dead local-stdb connection is detected even when the upstream
-    // stays alive — without it, the applier silently swallows apply errors
-    // forever and the relay stalls with 0 throughput (observed on
-    // relay-bc8: upstream=up, stdb=up, in_flight=8000/8000, no recovery).
-    let stdb_dead = std::sync::Arc::new(Notify::new());
+    // Separate backoff for local-stdb reconnects. Starts at 5s so we
+    // don't immediately re-flood an overloaded shared stdb; caps at 60s.
+    // Reset to 5 whenever the stdb connection was healthy long enough
+    // (i.e. the inner loop exited for a non-stdb reason).
+    const STDB_BACKOFF_MAX_SECS: u64 = 60;
+    let mut stdb_backoff_secs: u64 = 5;
+
     // Shared mirror of the driver's in_flight available-permits count,
     // updated by the applier task after each apply() call so the reconnect
     // loop's watchdog can detect saturation without owning the driver.
@@ -241,7 +248,14 @@ pub async fn run(
     let mut sequential_progress = SequentialState {
         next_idx: 0,
         in_flight_query_id: None,
+        all_applied: false,
     };
+
+    // Holds the coordinator permit across a reconnect cycle. Acquired in
+    // StdbConnectionDead before `continue 'reconnect`; released (dropped)
+    // once all sequential subscriptions are applied, or on any exit that
+    // doesn't restart the subscribe loop (Shutdown, UpstreamGone, etc.).
+    let mut permit_opt: Option<relay_coordinator::ReconnectPermit> = None;
 
     'reconnect: loop {
         let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -262,6 +276,7 @@ pub async fn run(
             sequential_progress = SequentialState {
                 next_idx: 0,
                 in_flight_query_id: None,
+                all_applied: false,
             };
         }
 
@@ -282,8 +297,20 @@ pub async fn run(
         // refcounts and the driver's own 8K in-flight semaphore.
         let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<ApplyJob>();
         let metrics_clone = metrics.clone();
+        // Capture the driver's WS-dropped notify before moving the driver
+        // into the applier task. Both the drainer (WS read error) and the
+        // applier (connection-fatal apply error) signal through this — they
+        // both mean the transport is dead and we should reconnect without
+        // republishing. Clone so the select loop keeps its own handle.
+        let ws_dropped = driver.ws_dropped_notify().clone();
+        let ws_dropped_apply = ws_dropped.clone();
+        // Capture the in-flight semaphore handle before moving the driver.
+        // On dead-driver exit paths (StdbConnectionDead, ModuleDead) we close
+        // the semaphore so the apply task can exit from acquire_owned() even
+        // when all 8 K permits are consumed and the drainer has stopped
+        // returning them — without this, apply_handle.await deadlocks.
+        let in_flight_cancel = driver.in_flight_semaphore();
         let mut apply_driver = driver;
-        let stdb_dead_apply = stdb_dead.clone();
         let in_flight_mirror = apply_in_flight_available.clone();
         let apply_handle = tokio::spawn(async move {
             loop {
@@ -315,7 +342,7 @@ pub async fn run(
                                 "local-stdb apply connection-fatal — signalling reconnect"
                             );
                             in_flight_mirror.store(0, std::sync::atomic::Ordering::Relaxed);
-                            stdb_dead_apply.notify_waiters();
+                            ws_dropped_apply.notify_one();
                             break;
                         }
                         // Per-table logic error (e.g. a missing reducer from
@@ -370,16 +397,18 @@ pub async fn run(
             let event = tokio::select! {
                 biased;
                 _ = shutdown.as_mut() => break InnerExit::Shutdown,
-                _ = stdb_dead.notified() => {
-                    // The applier task detected a connection-fatal apply
-                    // error — the WS sink is dead and the drainer has
-                    // exited. Reconnect the local stdb.
+                _ = ws_dropped.notified() => {
+                    // The drainer detected a WS read error, or the applier
+                    // detected a connection-fatal apply error. Either way
+                    // the transport is dead — reconnect WITHOUT republishing
+                    // (the WASM module is likely still alive).
                     break InnerExit::StdbConnectionDead;
                 }
                 r = module_dead.changed() => {
                     // Edge-triggered: fires when drain_responses detected
-                    // a WASM fatal error or WS recv error. Also fires
-                    // (Err) if the sender was dropped (driver
+                    // a WASM fatal error ("The instance encountered a fatal
+                    // error."). WS read errors now go to ws_dropped instead.
+                    // Also fires (Err) if the sender was dropped (driver
                     // disconnected) — only treat as ModuleDead on Ok + true.
                     if r.is_ok() && *module_dead.borrow() {
                         break InnerExit::ModuleDead;
@@ -452,6 +481,13 @@ pub async fn run(
                             "failed to decode ServerMessage"
                         ),
                     }
+                    // Release the coordinator permit once all sequential
+                    // subscriptions are applied — the heavy initial-sync
+                    // flood is over and the next queued relay can proceed.
+                    if sequential && sequential_progress.all_applied && permit_opt.is_some() {
+                        let _ = permit_opt.take();
+                    }
+
                     if let Some(limit) = cfg.frame_limit {
                         if frames >= limit {
                             tracing::info!(target: "relay::stdb_mode", frames, "frame limit reached");
@@ -474,6 +510,17 @@ pub async fn run(
         drop(cmd_tx);
         let _ = upstream_handle.await;
 
+        // On dead-driver exit paths, close the in-flight semaphore BEFORE
+        // dropping apply_tx / awaiting the apply task. If the apply task is
+        // parked in acquire_owned() (all 8 K permits consumed, drainer gone),
+        // dropping apply_tx alone is not enough — the task is not selecting on
+        // the channel, it's waiting for a permit. close() makes acquire_owned()
+        // return Err → DriverError::Closed → connection-fatal → task signals
+        // ws_dropped and breaks. For UpstreamGone/Shutdown/FrameLimitReached
+        // the driver is still live and the apply task drains naturally.
+        if matches!(exit_reason, InnerExit::StdbConnectionDead | InnerExit::ModuleDead) {
+            in_flight_cancel.close();
+        }
         // Drain the apply pipeline and recover the driver.
         drop(apply_tx);
         driver = match apply_handle.await {
@@ -572,6 +619,7 @@ pub async fn run(
                     "driver reconnected after force-republish — restarting upstream subscription"
                 );
                 backoff_secs = 1;
+                stdb_backoff_secs = 5;
                 continue 'reconnect;
             }
             InnerExit::UpstreamGone => {
@@ -579,6 +627,8 @@ pub async fn run(
                 if stayed_up >= STABLE_THRESHOLD {
                     backoff_secs = 1;
                 }
+                // Upstream died while stdb was healthy — stdb backoff can reset.
+                stdb_backoff_secs = 5;
                 let sleep_for = Duration::from_secs(backoff_secs);
                 backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
                 tracing::warn!(
@@ -602,26 +652,71 @@ pub async fn run(
                 // close the dead driver and reconnect with the same
                 // identity. Unlike ModuleDead, the fingerprint and
                 // published module are untouched.
+                let sleep_for = Duration::from_secs(stdb_backoff_secs);
+                stdb_backoff_secs = (stdb_backoff_secs * 2).min(STDB_BACKOFF_MAX_SECS);
                 tracing::warn!(
                     target: "relay::stdb_mode",
                     database = %cfg.mirror_database,
+                    backoff_secs = sleep_for.as_secs(),
                     "local-stdb connection dead — reconnecting (no republish)"
                 );
                 let _ = driver.close().await;
+                // driver is now consumed/closed. All subsequent shutdown exits in
+                // this arm use `return Ok(())` rather than `break 'reconnect` so
+                // the post-loop `driver.close()` is never reached with a moved driver.
 
-                let identity_token = if cfg.identity_token.is_some() {
-                    cfg.identity_token.clone()
-                } else {
-                    load_identity_token(&cfg.identity_token_file)
+                // Sleep BEFORE the reconnect attempt so stdb has time to recover
+                // under load. Without this, MirrorDriver::connect() fires immediately
+                // and races with other relays that hit the same dead-connection path.
+                tokio::select! {
+                    _ = shutdown.as_mut() => {
+                        tracing::info!(target: "relay::stdb_mode", "shutdown during stdb backoff");
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(sleep_for) => {}
+                }
+
+                // Retry the connect in a loop rather than crashing. If stdb is
+                // temporarily overloaded (e.g. another relay's initial sync is
+                // flooding it), the connection attempt itself can time out. Keep
+                // retrying with growing backoff until we succeed or are shut down.
+                driver = loop {
+                    let identity_token = if cfg.identity_token.is_some() {
+                        cfg.identity_token.clone()
+                    } else {
+                        load_identity_token(&cfg.identity_token_file)
+                    };
+                    match MirrorDriver::connect(DriverConfig {
+                        stdb_url: cfg.stdb_url.clone(),
+                        database: cfg.mirror_database.clone(),
+                        identity_token,
+                        ..Default::default()
+                    })
+                    .await
+                    {
+                        Ok(d) => break d,
+                        Err(e) => {
+                            let retry_secs = stdb_backoff_secs;
+                            stdb_backoff_secs =
+                                (stdb_backoff_secs * 2).min(STDB_BACKOFF_MAX_SECS);
+                            tracing::warn!(
+                                target: "relay::stdb_mode",
+                                database = %cfg.mirror_database,
+                                error = %e,
+                                retry_secs,
+                                "local-stdb reconnect failed — retrying"
+                            );
+                            tokio::select! {
+                                _ = shutdown.as_mut() => {
+                                    tracing::info!(target: "relay::stdb_mode",
+                                        "shutdown during stdb reconnect retry");
+                                    return Ok(());
+                                }
+                                _ = tokio::time::sleep(Duration::from_secs(retry_secs)) => {}
+                            }
+                        }
+                    }
                 };
-                driver = MirrorDriver::connect(DriverConfig {
-                    stdb_url: cfg.stdb_url.clone(),
-                    database: cfg.mirror_database.clone(),
-                    identity_token,
-                    ..Default::default()
-                })
-                .await
-                .context("reconnect to local stdb after connection death")?;
                 driver.set_meta_registry(meta_registry.clone());
                 metrics.local_stdb.mark_up();
                 if let Some(captured) = driver.captured() {
@@ -647,9 +742,17 @@ pub async fn run(
                 tracing::info!(
                     target: "relay::stdb_mode",
                     database = %cfg.mirror_database,
-                    "driver reconnected after stdb connection death — restarting upstream subscription"
+                    "driver reconnected — restarting upstream subscription"
                 );
                 backoff_secs = 1;
+                // Acquire a coordinator permit (if configured). This blocks until
+                // the coordinator grants a slot — i.e. until no other relay is
+                // mid-initial-sync. Falls back to uncoordinated if the daemon is absent.
+                if sequential {
+                    if let Some(ref client) = cfg.coordinator {
+                        permit_opt = client.acquire().await;
+                    }
+                }
                 continue 'reconnect;
             }
         }
@@ -665,6 +768,10 @@ pub async fn run(
 struct SequentialState {
     next_idx: usize,
     in_flight_query_id: Option<u32>,
+    /// Set to `true` once all tables have received `SubscribeApplied`.
+    /// The reconnect loop polls this to know when to release the
+    /// coordinator permit.
+    all_applied: bool,
 }
 
 /// One unit of work for the applier task: apply a batch of row changes
@@ -830,6 +937,7 @@ async fn dispatch_message(
                         n_tables = subscribe_tables.len(),
                         "all sequential subscriptions applied"
                     );
+                    sequential_progress.all_applied = true;
                 }
             }
         }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/relay",
+    "crates/relay-coordinator",
     "crates/relay-protocol",
     "crates/relay-upstream",
     "crates/relay-test-harness",
@@ -27,6 +28,7 @@ relay-upstream = { path = "crates/relay-upstream" }
 relay-publisher = { path = "crates/relay-publisher" }
 relay-mirror-driver = { path = "crates/relay-mirror-driver" }
 relay-frontend = { path = "crates/relay-frontend" }
+relay-coordinator = { path = "crates/relay-coordinator" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

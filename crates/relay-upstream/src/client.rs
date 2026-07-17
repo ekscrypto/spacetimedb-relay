@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use relay_protocol::api_messages::websocket::common::QuerySetId;
-use relay_protocol::api_messages::websocket::v2::{ClientMessage, ServerMessage, Subscribe};
+use relay_protocol::api_messages::websocket::v2::{ClientMessage, OneOffQuery, ServerMessage, Subscribe};
 use relay_protocol::sats::bsatn;
 use relay_protocol::tags;
 use relay_protocol::UpstreamReducerMeta;
@@ -527,9 +527,15 @@ pub async fn connect_and_run(
                             v1_compat::encode_one_off_query(PROBE_MESSAGE_ID, "SELECT 1")?
                         }
                         ProtocolVersion::V2 => {
-                            return Err(UpstreamError::Encode(
-                                "probe not implemented for v2 protocol".into(),
-                            ));
+                            // v2 OneOffQuery: no compression prefix; request_id
+                            // is arbitrary since we intercept the response by
+                            // server tag, not by id (relay is the sole sender).
+                            let msg = ClientMessage::OneOffQuery(OneOffQuery {
+                                request_id: 0,
+                                query_string: "SELECT 1".into(),
+                            });
+                            bsatn::to_vec(&msg)
+                                .map_err(|e| UpstreamError::Encode(e.to_string()))?
                         }
                     };
                     debug!(target: "relay::upstream", "sending liveness probe");

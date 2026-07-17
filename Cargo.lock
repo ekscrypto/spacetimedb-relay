@@ -1716,11 +1716,13 @@ dependencies = [
  "clap",
  "dhat",
  "parking_lot",
+ "relay-coordinator",
  "relay-frontend",
  "relay-mirror-driver",
  "relay-protocol",
  "relay-publisher",
  "relay-upstream",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
@@ -1728,6 +1730,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "relay-coordinator"
+version = "2.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
