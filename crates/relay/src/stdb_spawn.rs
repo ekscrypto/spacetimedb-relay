@@ -63,8 +63,15 @@ pub async fn spawn(
     );
 
     // `spacetime start` is a foreground command; we own its lifetime.
+    //
+    // `--in-memory` disables on-disk persistence entirely: stdb keeps all
+    // database pages in RAM and writes nothing to the data dir for them.
+    // This is intentional for relay mirrors — every boot performs a full
+    // resync from upstream, so there is nothing to recover and the disk
+    // write path is pure overhead. Removing it eliminates the iowait that
+    // bottlenecked per-region apply throughput under the per-mirror layout.
     let child = tokio::process::Command::new(spacetime_bin)
-        .args(["start", "--listen-addr", &listen_addr, "--data-dir"])
+        .args(["start", "--in-memory", "--listen-addr", &listen_addr, "--data-dir"])
         .arg(&stdb_data_dir)
         // Don't inherit our file descriptors — stdb emits its own log
         // format to stdout, which would interleave with the relay's
