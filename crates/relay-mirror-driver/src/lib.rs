@@ -19,7 +19,7 @@ pub mod registry;
 pub use registry::{MetaEntry, MetaRegistry};
 
 use bytes::Bytes;
-use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 pub use relay_protocol::UpstreamReducerMeta;
@@ -95,7 +95,6 @@ impl Default for DriverConfig {
 
 type Conn = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Conn, Message>;
-type Stream = SplitStream<Conn>;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ApplyStats {
@@ -365,12 +364,10 @@ async fn open_ws(cfg: &DriverConfig) -> Result<Conn, DriverError> {
     Ok(ws)
 }
 
-async fn drain_responses(
-    mut stream: Stream,
-    in_flight: Arc<Semaphore>,
-    dead_tx: watch::Sender<bool>,
-) {
-    let mut warn_budget = 5u8;
+async fn drain_responses<S>(mut stream: S, in_flight: Arc<Semaphore>, dead_tx: watch::Sender<bool>)
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(Message::Binary(bytes)) => {
@@ -390,10 +387,26 @@ async fn drain_responses(
             }
             Ok(_) => {}
             Err(e) => {
-                if warn_budget > 0 {
-                    tracing::warn!(target: "relay::mirror_driver", "ws recv error: {e}");
-                    warn_budget -= 1;
+                // Any WS read error is connection-fatal: once the stream
+                // errors (IO reset, protocol error, peer closing
+                // uncleanly), tungstenite's `next()` keeps returning
+                // `Some(Err)` forever rather than terminating with `None`.
+                // Looping here used to spin at 100% CPU — the spin starved
+                // the upstream WS, the game server dropped us from its
+                // data feeds, and the relay sat on a live-but-empty
+                // connection indefinitely (the OneOffQuery liveness probe
+                // response couldn't be serviced because this task owned
+                // the core). Break and signal dead so stdb_mode's existing
+                // ModuleDead path force-republishes and reconnects.
+                tracing::warn!(
+                    target: "relay::mirror_driver",
+                    error = %e,
+                    "ws recv error — treating as fatal, signalling reconnect"
+                );
+                if !*dead_tx.borrow() {
+                    let _ = dead_tx.send(true);
                 }
+                break;
             }
         }
     }
@@ -553,6 +566,46 @@ fn push_vec_vec_u8(buf: &mut Vec<u8>, rows: &[Bytes]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_responses_terminates_and_signals_dead_on_stream_error() {
+        // Regression: a WS read error (e.g. Connection reset by peer) used
+        // to leave the drainer spinning at 100% CPU. tungstenite's `next()`
+        // keeps returning `Some(Err)` after a fatal stream error rather
+        // than terminating with `None`, so the `while let Some` loop never
+        // exited. The fix breaks on the first Err and signals dead_tx so
+        // stdb_mode's ModuleDead path force-republishes + reconnects.
+        // This test feeds a stream of [Ok(Binary), Err, Err, Err] and
+        // asserts the drainer returns promptly (no spin) and sets dead.
+        use futures_util::stream;
+        use tokio_tungstenite::tungstenite::Error;
+
+        let msgs: Vec<Result<Message, Error>> = vec![
+            Ok(Message::Binary(Vec::new())),
+            Err(Error::AlreadyClosed),
+            Err(Error::AlreadyClosed),
+            Err(Error::AlreadyClosed),
+        ];
+        let stream = stream::iter(msgs);
+
+        let in_flight = Arc::new(Semaphore::new(8));
+        let (dead_tx, dead_rx) = watch::channel(false);
+
+        // 2s deadline catches a regression spin instantly.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drain_responses(stream, in_flight.clone(), dead_tx),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "drain_responses did not terminate on stream error — likely spinning"
+        );
+        assert!(
+            *dead_rx.borrow(),
+            "dead_tx should be signalled true after a stream error"
+        );
+    }
 
     #[test]
     fn chunk_returns_single_when_under_limits() {
