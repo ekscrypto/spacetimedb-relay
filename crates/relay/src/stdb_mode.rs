@@ -232,6 +232,14 @@ pub async fn run(
     const MAX_IN_FLIGHT: usize = 8000;
     let apply_in_flight_available =
         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(MAX_IN_FLIGHT));
+    // Monotonic count of apply() calls completed since connect. Lets the
+    // liveness watchdog distinguish "stdb is slow but making progress"
+    // (permits saturated, counter advancing) from "stdb is dead" (permits
+    // saturated AND counter frozen). Without this, a CPU-bound but healthy
+    // stdb is misdiagnosed as a dead connection and force-reconnected,
+    // which only adds load and worsens the slowdown.
+    let apply_completed =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     enum InnerExit {
         Shutdown,
@@ -260,6 +268,10 @@ pub async fn run(
     'reconnect: loop {
         let (event_tx, mut event_rx) = mpsc::channel(256);
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        // Fresh apply-progress baseline for this connection attempt — the
+        // watchdog compares apply_completed against the count captured at
+        // the first saturated tick to decide whether stdb is advancing.
+        apply_completed.store(0, std::sync::atomic::Ordering::Relaxed);
         let attempt_cfg = upstream_cfg.clone();
         let upstream_handle = tokio::spawn(async move {
             if let Err(e) = connect_and_run(attempt_cfg, event_tx, cmd_rx).await {
@@ -312,6 +324,7 @@ pub async fn run(
         let in_flight_cancel = driver.in_flight_semaphore();
         let mut apply_driver = driver;
         let in_flight_mirror = apply_in_flight_available.clone();
+        let apply_completed_mirror = apply_completed.clone();
         let apply_handle = tokio::spawn(async move {
             loop {
                 let Some(job) = apply_rx.recv().await else {
@@ -363,6 +376,9 @@ pub async fn run(
                     apply_driver.available_permits(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                // Bump the progress counter so the watchdog can confirm the
+                // apply pipeline is advancing — not just saturated.
+                apply_completed_mirror.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 metrics_clone
                     .local_stdb
                     .record_traffic(stats.bytes_sent, stats.calls);
@@ -378,9 +394,14 @@ pub async fn run(
         // connection is silently dead. The fingerprint of a dead WS is
         // all in-flight permits held (apply() acquired them, the drainer
         // that returns them is gone) with no progress. We check every
-        // 15s; if fully saturated for two consecutive checks, the
-        // connection is dead.
+        // 15s; if fully saturated for two consecutive checks (30s) AND
+        // apply_completed hasn't advanced in that window, the connection
+        // is dead. The progress check is essential: a live but CPU-bound
+        // stdb can sit fully saturated for >30s while still draining, and
+        // tearing it down only adds re-subscribe load and worsens the
+        // slowdown.
         let mut saturation_ticks: u32 = 0;
+        let mut last_apply_count: Option<u64> = None;
         let mut watchdog = tokio::time::interval(Duration::from_secs(15));
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -417,24 +438,60 @@ pub async fn run(
                 }
                 _ = watchdog.tick() => {
                     // in_flight saturation watchdog. If every permit is
-                    // held (max_in_flight == 0 available), the drainer
-                    // isn't returning permits — it's dead. Require two
-                    // consecutive saturated ticks (30s) to avoid false
-                    // positives during legitimate burst processing.
+                    // held (max_in_flight == 0 available) the drainer may
+                    // be gone — but only declare the connection dead when
+                    // permits stayed at 0 across two ticks (30s) AND no
+                    // apply() completed in between. A live-but-slow stdb
+                    // keeps completing apply() calls (slowly), advancing
+                    // apply_completed; that path must NOT trigger a
+                    // reconnect, since tearing down and re-subscribing all
+                    // tables only adds load to an already-slow stdb.
                     let avail = apply_in_flight_available.load(std::sync::atomic::Ordering::Relaxed);
                     if avail == 0 {
-                        saturation_ticks += 1;
-                        if saturation_ticks >= 2 {
-                            tracing::error!(
-                                target: "relay::stdb_mode",
-                                available_permits = avail,
-                                "local-stdb in_flight fully saturated for 30s — \
-                                 connection is dead, forcing reconnect"
-                            );
-                            break InnerExit::StdbConnectionDead;
+                        let done = apply_completed.load(std::sync::atomic::Ordering::Relaxed);
+                        match last_apply_count {
+                            None => {
+                                // First saturated tick: capture the progress
+                                // baseline. The next tick decides whether stdb
+                                // advanced.
+                                last_apply_count = Some(done);
+                                saturation_ticks = 1;
+                            }
+                            Some(prev) => {
+                                if done == prev {
+                                    // Still saturated AND frozen — stdb is dead.
+                                    saturation_ticks += 1;
+                                    if saturation_ticks >= 2 {
+                                        tracing::error!(
+                                            target: "relay::stdb_mode",
+                                            available_permits = avail,
+                                            apply_completed = done,
+                                            "local-stdb in_flight fully saturated for 30s \
+                                             with no apply progress — connection is dead, \
+                                             forcing reconnect"
+                                        );
+                                        break InnerExit::StdbConnectionDead;
+                                    }
+                                } else {
+                                    // Saturated but advancing — stdb is alive,
+                                    // just behind. Leave it alone; reconnecting
+                                    // would only add load.
+                                    tracing::debug!(
+                                        target: "relay::stdb_mode",
+                                        available_permits = avail,
+                                        apply_completed = done,
+                                        prev_apply_completed = prev,
+                                        "local-stdb in_flight saturated but apply is progressing — \
+                                         leaving connection alone"
+                                    );
+                                    last_apply_count = Some(done);
+                                    saturation_ticks = 1;
+                                }
+                            }
                         }
                     } else {
                         saturation_ticks = 0;
+                        last_apply_count = None;
                     }
                     // Yield to the event arm to process a frame this iteration.
                     continue;
