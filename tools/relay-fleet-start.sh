@@ -10,7 +10,8 @@
 # at boot, or manually after a binary update / bulk stop.
 #
 # Behavior:
-#   1. Wait for the shared stdb (127.0.0.1:3050/v1/health → 200).
+#   1. Verify the relay binary exists (each relay spawns its own stdb
+#      via --stdb-spawn; there is no shared stdb pre-flight check).
 #   2. Start relay-global, then each relay-bc* region in ascending ID
 #      order, one at a time. For each: start it, then poll its dashboard
 #      /metrics until upstream.state == "up" before starting the next.
@@ -24,8 +25,7 @@
 
 set -u
 
-STDB_URL="http://127.0.0.1:3050/v1/health"
-STDB_WAIT_secs=120      # stdb boot is fast; 2 min is generous
+RELAY_BIN=/srv/relay/spacetimedb-relay/target/release/relay
 RELAY_READY_secs=600    # schema-drift path runs cargo build: ~5-7 min
 POLL_interval=5
 
@@ -37,20 +37,13 @@ dash_port() {
         | grep -oE '[0-9]+$' | head -1
 }
 
-# Wait for stdb /v1/health to return HTTP 200.
-wait_for_stdb() {
-    log "waiting for stdb health at $STDB_URL (up to ${STDB_WAIT_secs}s)…"
-    elapsed=0
-    while [ "$elapsed" -lt "$STDB_WAIT_secs" ]; do
-        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$STDB_URL" 2>/dev/null || echo 000)
-        if [ "$code" = "200" ]; then
-            log "stdb healthy after ${elapsed}s."
-            return 0
-        fi
-        sleep "$POLL_interval"
-        elapsed=$((elapsed + POLL_interval))
-    done
-    log "ERROR: stdb not healthy after ${STDB_WAIT_secs}s (last HTTP $code) — aborting fleet start."
+# Check that the relay binary exists (each relay spawns its own stdb).
+check_relay_bin() {
+    if [ -x "$RELAY_BIN" ]; then
+        log "relay binary found: $RELAY_BIN"
+        return 0
+    fi
+    log "ERROR: relay binary not found or not executable: $RELAY_BIN — aborting fleet start."
     return 1
 }
 
@@ -96,6 +89,7 @@ discover_units() {
         case "$name" in
             relay-stdb) continue ;;
             relay-fleet-sequencer) continue ;;
+            relay-coordinator) continue ;;
             relay-global) echo "0global $name" ;;
             relay-bc*)    echo "$(echo "$name" | sed 's/relay-bc//') $name" ;;
             *)            echo "999 $name" ;;
@@ -105,7 +99,7 @@ discover_units() {
 
 # --- main ---
 
-wait_for_stdb || exit 1
+check_relay_bin || exit 1
 
 ok=0
 timed_out=0
