@@ -632,7 +632,9 @@
 
       // Status: driven by the live upstream (and local-stdb) connection
       // state, not by schema cache. "up" requires both links up; "down"
-      // if either is down; otherwise "initial".
+      // if either is down or if no state is reported at all (a source
+      // with no metrics is assumed down, not initialising); otherwise
+      // "initial" only when a partial/ transitional state is present.
       var m = s.metrics || {};
       var upState = (m.upstream && m.upstream.state) || "";
       var lsState = (m.local_stdb && m.local_stdb.state) || "";
@@ -640,6 +642,9 @@
       if (upState === "up" && lsState === "up") {
         state = "up"; cls = "up"; label = "up";
       } else if (upState === "down" || lsState === "down") {
+        state = "down"; cls = "bad"; label = "down";
+      } else if (!upState && !lsState) {
+        // No state reported at all — assume down rather than initialising.
         state = "down"; cls = "bad"; label = "down";
       } else {
         state = "initial"; cls = "warn"; label = upState || lsState || "initial";
@@ -653,19 +658,24 @@
       healthBody.appendChild(tr);
     });
 
-    // Overall header pill: now reflects real up/down across all sources,
-    // derived from upstream/local_stdb state. Falls back to schema_cached
-    // only when no metrics are reported (older /health).
+    // Overall header pill: reflects real up/down across all sources,
+    // derived from upstream/local_stdb state. A source with no reported
+    // metrics is counted as down, not initialising — so a partially-down
+    // fleet reports the down count rather than "connecting".
     var upCount = 0, downCount = 0, hasMetrics = false;
     sources.forEach(function (s) {
       var m = s.metrics && s.metrics.upstream;
-      if (!m) return;
+      if (!m) {
+        // No metrics → assume down.
+        downCount++;
+        return;
+      }
       hasMetrics = true;
       if (m.state === "up") upCount++;
       else if (m.state === "down") downCount++;
     });
     srcCount.textContent = String(schemaCount != null ? schemaCount : sources.length);
-    if (hasMetrics) {
+    if (hasMetrics || downCount > 0) {
       if (downCount === 0 && upCount === sources.length) {
         overallPill.className = "pill up";
         overallPill.textContent = "all up";
