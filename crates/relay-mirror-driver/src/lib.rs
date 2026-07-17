@@ -394,7 +394,18 @@ async fn open_ws(cfg: &DriverConfig) -> Result<Conn, DriverError> {
             .map_err(|e| DriverError::Url(format!("invalid identity token: {e}")))?;
         req.headers_mut().insert(AUTHORIZATION, v);
     }
-    let (ws, _resp) = tokio_tungstenite::connect_async(req)
+    // Disable tungstenite's 64 MiB default message/frame size cap. The
+    // local stdb can emit a single frame exceeding that during a big
+    // snapshot/apply burst — observed in production as `Space limit
+    // exceeded: Message too long: 67112960 > 67108864`, which killed the
+    // WS read mid-message. Every other WS path in this repo sets the same
+    // None/None (see relay-upstream client.rs connect_async_with_config).
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: None,
+        max_frame_size: None,
+        ..Default::default()
+    };
+    let (ws, _resp) = tokio_tungstenite::connect_async_with_config(req, Some(ws_config), false)
         .await
         .map_err(|e| DriverError::Connect(e.to_string()))?;
     Ok(ws)
