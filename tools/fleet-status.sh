@@ -64,9 +64,10 @@ label() {
 }
 
 print_once() {
-    # Header.
-    printf '%-7s %-15s %-9s %10s %10s %9s %-9s %-6s %s\n' \
-        REGION UNIT FRONTEND UPSTREAM U_BYTES_1M U_UNITS_1M STDB PUBLISH NOTES
+    # Header. UPTIME is how long the upstream link has been continuously
+    # up (now - upstream.last_up_at); "-" when not currently up.
+    printf '%-7s %-15s %-9s %10s %-7s %10s %9s %-9s %-6s %s\n' \
+        REGION UNIT FRONTEND UPSTREAM UPTIME U_BYTES_1M U_UNITS_1M STDB PUBLISH NOTES
     for unit in $(discover); do
         port=$(dash_port "$unit")
         lbl=$(label "$unit")
@@ -74,14 +75,14 @@ print_once() {
         fport_disp=${fport:-"-"}
         if [ -z "$port" ]; then
             if [ "$ONLY_DASH" = "1" ]; then continue; fi
-            printf '%-7s %-15s %-9s %-9s %10s %10s %-9s %-6s %s\n' \
-                "$lbl" "$unit" "$fport_disp" "-" "-" "-" "-" "-" "no dashboard"
+            printf '%-7s %-15s %-9s %-9s %-7s %10s %10s %-9s %-6s %s\n' \
+                "$lbl" "$unit" "$fport_disp" "-" "-" "-" "-" "-" "-" "no dashboard"
             continue
         fi
         json=$(curl -s --max-time 4 "http://127.0.0.1:${port}/metrics" 2>/dev/null || true)
         if [ -z "$json" ]; then
-            printf '%-7s %-15s %-9s %-9s %10s %10s %-9s %-6s %s\n' \
-                "$lbl" "$unit" "$fport_disp" "-" "-" "-" "-" "-" "dashboard unreachable"
+            printf '%-7s %-15s %-9s %-9s %-7s %10s %10s %-9s %-6s %s\n' \
+                "$lbl" "$unit" "$fport_disp" "-" "-" "-" "-" "-" "-" "dashboard unreachable"
             continue
         fi
         # Pull the fields we care about. python3 because it's already a
@@ -106,10 +107,31 @@ reason = u.get("last_disconnect_reason")
 if reason:
     notes.append("last_reason=%s" % reason)
 def mb(b): return "%.1fM" % (b/1e6) if b is not None else "-"
+def uptime(d):
+    # Stable upstream duration: now - upstream.last_up_at, but only
+    # meaningful while currently up. last_up_at is the epoch-seconds
+    # timestamp the link last transitioned to up.
+    if d.get("upstream", {}).get("state") != "up":
+        return "-"
+    now = d.get("now")
+    since = d.get("upstream", {}).get("last_up_at")
+    if not now or not since:
+        return "?"
+    secs = int(now) - int(since)
+    if secs < 0:
+        return "?"
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    if secs < 86400:
+        return "%.1fh" % (secs / 3600)
+    return "%.1fd" % (secs / 86400)
 pub = "repub" if p.get("republished_this_run") else "cached"
-print("%-7s %-15s %-9s %-9s %10s %10s %-9s %-6s %s" % (
+print("%-7s %-15s %-9s %-9s %-7s %10s %10s %-9s %-6s %s" % (
     lbl, unit, fport,
     u.get("state","?"),
+    uptime(d),
     mb(u.get("bytes_1m")), (str(u.get("units_1m",0)) if u.get("units_1m") is not None else "-"),
     l.get("state","?"), pub, ", ".join(notes)))
 PY
