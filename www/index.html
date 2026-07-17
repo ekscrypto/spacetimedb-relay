@@ -272,18 +272,21 @@
           <th class="hide-sm">Database</th>
           <th>Status</th>
           <th class="hide-sm">Throughput</th>
+          <th>Uptime</th>
         </tr>
       </thead>
       <tbody id="health-body">
-        <tr><td colspan="5" class="loading">Loading&hellip;</td></tr>
+        <tr><td colspan="6" class="loading">Loading&hellip;</td></tr>
       </tbody>
     </table>
   </div>
   <p class="section-note" style="margin-top: 10px;">
     Status reflects each region&rsquo;s live upstream connection; throughput is
-    incoming data over the last minute. Deeper per-instance metrics
-    (disconnect reasons, 30-minute windows, host memory and disk) remain on
-    each instance&rsquo;s loopback dashboard and are not part of the public surface.
+    incoming data over the last minute; uptime is how long the current
+    upstream connection has held continuously (hover for process and
+    local-stdb uptime). Deeper per-instance metrics (disconnect reasons,
+    30-minute windows, host memory and disk) remain on each instance&rsquo;s
+    loopback dashboard and are not part of the public surface.
   </p>
 
   <!-- Section 2: SpacetimeDB relays (wss://) -->
@@ -553,6 +556,19 @@
     return v.toFixed(v < 10 ? 1 : 0) + " " + units[i];
   }
 
+  function formatDuration(seconds) {
+    // seconds → compact "4d 3h 12m" / "2h 15m" / "3m" / "42s".
+    if (seconds == null || isNaN(seconds) || seconds < 0) return "—";
+    var s = Math.floor(seconds);
+    if (s < 60) return s + "s";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + "m";
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + "h " + (m % 60) + "m";
+    var d = Math.floor(h / 24);
+    return d + "d " + (h % 24) + "h";
+  }
+
   function setText(id, text) {
     var node = document.getElementById(id);
     if (node) node.textContent = text;
@@ -603,25 +619,99 @@
   // upstream byte counters measure application-layer (BSATN) payload,
   // which isn't comparable to the host NIC bandwidth shown above and
   // invited misleading cross-comparisons.
-  function upstreamThroughput(s) {
+  function upstreamThroughput(s, stalled) {
     var up = s.metrics && s.metrics.upstream;
     if (!up) return "";
     var main = "", title = [];
     if (up.units_1m != null) {
       main = formatUnits(Math.round(up.units_1m / 60)) + " updates/s";
     }
+    if (stalled) {
+      title.push("stalled: 0 updates in the last 60s");
+    }
     if (up.units_5m != null) {
       title.push("5-min avg: " + Math.round(up.units_5m / 300) + " updates/s");
     }
-    return main ? '<span class="mono" title="' + escapeHtml(title.join("\n")) +
-      '">' + main + "</span>" : "";
+    var style = stalled ? ' style="color: var(--warn);"' : "";
+    return main ? '<span class="mono"' + style + ' title="' +
+      escapeHtml(title.join("\n")) + '">' + main + "</span>" : "";
+  }
+
+  // Stall detection: a relay is "stalled" when its upstream connection
+  // reports "up" but delivered zero updates in the last minute — the socket
+  // is open but no data is flowing, a silent failure mode that plain "up"
+  // hides and which is an error condition for downstream clients. Startup
+  // is not a concern: a freshly-launched relay reports the "initial" state,
+  // not "up", so any source we see as "up" with zero throughput is
+  // genuinely stalled. Returns null when not stalled or when units aren't
+  // reported (legacy /health) — callers treat null as "not stalled".
+  function upstreamStalled(s) {
+    var up = s.metrics && s.metrics.upstream;
+    if (!up || up.state !== "up") return null;
+    if (up.units_1m == null) return null;            // not measured → unknown
+    if (up.units_1m === 0) {
+      return { units_1m: 0, units_5m: up.units_5m };
+    }
+    return null;
+  }
+
+  // Uptime column: headline is how long the current upstream connection has
+  // held continuously — the most operationally meaningful "is data flowing"
+  // signal. When upstream is down we show the local-stdb uptime instead
+  // (still useful: it shows whether the mirror is independently healthy),
+  // and fall back to the process uptime. Hover gives the full breakdown of
+  // all three, with last-down timestamps and disconnect reasons when known.
+  function uptimeCell(s) {
+    var m = s.metrics || {};
+    var proc = m.process_uptime_seconds;
+    var up = m.upstream || {};
+    var ls = m.local_stdb || {};
+    var main, parts = [];
+
+    var upUptime = (up.state === "up") ? up.uptime_seconds : null;
+    var lsUptime = (ls.state === "up") ? ls.uptime_seconds : null;
+
+    if (upUptime != null) {
+      main = formatDuration(upUptime);
+    } else if (lsUptime != null) {
+      main = formatDuration(lsUptime);
+    } else {
+      main = formatDuration(proc);
+    }
+
+    parts.push("process: " + formatDuration(proc));
+    if (upUptime != null) {
+      parts.push("upstream: " + formatDuration(upUptime));
+    } else if (up.last_down_at != null) {
+      parts.push("upstream: down (last down " +
+        new Date(up.last_down_at * 1000).toLocaleString() + ")");
+      if (up.last_disconnect_reason) {
+        parts.push("  reason: " + up.last_disconnect_reason);
+      }
+    } else {
+      parts.push("upstream: —");
+    }
+    if (lsUptime != null) {
+      parts.push("local_stdb: " + formatDuration(lsUptime));
+    } else if (ls.last_down_at != null) {
+      parts.push("local_stdb: down (last down " +
+        new Date(ls.last_down_at * 1000).toLocaleString() + ")");
+      if (ls.last_disconnect_reason) {
+        parts.push("  reason: " + ls.last_disconnect_reason);
+      }
+    } else {
+      parts.push("local_stdb: —");
+    }
+
+    return '<span class="mono" title="' + escapeHtml(parts.join("\n")) + '">' +
+      escapeHtml(main) + "</span>";
   }
 
   function renderHealth(sources, schemaCount) {
     healthBody.innerHTML = "";
     if (!sources.length) {
       healthBody.appendChild(el("tr", null,
-        '<td colspan="5" class="empty">No sources reported.</td>'));
+        '<td colspan="6" class="empty">No sources reported.</td>'));
       return;
     }
     sortSources(sources).forEach(function (s) {
@@ -633,36 +723,53 @@
       // Status: driven by the live upstream (and local-stdb) connection
       // state, not by schema cache. "up" requires both links up; "down"
       // if either is down or if no state is reported at all (a source
-      // with no metrics is assumed down, not initialising); otherwise
-      // "initial" only when a partial/ transitional state is present.
+      // with no metrics is assumed down, not initialising); "stalled"
+      // (warn) when both links are up but upstream delivered zero updates
+      // in the last minute — an error condition we surface over the plain
+      // "up"; otherwise "initial" only when a partial/ transitional state
+      // is present.
       var m = s.metrics || {};
       var upState = (m.upstream && m.upstream.state) || "";
       var lsState = (m.local_stdb && m.local_stdb.state) || "";
-      var state, cls, label;
+      var stalled = upstreamStalled(s);
+      var state, cls, label, pillTitle;
       if (upState === "up" && lsState === "up") {
-        state = "up"; cls = "up"; label = "up";
+        if (stalled) {
+          state = "stalled"; cls = "warn"; label = "stalled";
+          pillTitle = "upstream socket is up but delivered 0 updates in the last 60s\n" +
+            "(upstream: up\nlocal_stdb: up)";
+        } else {
+          state = "up"; cls = "up"; label = "up";
+          pillTitle = "upstream: up\nlocal_stdb: up";
+        }
       } else if (upState === "down" || lsState === "down") {
         state = "down"; cls = "bad"; label = "down";
+        pillTitle = "upstream: " + (upState || "—") + "\nlocal_stdb: " + (lsState || "—");
       } else if (!upState && !lsState) {
         // No state reported at all — assume down rather than initialising.
         state = "down"; cls = "bad"; label = "down";
+        pillTitle = "upstream: —\nlocal_stdb: —";
       } else {
         state = "initial"; cls = "warn"; label = upState || lsState || "initial";
+        pillTitle = "upstream: " + (upState || "—") + "\nlocal_stdb: " + (lsState || "—");
       }
       tr.appendChild(el("td", null,
-        '<span class="pill ' + cls + '" title="' +
-        escapeHtml("upstream: " + (upState || "—") + "\nlocal_stdb: " + (lsState || "—")) +
+        '<span class="pill ' + cls + '" title="' + escapeHtml(pillTitle) +
         '">' + escapeHtml(label) + "</span>"));
 
-      tr.appendChild(el("td", "num hide-sm", upstreamThroughput(s)));
+      tr.appendChild(el("td", "num hide-sm", upstreamThroughput(s, stalled)));
+      tr.appendChild(el("td", "num", uptimeCell(s)));
       healthBody.appendChild(tr);
     });
 
-    // Overall header pill: reflects real up/down across all sources,
+    // Overall header pill: reflects real up/down/stalled across all sources,
     // derived from upstream/local_stdb state. A source with no reported
     // metrics is counted as down, not initialising — so a partially-down
-    // fleet reports the down count rather than "connecting".
-    var upCount = 0, downCount = 0, hasMetrics = false;
+    // fleet reports the down count rather than "connecting". A stalled
+    // source (up but zero throughput) counts separately and is surfaced as
+    // a warn-tier issue only when nothing is fully down. Priority on the
+    // header pill: down > stalled > connecting > all-up.
+    var upCount = 0, downCount = 0, stalledCount = 0, hasMetrics = false;
     sources.forEach(function (s) {
       var m = s.metrics && s.metrics.upstream;
       if (!m) {
@@ -671,8 +778,12 @@
         return;
       }
       hasMetrics = true;
-      if (m.state === "up") upCount++;
-      else if (m.state === "down") downCount++;
+      if (m.state === "down") {
+        downCount++;
+      } else if (m.state === "up") {
+        if (upstreamStalled(s)) stalledCount++;
+        else upCount++;
+      }
     });
     srcCount.textContent = String(schemaCount != null ? schemaCount : sources.length);
     if (hasMetrics || downCount > 0) {
@@ -685,6 +796,11 @@
         overallPill.textContent = downCount + " down";
         overallText.textContent = downCount + " of " + sources.length +
           " sources report a down upstream connection.";
+      } else if (stalledCount > 0) {
+        overallPill.className = "pill warn";
+        overallPill.textContent = stalledCount + " stalled";
+        overallText.textContent = stalledCount + " of " + sources.length +
+          " sources are up but delivering no updates.";
       } else {
         overallPill.className = "pill warn";
         overallPill.textContent = "connecting";
