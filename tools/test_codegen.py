@@ -135,6 +135,72 @@ class ApplyReducerToleranceTests(unittest.TestCase):
         self.assertNotIn(".find(", body)
 
 
+class ReducerNameManglingTests(unittest.TestCase):
+    """Reducers must pin their registered name via #[reducer(name = ...)].
+
+    Background: SpacetimeDB applies a SnakeCase naming policy by default
+    that mangles a reducer's registered name by inserting an underscore
+    between a lowercase letter and a digit (e.g. a fn
+    `relay_apply_foo_v4` is registered as `relay_apply_foo_v_4`). The
+    relay driver calls `relay_apply_<table>` using the raw, unmangled
+    upstream table name, so any table whose name contains a letter+digit
+    pair (observed on _v1/_v2/_v3/_v4 versioned tables: inter_module_message_v4,
+    deployable_state_v2, etc.) hit "no such reducer" on every call — ~286
+    errors/min on relay-global, which kept the module in a death loop.
+    Fix: emit an explicit `name = "relay_*_<table>"` on every per-table
+    reducer so the canonical name is the raw table name, bypassing the
+    SnakeCase policy.
+    """
+
+    def _generate_versioned(self) -> str:
+        """Generate a module with a table whose name ends in a letter+digit."""
+        elements = [
+            {"name": {"some": "id"}, "algebraic_type": {"U64": []}},
+        ]
+        schema = {
+            "typespace": _typespace_with_product(elements),
+            "tables": [_table("widget_v2", elements, pk_cols=[0])],
+            "reducers": [],
+            "types": [],
+            "misc_exports": [],
+            "row_level_security": [],
+        }
+        return codegen.Codegen(schema).run()
+
+    def test_per_table_reducers_have_explicit_name_attribute(self):
+        """Every per-table reducer must carry #[reducer(name = "...")]."""
+        src = self._generate_versioned()
+        # The fn name is relay_apply_widget_v2; the registered (canonical)
+        # name must ALSO be relay_apply_widget_v2 (unmangled), via the
+        # explicit name= override.
+        self.assertIn(
+            '#[spacetimedb::reducer(name = "relay_apply_widget_v2")]',
+            src,
+        )
+        self.assertIn(
+            '#[spacetimedb::reducer(name = "relay_insert_widget_v2")]',
+            src,
+        )
+        self.assertIn(
+            '#[spacetimedb::reducer(name = "relay_delete_widget_v2")]',
+            src,
+        )
+        self.assertIn(
+            '#[spacetimedb::reducer(name = "relay_update_widget_v2")]',
+            src,
+        )
+
+    def test_explicit_name_uses_raw_table_name_not_mangled(self):
+        """The name= value must be the raw table name (widget_v2), not the
+        SnakeCase-mangled form (widget_v_2). This is the regression: the
+        driver calls relay_apply_widget_v2, so the registered name must be
+        exactly that."""
+        src = self._generate_versioned()
+        self.assertIn('"relay_apply_widget_v2"', src)
+        self.assertNotIn('"relay_apply_widget_v_2"', src)
+        self.assertNotIn("widget_v_2", src)
+
+
 class InsertOnlyApplyReducerTests(unittest.TestCase):
     """Tables without a single-column PK still need a relay_apply_*
     reducer.
