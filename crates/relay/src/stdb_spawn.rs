@@ -31,15 +31,25 @@ impl Drop for StdbProcess {
 ///   ≥ 2.x accepts a bare URL in the `-s` position without a pre-registered
 ///   alias)
 /// - a [`StdbProcess`] that kills the child on drop
+/// - `true` if the stdb data directory was newly created (i.e. this stdb
+///   instance is fresh and contains no databases). Callers should delete
+///   the publisher fingerprint when this is `true` so the mirror module is
+///   always republished into the empty stdb.
 ///
 /// The stdb data directory is `<data_dir>/stdb/` so each relay instance
 /// keeps its SpacetimeDB state alongside its own publisher workdir and
 /// identity token.
-pub async fn spawn(spacetime_bin: &Path, data_dir: &Path) -> Result<(Url, String, StdbProcess)> {
+pub async fn spawn(
+    spacetime_bin: &Path,
+    data_dir: &Path,
+) -> Result<(Url, String, StdbProcess, bool)> {
     let port = free_loopback_port().await?;
     let listen_addr = format!("127.0.0.1:{port}");
     let stdb_data_dir = data_dir.join("stdb");
 
+    // Track whether the data dir already existed. A fresh dir means the
+    // stdb has no databases, so the caller must republish unconditionally.
+    let is_fresh = !stdb_data_dir.exists();
     tokio::fs::create_dir_all(&stdb_data_dir)
         .await
         .with_context(|| format!("create stdb data dir {}", stdb_data_dir.display()))?;
@@ -78,7 +88,7 @@ pub async fn spawn(spacetime_bin: &Path, data_dir: &Path) -> Result<(Url, String
 
     let ws_url = Url::parse(&format!("ws://127.0.0.1:{port}"))
         .expect("generated URL is valid");
-    Ok((ws_url, http_base, StdbProcess(child)))
+    Ok((ws_url, http_base, StdbProcess(child), is_fresh))
 }
 
 /// Bind an ephemeral loopback port and immediately release it, returning
