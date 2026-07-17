@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use relay_mirror_driver::{DriverConfig, MetaRegistry, MirrorDriver};
+use relay_mirror_driver::{DriverConfig, DriverError, MetaRegistry, MirrorDriver};
 use relay_protocol::api_messages::websocket::v2::{ServerMessage, TableUpdateRows};
 use relay_protocol::{MirroredSchema, UpstreamReducerMeta};
 use relay_publisher::{Publisher, PublisherConfig};
@@ -35,6 +35,7 @@ use relay_upstream::{
     UpstreamConfig, UpstreamEvent,
 };
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use url::Url;
 
 use crate::dashboard::Metrics;
@@ -210,11 +211,27 @@ pub async fn run(
     const STABLE_THRESHOLD: Duration = Duration::from_secs(5);
     let mut backoff_secs: u64 = 1;
 
+    // Signal fired by the applier task when apply() returns a connection-
+    // fatal error (the WS sink is dead). The reconnect loop selects on this
+    // so a dead local-stdb connection is detected even when the upstream
+    // stays alive — without it, the applier silently swallows apply errors
+    // forever and the relay stalls with 0 throughput (observed on
+    // relay-bc8: upstream=up, stdb=up, in_flight=8000/8000, no recovery).
+    let stdb_dead = std::sync::Arc::new(Notify::new());
+    // Shared mirror of the driver's in_flight available-permits count,
+    // updated by the applier task after each apply() call so the reconnect
+    // loop's watchdog can detect saturation without owning the driver.
+    // Matches DriverConfig::default().max_in_flight (8000).
+    const MAX_IN_FLIGHT: usize = 8000;
+    let apply_in_flight_available =
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(MAX_IN_FLIGHT));
+
     enum InnerExit {
         Shutdown,
         UpstreamGone,
         FrameLimitReached,
         ModuleDead,
+        StdbConnectionDead,
     }
 
     // Sequential-mode state. Outside the reconnect loop so it persists
@@ -266,6 +283,8 @@ pub async fn run(
         let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<ApplyJob>();
         let metrics_clone = metrics.clone();
         let mut apply_driver = driver;
+        let stdb_dead_apply = stdb_dead.clone();
+        let in_flight_mirror = apply_in_flight_available.clone();
         let apply_handle = tokio::spawn(async move {
             loop {
                 let Some(job) = apply_rx.recv().await else {
@@ -277,10 +296,32 @@ pub async fn run(
                 {
                     Ok(stats) => stats,
                     Err(e) => {
-                        // Log but do NOT tear down the connection. One
-                        // bad table (e.g. a missing reducer from a schema
-                        // mismatch) should not kill the subscription for
-                        // all other tables.
+                        // Distinguish connection-fatal errors (the WS sink
+                        // is dead: Send, WebSocket, Closed) from per-table
+                        // logic errors (Encode). A dead sink means the
+                        // local-stdb connection is gone — the drainer has
+                        // already exited and no responses will ever arrive,
+                        // so the in_flight semaphore saturates and apply()
+                        // parks forever. Signal the reconnect loop.
+                        let is_connection_fatal = matches!(
+                            e,
+                            DriverError::Send(_) | DriverError::WebSocket(_) | DriverError::Closed
+                        );
+                        if is_connection_fatal {
+                            tracing::error!(
+                                target: "relay::stdb_mode",
+                                table = %job.table,
+                                error = %e,
+                                "local-stdb apply connection-fatal — signalling reconnect"
+                            );
+                            in_flight_mirror.store(0, std::sync::atomic::Ordering::Relaxed);
+                            stdb_dead_apply.notify_waiters();
+                            break;
+                        }
+                        // Per-table logic error (e.g. a missing reducer from
+                        // a schema mismatch). Log but do NOT tear down the
+                        // connection — one bad table should not kill the
+                        // subscription for all other tables.
                         tracing::warn!(
                             target: "relay::stdb_mode",
                             table = %job.table,
@@ -290,6 +331,11 @@ pub async fn run(
                         continue;
                     }
                 };
+                // Mirror the driver's available permits for the watchdog.
+                in_flight_mirror.store(
+                    apply_driver.available_permits(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 metrics_clone
                     .local_stdb
                     .record_traffic(stats.bytes_sent, stats.calls);
@@ -300,17 +346,68 @@ pub async fn run(
         });
 
         let mut connected_at: Option<std::time::Instant> = None;
+
+        // Liveness watchdog: periodically check whether the local-stdb
+        // connection is silently dead. The fingerprint of a dead WS is
+        // all in-flight permits held (apply() acquired them, the drainer
+        // that returns them is gone) with no progress. We check every
+        // 15s; if fully saturated for two consecutive checks, the
+        // connection is dead.
+        let mut saturation_ticks: u32 = 0;
+        let mut watchdog = tokio::time::interval(Duration::from_secs(15));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let exit_reason = loop {
+            // Level-triggered check: if the module_dead watch is already
+            // true (e.g. set while the select was parked on another arm),
+            // bail immediately rather than waiting for an edge that will
+            // never come. The edge-triggered changed() alone can miss the
+            // signal when the watch coalesces two sends into one.
+            if *module_dead.borrow() {
+                break InnerExit::ModuleDead;
+            }
+
             let event = tokio::select! {
                 biased;
                 _ = shutdown.as_mut() => break InnerExit::Shutdown,
+                _ = stdb_dead.notified() => {
+                    // The applier task detected a connection-fatal apply
+                    // error — the WS sink is dead and the drainer has
+                    // exited. Reconnect the local stdb.
+                    break InnerExit::StdbConnectionDead;
+                }
                 r = module_dead.changed() => {
-                    // Fires when drain_responses detected a WASM fatal error.
-                    // Also fires (Err) if the sender was dropped (driver
+                    // Edge-triggered: fires when drain_responses detected
+                    // a WASM fatal error or WS recv error. Also fires
+                    // (Err) if the sender was dropped (driver
                     // disconnected) — only treat as ModuleDead on Ok + true.
                     if r.is_ok() && *module_dead.borrow() {
                         break InnerExit::ModuleDead;
                     }
+                    continue;
+                }
+                _ = watchdog.tick() => {
+                    // in_flight saturation watchdog. If every permit is
+                    // held (max_in_flight == 0 available), the drainer
+                    // isn't returning permits — it's dead. Require two
+                    // consecutive saturated ticks (30s) to avoid false
+                    // positives during legitimate burst processing.
+                    let avail = apply_in_flight_available.load(std::sync::atomic::Ordering::Relaxed);
+                    if avail == 0 {
+                        saturation_ticks += 1;
+                        if saturation_ticks >= 2 {
+                            tracing::error!(
+                                target: "relay::stdb_mode",
+                                available_permits = avail,
+                                "local-stdb in_flight fully saturated for 30s — \
+                                 connection is dead, forcing reconnect"
+                            );
+                            break InnerExit::StdbConnectionDead;
+                        }
+                    } else {
+                        saturation_ticks = 0;
+                    }
+                    // Yield to the event arm to process a frame this iteration.
                     continue;
                 }
                 event = event_rx.recv() => match event {
@@ -497,6 +594,63 @@ pub async fn run(
                     }
                     _ = tokio::time::sleep(sleep_for) => {}
                 }
+            }
+            InnerExit::StdbConnectionDead => {
+                // The local-stdb WS connection died (TCP reset, sink
+                // error, or in_flight saturation with no responses), but
+                // the module itself is fine — no republish needed. Just
+                // close the dead driver and reconnect with the same
+                // identity. Unlike ModuleDead, the fingerprint and
+                // published module are untouched.
+                tracing::warn!(
+                    target: "relay::stdb_mode",
+                    database = %cfg.mirror_database,
+                    "local-stdb connection dead — reconnecting (no republish)"
+                );
+                let _ = driver.close().await;
+
+                let identity_token = if cfg.identity_token.is_some() {
+                    cfg.identity_token.clone()
+                } else {
+                    load_identity_token(&cfg.identity_token_file)
+                };
+                driver = MirrorDriver::connect(DriverConfig {
+                    stdb_url: cfg.stdb_url.clone(),
+                    database: cfg.mirror_database.clone(),
+                    identity_token,
+                    ..Default::default()
+                })
+                .await
+                .context("reconnect to local stdb after connection death")?;
+                driver.set_meta_registry(meta_registry.clone());
+                metrics.local_stdb.mark_up();
+                if let Some(captured) = driver.captured() {
+                    if let Err(e) = save_identity_token(&cfg.identity_token_file, &captured.token) {
+                        tracing::warn!(
+                            target: "relay::stdb_mode",
+                            error = %e,
+                            "failed to persist identity token after reconnect"
+                        );
+                    }
+                }
+                driver
+                    .bind_writer()
+                    .await
+                    .context("relay_bind_writer after stdb reconnect")?;
+                module_dead = driver.module_dead_receiver();
+                // Reset the saturation watchdog and in_flight mirror.
+                apply_in_flight_available.store(
+                    MAX_IN_FLIGHT,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+
+                tracing::info!(
+                    target: "relay::stdb_mode",
+                    database = %cfg.mirror_database,
+                    "driver reconnected after stdb connection death — restarting upstream subscription"
+                );
+                backoff_secs = 1;
+                continue 'reconnect;
             }
         }
     }
