@@ -55,6 +55,14 @@ class ApplyReducerToleranceTests(unittest.TestCase):
     entire module and loop the self-healing republish path. The reducer
     must use delete+insert (idempotent whether or not the row exists)
     instead of update().
+
+    The same idempotence requirement applies to the insert arm: a bare
+    insert() panics (errno 12 "Value with given unique identifier
+    already exists") when the row is already present locally. This
+    arises during resubscribe (upstream replays inserts for rows the
+    mirror still holds) and when an update for one entity arrives split
+    across TableUpdates with no upstream delete. Every insert — paired
+    or not — must therefore delete()+insert().
     """
 
     def _generate(self) -> str:
@@ -83,21 +91,39 @@ class ApplyReducerToleranceTests(unittest.TestCase):
         body = self._apply_reducer_body(self._generate())
         self.assertNotIn(".update(", body, "relay_apply must not use .update()")
 
-    def test_apply_reducer_uses_delete_plus_insert_when_paired(self):
-        """Paired path must be delete+insert (panic-proof for any PK type)."""
+    def test_apply_reducer_insert_is_always_delete_plus_insert(self):
+        """Every insert must be delete()+insert() — there is a single,
+        unconditional insert path covering both paired and unpaired
+        rows. This is panic-proof for any PK type: delete() returns
+        bool and never panics whether or not the row existed, and
+        insert() then sees a free slot (no errno 12 duplicate)."""
         body = self._apply_reducer_body(self._generate())
-        self.assertIn(".delete(&new.id);", body)
-        # delete must be immediately followed by insert in the paired arm
+        # The insert path: delete immediately followed by insert.
         self.assertIn(
             "ctx.db.widget().id().delete(&new.id);\n"
-            "            ctx.db.widget().insert(new);",
+            "        ctx.db.widget().insert(new);",
             body,
         )
+        # No bare insert() that could panic on a duplicate PK. The only
+        # insert(new) call must be the one preceded by the delete.
+        insert_count = body.count("ctx.db.widget().insert(new);")
+        self.assertEqual(insert_count, 1, "exactly one insert path expected")
+        delete_count = body.count("ctx.db.widget().id().delete(&new.id);")
+        self.assertEqual(delete_count, 1, "exactly one pre-insert delete expected")
 
-    def test_apply_reducer_unpaired_path_still_inserts(self):
-        """Unpaired inserts (no matching delete in this batch) still insert."""
+    def test_apply_reducer_unpaired_insert_does_not_bare_insert(self):
+        """Regression: the unpaired-insert arm must NOT call insert()
+        without a preceding delete(). A bare insert panics with errno 12
+        when the row already exists locally — observed killing the module
+        ~223x/day on relay-global for ability_state / attack_outcome_state
+        / action_bar_state etc., which looped the self-healing republish
+        path and surfaced downstream as 'no such reducer'."""
         body = self._apply_reducer_body(self._generate())
-        self.assertIn("ctx.db.widget().insert(new);", body)
+        # The buggy form was an `else { insert(new) }` with no delete.
+        # There must be no insert() reachable without a delete() above it
+        # in the same block. Concretely: no `else` insert arm.
+        self.assertNotIn("else {", body)
+        self.assertNotIn("else{{", body)
 
     def test_apply_reducer_trailing_delete_is_unguarded(self):
         """Unpaired deletes call .delete() directly — it returns bool and
