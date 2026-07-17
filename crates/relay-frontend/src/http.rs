@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncWriteExt, Interest};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -58,32 +58,37 @@ pub async fn probe(stream: &TcpStream) -> HttpProbe {
 }
 
 async fn probe_inner(stream: &TcpStream) -> HttpProbe {
-    let mut buf = Vec::<u8>::with_capacity(2048);
+    // `peek` is non-destructive: every call refills from byte 0 of the
+    // socket buffer, overwriting our view with whatever prefix has
+    // arrived so far. We reuse one buffer sized to the inspection cap
+    // and track the high-water mark of bytes seen — never appending,
+    // because the same leading bytes come back on every peek. The bytes
+    // stay in the socket buffer so the WS handshake sees them intact
+    // when we return Passthrough.
+    let mut buf = vec![0u8; PROBE_MAX_BYTES];
+    let mut len = 0usize;
     loop {
-        // Wait until there's something to read, then peek it. `peek`
-        // does not advance the read cursor, so the bytes remain
-        // available for the WS handshake if we return Passthrough.
-        if stream.ready(Interest::READABLE).await.is_err() {
-            return HttpProbe::Passthrough;
-        }
-        let mut chunk = [0u8; 2048];
-        match stream.try_read(&mut chunk) {
+        // `peek` awaits new bytes itself (no separate readiness wait).
+        // PROBE_TIMEOUT (on the outer `probe`) bounds the total time.
+        match stream.peek(&mut buf[..]).await {
             Ok(0) => return HttpProbe::Passthrough, // client closed / nothing
             Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() >= PROBE_MAX_BYTES {
-                    // Headers too large — give up and defer to WS.
-                    return HttpProbe::Passthrough;
+                // peek reports the total bytes currently buffered on the
+                // socket (capped at buf.len()). It grows as more data
+                // arrives; a non-growing n is spurious — loop and wait
+                // for more rather than classifying stale data.
+                if n <= len {
+                    continue;
                 }
-                if classify(&buf) != ProbeState::NeedMore {
+                len = n;
+                if classify(&buf[..len]) != ProbeState::NeedMore {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(_) => return HttpProbe::Passthrough,
         }
     }
-    classify_final(&buf)
+    classify_final(&buf[..len])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,5 +304,116 @@ mod tests {
         assert_eq!(&text[idx + blank.len()..], r#"{"tables":[]}"#);
         // No trailing bytes after the body.
         assert_eq!(resp.len(), text.len());
+    }
+
+    // ---- regression: probe must not consume socket bytes ----
+    //
+    // The classify() unit tests above all run against in-memory slices,
+    // so they cannot catch a probe that eats bytes off the socket before
+    // handing the stream to the WS handshake. The bug behind the
+    // 2026-07-17 subscriber outage was exactly that: probe_inner used
+    // try_read (destructive) where every comment said peek
+    // (non-destructive). A WS upgrade arrived, the probe classified it
+    // Passthrough, and the bytes it had read were gone — tungstenite
+    // then blocked forever on the starved handshake. These tests use a
+    // real loopback socket to assert the property that actually broke:
+    // after probe() returns, every byte the peer sent is still readable.
+
+    #[tokio::test]
+    async fn probe_passthrough_leaves_ws_upgrade_bytes_intact() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A realistic WebSocket subscribe handshake: the exact shape a
+        // downstream client sends to /v1/database/<db>/subscribe.
+        let req = b"GET /v1/database/relay-mirror-bc13/subscribe HTTP/1.1\r\n\
+                    Host: relay.bitcraftsync.app:3013\r\n\
+                    Upgrade: websocket\r\n\
+                    Connection: Upgrade\r\n\
+                    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                    Sec-WebSocket-Version: 13\r\n\
+                    Sec-WebSocket-Protocol: v1.json.spacetimedb\r\n\
+                    \r\n";
+
+        let peer = tokio::spawn(async move {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // Use write_all so the whole request lands in the socket
+            // buffer before the server peeks.
+            use tokio::io::AsyncWriteExt;
+            let mut sock = sock;
+            sock.write_all(req).await.unwrap();
+            sock.flush().await.unwrap();
+            sock
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+
+        // Probe classifies this as Passthrough (WS upgrade).
+        let outcome = tokio::time::timeout(Duration::from_secs(2), probe(&stream))
+            .await
+            .expect("probe did not return within 2s");
+        assert_eq!(outcome, HttpProbe::Passthrough);
+
+        let mut peer_sock = peer.await.unwrap();
+
+        // The crux: every byte must still be readable from the server
+        // side. With the try_read bug, stream.try_read(...) had already
+        // consumed req.len() bytes and this read returned far fewer /
+        // blocked until the peer gave up.
+        let mut got = vec![0u8; req.len()];
+        tokio::time::timeout(Duration::from_secs(2), stream.readable())
+            .await
+            .expect("server stream never became readable after probe")
+            .unwrap();
+        let n = stream.try_read(&mut got).expect("read after probe");
+        assert_eq!(
+            &got[..n],
+            &req[..],
+            "probe consumed/dropped bytes: read {} of {}",
+            n,
+            req.len()
+        );
+
+        use tokio::io::AsyncWriteExt;
+        peer_sock.shutdown().await.ok();
+    }
+
+    #[tokio::test]
+    async fn probe_passthrough_leaves_non_schema_get_intact() {
+        // Same property for a plain non-schema GET (e.g. /metrics).
+        // Must also fall through untouched — the WS listener will reject
+        // it as a 400, but that rejection must come from tungstenite, not
+        // from a starved handshake.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let req = b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+
+        let peer = tokio::spawn(async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(req).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), probe(&stream))
+            .await
+            .expect("probe did not return within 2s");
+        assert_eq!(outcome, HttpProbe::Passthrough);
+
+        peer.await.unwrap();
+
+        let mut got = vec![0u8; req.len()];
+        tokio::time::timeout(Duration::from_secs(2), stream.readable())
+            .await
+            .expect("server stream never became readable after probe")
+            .unwrap();
+        let n = stream.try_read(&mut got).expect("read after probe");
+        assert_eq!(&got[..n], &req[..], "probe consumed/dropped bytes");
+
+        // classify the re-read bytes to prove the WS layer would see the
+        // real request, not a truncated prefix.
+        assert_eq!(classify_final(&got[..n]), HttpProbe::Passthrough);
     }
 }
