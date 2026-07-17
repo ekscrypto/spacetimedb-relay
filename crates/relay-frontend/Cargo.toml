@@ -18,6 +18,7 @@ bytes.workspace = true
 parking_lot.workspace = true
 dashmap.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 uuid.workspace = true
 
 relay-protocol.workspace = true
@@ -30,3 +31,4 @@ spacetimedb-lib-v1.workspace = true
 [dev-dependencies]
 tracing-subscriber.workspace = true
 smallvec = "1"
+bytestring = "1"

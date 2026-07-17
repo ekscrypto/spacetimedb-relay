@@ -171,7 +171,7 @@ impl<'a> Callback for SubprotocolNegotiator<'a> {
         request: &Request,
         mut response: Response,
     ) -> Result<Response, ErrorResponse> {
-        let mut want = None;
+        let mut want: Option<Subprotocol> = None;
         for h in request.headers().get_all("sec-websocket-protocol") {
             let s = match h.to_str() {
                 Ok(s) => s,
@@ -180,7 +180,12 @@ impl<'a> Callback for SubprotocolNegotiator<'a> {
             for p in s.split(',') {
                 let p = p.trim();
                 if let Some(sp) = Subprotocol::from_name(p) {
-                    if want.is_none() || sp == Subprotocol::V2 {
+                    // Pick the first recognized protocol, then upgrade to a
+                    // more efficient one if the client also offers it:
+                    // V2 (bsatn) > V1 (bsatn) > V1Json (text). BSATN is
+                    // smaller and avoids JSON encode/decode, so when a
+                    // client offers both, prefer it.
+                    if want.is_none() || sp.rank() > want.unwrap().rank() {
                         want = Some(sp);
                     }
                 }

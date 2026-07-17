@@ -162,8 +162,39 @@ async fn drive(
                             .map_err(ClientError::LocalWs)?;
                     }
                     Message::Text(t) => {
-                        // Spec-compliance: forward text frames opaquely.
-                        // SpacetimeDB doesn't use them on the bsatn path.
+                        // On the bsatn path, SpacetimeDB doesn't use WS
+                        // text frames — forward opaquely (spec-compliance).
+                        // On the v1.json path, text frames carry the
+                        // client's JSON messages; apply the same read-only
+                        // guardrails as the binary branch above before
+                        // forwarding to local stdb.
+                        if ctx.subprotocol == Subprotocol::V1Json {
+                            // Record inbound bytes (encoding-agnostic) and
+                            // bump per-client counters parsed from JSON.
+                            ctx.metrics.record_inbound(t.len() as u64);
+                            stats.record_inbound(t.len() as u64);
+                            inspect_json_client_message(stats, &t);
+                            if let Some(kind) = json_write_kind(&t) {
+                                let reply = match kind {
+                                    JsonWrite::OneOffQuery => {
+                                        reject_json_one_off_query(&t, stats)
+                                    }
+                                    JsonWrite::CallReducer => {
+                                        reject_json_call_reducer(&t, stats)
+                                    }
+                                    JsonWrite::CallProcedure => {
+                                        reject_json_call_procedure(&t, stats)
+                                    }
+                                };
+                                if let Some(err_text) = reply {
+                                    downstream
+                                        .send(Message::Text(err_text))
+                                        .await
+                                        .map_err(ClientError::DownstreamWs)?;
+                                }
+                                continue;
+                            }
+                        }
                         local.send(Message::Text(t)).await.map_err(ClientError::LocalWs)?;
                     }
                     Message::Ping(p) => {
@@ -313,6 +344,8 @@ fn inspect_client_message(stats: &ClientStats, bytes: &Bytes, subprotocol: Subpr
 }
 
 fn try_decode_subscribe_queries(sp: Subprotocol, body: &[u8]) -> Option<Vec<String>> {
+    // Only the bsatn encodings are decodable here; v1.json subscriptions
+    // are recorded from text frames by inspect_json_client_message.
     match sp {
         Subprotocol::V2 => {
             use spacetimedb_client_api_messages::websocket::v2;
@@ -338,6 +371,9 @@ fn try_decode_subscribe_queries(sp: Subprotocol, body: &[u8]) -> Option<Vec<Stri
                 _ => None,
             }
         }
+        // v1.json subscriptions arrive as WS text frames and are decoded
+        // by inspect_json_client_message; never via this BSATN path.
+        Subprotocol::V1Json => None,
     }
 }
 
@@ -537,6 +573,8 @@ fn reject_one_off_query(
             let encoded = spacetimedb_lib_v1::bsatn::to_vec(&reply).ok()?;
             Some(codec::wrap_uncompressed(encoded))
         }
+        // JSON clients take the text-frame path (reject_json_one_off_query).
+        Subprotocol::V1Json => None,
     }
 }
 
@@ -572,6 +610,9 @@ fn inbound_write_tag(bytes: &Bytes, subprotocol: Subprotocol) -> Option<WriteTag
             0x07 => WriteTag::CallProcedure,
             _ => return None,
         },
+        // JSON text frames are classified by json_write_kind; this inspects
+        // BSATN binary discriminants, which don't exist for v1.json.
+        Subprotocol::V1Json => return None,
     })
 }
 
@@ -646,6 +687,8 @@ fn reject_call_reducer(
             let encoded = spacetimedb_lib_v1::bsatn::to_vec(&reply).ok()?;
             Some(codec::wrap_uncompressed(encoded))
         }
+        // JSON clients take the text-frame path (reject_json_call_reducer).
+        Subprotocol::V1Json => None,
     }
 }
 
@@ -710,6 +753,200 @@ fn reject_call_procedure(
             let encoded = spacetimedb_lib_v1::bsatn::to_vec(&reply).ok()?;
             Some(codec::wrap_uncompressed(encoded))
         }
+        // JSON clients take the text-frame path (reject_json_call_procedure).
+        Subprotocol::V1Json => None,
+    }
+}
+
+// ---- v1.json reject helpers ----
+//
+// `v1.json.spacetimedb` clients send WS text frames carrying
+// JSON-encoded `v1::ClientMessage`s. The BSATN reject helpers above
+// inspect binary-frame tags; these mirror them for the JSON path so the
+// same read-only guardrails apply: OneOffQuery / CallReducer /
+// CallProcedure are rejected before they reach local stdb, with a JSON
+// reply echoing the caller's request_id / message_id.
+//
+// (De)serialization goes through the SDK's own sats↔serde bridge
+// (`spacetimedb_lib_v1::sats::serde::SerializeWrapper` with `serde_json`)
+// rather than hand-rolled JSON, so the wire bytes match what SpacetimeDB
+// itself emits for `v1.json`. Returns `None` on any decode failure; the
+// caller must still skip forwarding the original message regardless.
+
+/// The args type for `v1::ClientMessage<JsonFormat>` — i.e.
+/// `<JsonFormat as WebsocketFormat>::Single` (a `ByteString` carrying the
+/// raw JSON value the client supplied). Spelled via the trait alias so we
+/// don't take a direct dependency on the `bytestring` crate.
+pub type JsonSingle =
+    <spacetimedb_client_api_messages_v1::websocket::JsonFormat as spacetimedb_client_api_messages_v1::websocket::WebsocketFormat>::Single;
+
+/// Decode a JSON `v1::ClientMessage<JsonFormat>` from a WS text payload.
+/// `JsonFormat::Single = ByteString`, the raw JSON value the client
+/// supplied as reducer/procedure args.
+fn decode_json_client_message(
+    text: &str,
+) -> Option<spacetimedb_client_api_messages_v1::websocket::ClientMessage<JsonSingle>> {
+    use spacetimedb_client_api_messages_v1::websocket as v1;
+    use spacetimedb_lib_v1::sats::serde::SerdeWrapper;
+    let wrap: SerdeWrapper<v1::ClientMessage<JsonSingle>> =
+        serde_json::from_str(text).ok()?;
+    Some(wrap.0)
+}
+
+/// Serialize a `v1::ServerMessage<JsonFormat>` to the JSON text that goes
+/// on the wire as a WS text frame.
+fn encode_json_server_message(
+    msg: spacetimedb_client_api_messages_v1::websocket::ServerMessage<
+        spacetimedb_client_api_messages_v1::websocket::JsonFormat,
+    >,
+) -> Option<String> {
+    use spacetimedb_lib_v1::sats::serde::SerdeWrapper;
+    serde_json::to_string(&SerdeWrapper::from_ref(&msg)).ok()
+}
+
+/// Reject a JSON `OneOffQuery`. Mirrors [`reject_one_off_query`]'s v1
+/// branch: a `OneOffQueryResponse` carrying the error and the caller's
+/// `message_id`, no rows.
+fn reject_json_one_off_query(text: &str, stats: &ClientStats) -> Option<String> {
+    use spacetimedb_client_api_messages_v1::websocket as v1;
+    const ERR: &str =
+        "OneOffQuery is not supported through the relay frontend; subscribe to the table instead";
+    let v1::ClientMessage::OneOffQuery(q) = decode_json_client_message(text)? else {
+        return None;
+    };
+    tracing::warn!(
+        target: "relay::frontend",
+        client_id = %stats.id,
+        query = %q.query_string,
+        "rejecting OneOffQuery — use subscriptions"
+    );
+    let reply = v1::ServerMessage::<v1::JsonFormat>::OneOffQueryResponse(v1::OneOffQueryResponse {
+        message_id: q.message_id,
+        error: Some(ERR.into()),
+        tables: Box::new([]),
+        total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::from_micros(0),
+    });
+    encode_json_server_message(reply)
+}
+
+/// Reject a JSON `CallReducer`. Mirrors [`reject_call_reducer`]'s v1
+/// branch: a failed `TransactionUpdate` echoing the reducer request.
+fn reject_json_call_reducer(text: &str, stats: &ClientStats) -> Option<String> {
+    use spacetimedb_client_api_messages_v1::websocket as v1;
+    const ERR: &str =
+        "CallReducer is not supported through the relay frontend; the relay is read-only";
+    let v1::ClientMessage::CallReducer(cr) = decode_json_client_message(text)? else {
+        return None;
+    };
+    tracing::warn!(
+        target: "relay::frontend",
+        client_id = %stats.id,
+        request_id = cr.request_id,
+        reducer = %cr.reducer,
+        "rejecting CallReducer — the relay is read-only"
+    );
+    let reply = v1::ServerMessage::<v1::JsonFormat>::TransactionUpdate(v1::TransactionUpdate {
+        status: v1::UpdateStatus::Failed(ERR.into()),
+        timestamp: spacetimedb_lib_v1::Timestamp::UNIX_EPOCH,
+        caller_identity: spacetimedb_lib_v1::Identity::ZERO,
+        caller_connection_id: spacetimedb_lib_v1::ConnectionId::ZERO,
+        reducer_call: v1::ReducerCallInfo {
+            reducer_name: cr.reducer,
+            reducer_id: 0,
+            args: cr.args,
+            request_id: cr.request_id,
+        },
+        energy_quanta_used: spacetimedb_client_api_messages_v1::energy::EnergyQuanta::ZERO,
+        total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::from_micros(0),
+    });
+    encode_json_server_message(reply)
+}
+
+/// Reject a JSON `CallProcedure`. Mirrors [`reject_call_procedure`]'s v1
+/// branch: a `ProcedureResult` with `InternalError`.
+fn reject_json_call_procedure(text: &str, stats: &ClientStats) -> Option<String> {
+    use spacetimedb_client_api_messages_v1::websocket as v1;
+    const ERR: &str =
+        "CallProcedure is not supported through the relay frontend; the relay is read-only";
+    let v1::ClientMessage::CallProcedure(cp) = decode_json_client_message(text)? else {
+        return None;
+    };
+    tracing::warn!(
+        target: "relay::frontend",
+        client_id = %stats.id,
+        request_id = cp.request_id,
+        procedure = %cp.procedure,
+        "rejecting CallProcedure — the relay is read-only"
+    );
+    let reply = v1::ServerMessage::<v1::JsonFormat>::ProcedureResult(v1::ProcedureResult {
+        status: v1::ProcedureStatus::InternalError(ERR.into()),
+        timestamp: spacetimedb_lib_v1::Timestamp::UNIX_EPOCH,
+        total_host_execution_duration: spacetimedb_lib_v1::TimeDuration::from_micros(0),
+        request_id: cp.request_id,
+    });
+    encode_json_server_message(reply)
+}
+
+/// Which write-path JSON client message a text frame carries, if any.
+/// The JSON analogue of [`inbound_write_tag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonWrite {
+    OneOffQuery,
+    CallReducer,
+    CallProcedure,
+}
+
+/// Classify a JSON client text frame. Returns `None` for anything that
+/// isn't a rejected write-path message (i.e. `Subscribe` etc. flow
+/// through to local stdb). Decode failures are treated as `None` too —
+/// the caller must still skip forwarding when this returns `Some`.
+fn json_write_kind(text: &str) -> Option<JsonWrite> {
+    use spacetimedb_client_api_messages_v1::websocket as v1;
+    Some(match decode_json_client_message(text)? {
+        v1::ClientMessage::OneOffQuery(_) => JsonWrite::OneOffQuery,
+        v1::ClientMessage::CallReducer(_) => JsonWrite::CallReducer,
+        v1::ClientMessage::CallProcedure(_) => JsonWrite::CallProcedure,
+        _ => return None,
+    })
+}
+
+/// Bump the per-client counters for a JSON inbound frame. The text-frame
+/// analogue of [`inspect_client_message`] — same counters, parsed from
+/// JSON instead of a BSATN tag.
+fn inspect_json_client_message(stats: &ClientStats, text: &str) {
+    use spacetimedb_client_api_messages_v1::websocket as v1;
+    let Some(msg) = decode_json_client_message(text) else {
+        return;
+    };
+    match msg {
+        v1::ClientMessage::CallReducer(_) => {
+            stats
+                .call_reducers
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        v1::ClientMessage::CallProcedure(_) => {
+            stats
+                .call_procedures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        v1::ClientMessage::OneOffQuery(_) => {
+            stats
+                .one_off_queries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        v1::ClientMessage::SubscribeMulti(m) => {
+            let mut subs = stats.subscriptions.lock();
+            for q in m.query_strings.iter() {
+                subs.insert(q.to_string());
+            }
+        }
+        v1::ClientMessage::Subscribe(s) => {
+            let mut subs = stats.subscriptions.lock();
+            for q in s.query_strings.iter() {
+                subs.insert(q.to_string());
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1027,5 +1264,181 @@ mod tests {
         let frame = Bytes::from(codec::wrap_uncompressed(body));
         let stats = fake_stats(Subprotocol::V2);
         assert!(reject_call_procedure(&frame, Subprotocol::V2, &stats).is_none());
+    }
+
+    // ---- v1.json reject helpers ----
+
+    /// Encode a `v1::ClientMessage<JsonFormat>` to the JSON text a client
+    /// would send as a WS text frame. Uses the same sats↔serde bridge the
+    /// reject helpers decode with, so the round-trip is faithful.
+    fn encode_json_client_message(
+        msg: spacetimedb_client_api_messages_v1::websocket::ClientMessage<JsonSingle>,
+    ) -> String {
+        use spacetimedb_lib_v1::sats::serde::SerdeWrapper;
+        serde_json::to_string(&SerdeWrapper::new(msg)).unwrap()
+    }
+
+    /// Decode a JSON `v1::ServerMessage<JsonFormat>` reply back from the
+    /// wire text, so tests can assert on the variant + fields.
+    fn decode_json_reply(
+        text: &str,
+    ) -> Option<
+        spacetimedb_client_api_messages_v1::websocket::ServerMessage<
+            spacetimedb_client_api_messages_v1::websocket::JsonFormat,
+        >,
+    > {
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        use spacetimedb_lib_v1::sats::serde::SerdeWrapper;
+        let wrap: SerdeWrapper<v1::ServerMessage<v1::JsonFormat>> =
+            serde_json::from_str(text).ok()?;
+        Some(wrap.0)
+    }
+
+    #[test]
+    fn reject_json_call_reducer_returns_failed_transaction_update() {
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        // A realistic JSON CallReducer the way a client sends it.
+        let req = encode_json_client_message(v1::ClientMessage::CallReducer(
+            v1::CallReducer {
+                reducer: "relay_bind_writer".into(),
+                args: bytestring::ByteString::from("[]"),
+                request_id: 99,
+                flags: v1::CallReducerFlags::FullUpdate,
+            },
+        ));
+        let stats = fake_stats(Subprotocol::V1Json);
+        let reply = reject_json_call_reducer(&req, &stats).expect("json reply");
+
+        match decode_json_reply(&reply).expect("reply decodes") {
+            v1::ServerMessage::TransactionUpdate(tu) => {
+                assert_eq!(tu.reducer_call.request_id, 99);
+                assert_eq!(&*tu.reducer_call.reducer_name, "relay_bind_writer");
+                match tu.status {
+                    v1::UpdateStatus::Failed(msg) => {
+                        assert!(msg.contains("read-only"), "msg was: {msg}");
+                    }
+                    _ => panic!("expected Failed status"),
+                }
+            }
+            _ => panic!("expected TransactionUpdate variant"),
+        }
+    }
+
+    #[test]
+    fn reject_json_one_off_query_returns_error_response() {
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        let req = encode_json_client_message(v1::ClientMessage::OneOffQuery(
+            v1::OneOffQuery {
+                message_id: b"\x01\x02\x03".to_vec().into_boxed_slice(),
+                query_string: "SELECT * FROM player_state".into(),
+            },
+        ));
+        let stats = fake_stats(Subprotocol::V1Json);
+        let reply = reject_json_one_off_query(&req, &stats).expect("json reply");
+
+        match decode_json_reply(&reply).expect("reply decodes") {
+            v1::ServerMessage::OneOffQueryResponse(r) => {
+                assert_eq!(&*r.message_id, b"\x01\x02\x03");
+                assert_eq!(r.tables.len(), 0);
+                assert!(r.error.unwrap().contains("subscribe to the table"));
+            }
+            _ => panic!("expected OneOffQueryResponse variant"),
+        }
+    }
+
+    #[test]
+    fn reject_json_call_procedure_returns_internal_error() {
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        let req = encode_json_client_message(v1::ClientMessage::CallProcedure(
+            v1::CallProcedure {
+                procedure: "do_thing".into(),
+                args: bytestring::ByteString::from("{}"),
+                request_id: 5,
+                flags: v1::CallProcedureFlags::Default,
+            },
+        ));
+        let stats = fake_stats(Subprotocol::V1Json);
+        let reply = reject_json_call_procedure(&req, &stats).expect("json reply");
+
+        match decode_json_reply(&reply).expect("reply decodes") {
+            v1::ServerMessage::ProcedureResult(r) => {
+                assert_eq!(r.request_id, 5);
+                match r.status {
+                    v1::ProcedureStatus::InternalError(msg) => {
+                        assert!(msg.contains("read-only"));
+                    }
+                    _ => panic!("expected InternalError status"),
+                }
+            }
+            _ => panic!("expected ProcedureResult variant"),
+        }
+    }
+
+    #[test]
+    fn json_write_kind_classifies_write_paths() {
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        // CallReducer / CallProcedure / OneOffQuery are write paths.
+        let cr = encode_json_client_message(v1::ClientMessage::CallReducer(
+            v1::CallReducer {
+                reducer: "x".into(),
+                args: bytestring::ByteString::from("[]"),
+                request_id: 1,
+                flags: v1::CallReducerFlags::FullUpdate,
+            },
+        ));
+        assert_eq!(json_write_kind(&cr), Some(JsonWrite::CallReducer));
+
+        let cp = encode_json_client_message(v1::ClientMessage::CallProcedure(
+            v1::CallProcedure {
+                procedure: "x".into(),
+                args: bytestring::ByteString::from("{}"),
+                request_id: 1,
+                flags: v1::CallProcedureFlags::Default,
+            },
+        ));
+        assert_eq!(json_write_kind(&cp), Some(JsonWrite::CallProcedure));
+
+        let oq = encode_json_client_message(v1::ClientMessage::OneOffQuery(
+            v1::OneOffQuery {
+                message_id: b"".to_vec().into_boxed_slice(),
+                query_string: "SELECT 1".into(),
+            },
+        ));
+        assert_eq!(json_write_kind(&oq), Some(JsonWrite::OneOffQuery));
+    }
+
+    #[test]
+    fn json_write_kind_none_for_subscribe() {
+        // A Subscribe must flow through to local stdb — not classified as
+        // a write path.
+        use spacetimedb_client_api_messages_v1::websocket as v1;
+        let s = encode_json_client_message(v1::ClientMessage::SubscribeMulti(
+            v1::SubscribeMulti {
+                query_strings: vec!["SELECT * FROM admin_broadcast".into()].into_boxed_slice(),
+                request_id: 1,
+                query_id: v1::QueryId::new(0),
+            },
+        ));
+        assert_eq!(json_write_kind(&s), None);
+    }
+
+    #[test]
+    fn json_rejects_return_none_on_garbage() {
+        let stats = fake_stats(Subprotocol::V1Json);
+        assert!(reject_json_call_reducer("not json", &stats).is_none());
+        assert!(reject_json_one_off_query("not json", &stats).is_none());
+        assert!(reject_json_call_procedure("not json", &stats).is_none());
+    }
+
+    #[test]
+    fn bsatn_reject_helpers_noop_for_v1json() {
+        // The BSATN paths must return None for V1Json — JSON has its own
+        // reject functions. Guards against a frame being misrouted.
+        let frame = Bytes::from_static(&[0u8; 8]);
+        let stats = fake_stats(Subprotocol::V1Json);
+        assert!(reject_one_off_query(&frame, Subprotocol::V1Json, &stats).is_none());
+        assert!(reject_call_reducer(&frame, Subprotocol::V1Json, &stats).is_none());
+        assert!(reject_call_procedure(&frame, Subprotocol::V1Json, &stats).is_none());
+        assert_eq!(inbound_write_tag(&frame, Subprotocol::V1Json), None);
     }
 }

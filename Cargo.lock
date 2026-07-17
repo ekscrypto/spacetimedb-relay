@@ -1751,6 +1751,7 @@ version = "2.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "bytestring",
  "dashmap",
  "futures-util",
  "http",
@@ -1758,6 +1759,7 @@ dependencies = [
  "relay-mirror-driver",
  "relay-protocol",
  "serde",
+ "serde_json",
  "smallvec",
  "spacetimedb-client-api-messages 1.12.0",
  "spacetimedb-client-api-messages 2.2.0",
