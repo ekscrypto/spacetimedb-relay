@@ -404,35 +404,35 @@ class Codegen:
                 f"                .map_err(|e| format!(\"bsatn decode {rust_name} delete: {{e}}\").into_boxed_str())?,",
                 f"        );",
                 f"    }}",
+                f"    // Track which old rows have been consumed by a paired insert",
+                f"    // so the trailing delete loop doesn't re-delete them.",
                 f"    let mut consumed = vec![false; old_rows.len()];",
                 f"    for b in &inserts {{",
                 f"        let new: {struct_name} = spacetimedb::sats::bsatn::from_slice(b)",
                 f"            .map_err(|e| format!(\"bsatn decode {rust_name} insert: {{e}}\").into_boxed_str())?;",
-                f"        let mut paired = false;",
                 f"        for (i, old) in old_rows.iter().enumerate() {{",
                 f"            if consumed[i] {{ continue; }}",
                 f"            if old.{pk_field_name} == new.{pk_field_name} {{",
                 f"                consumed[i] = true;",
-                f"                paired = true;",
                 f"                break;",
                 f"            }}",
                 f"        }}",
-                f"        if paired {{",
                 # delete + insert, not .update(): update() panics
                 # (errno 15 "row was not found") when the paired row
-                # isn't actually present in the local mirror — which
-                # happens during resubscribe after a republish, when an
-                # upstream update for a not-yet-inserted (or already-
-                # deleted) row arrives. delete() returns bool and never
+                # isn't actually present in the local mirror. A bare
+                # insert() on the unpaired path panics (errno 12 "Value
+                # with given unique identifier already exists") when the
+                # row is already present locally. Both conditions arise
+                # during resubscribe after a republish: upstream may
+                # replay inserts for rows the mirror still holds, and
+                # stream an update for a not-yet-inserted row whose
+                # delete hasn't landed. delete() returns bool and never
                 # panics, so delete+insert is idempotent whether or not
-                # the row existed. This mirrors what relay_update_ does
-                # and works for every PK type (find() would require a
+                # the row existed, for either the paired or unpaired
+                # case. Works for every PK type (find() would require a
                 # FilterableValue bound that custom/inline PK types lack).
-                f"            ctx.db.{rust_name}().{pk_field_name}().delete(&new.{pk_field_name});",
-                f"            ctx.db.{rust_name}().insert(new);",
-                f"        }} else {{",
-                f"            ctx.db.{rust_name}().insert(new);",
-                f"        }}",
+                f"        ctx.db.{rust_name}().{pk_field_name}().delete(&new.{pk_field_name});",
+                f"        ctx.db.{rust_name}().insert(new);",
                 f"    }}",
                 f"    for (i, old) in old_rows.into_iter().enumerate() {{",
                 f"        if consumed[i] {{ continue; }}",
