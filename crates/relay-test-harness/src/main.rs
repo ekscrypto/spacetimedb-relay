@@ -25,6 +25,7 @@
 //! that invariant in the architecture.
 
 mod stdb_client;
+mod stdb_client_json;
 mod stdb_client_v1;
 
 use std::time::Duration;
@@ -92,6 +93,22 @@ struct Args {
     #[arg(long, env = "TEST_SUBSCRIBE_ONLY")]
     subscribe_only: bool,
 
+    /// Integrity-check mode: skip the subscriber/writer machinery and
+    /// instead run four read-only checks against `--via-frontend` (or
+    /// `--relay`) + `--database`, printing `[OK]`/`[FAIL]` per check and
+    /// exiting 0 only if all four pass. The checks are:
+    ///
+    ///   1. v2.bsatn subscribe — expect InitialConnection + SubscribeApplied
+    ///   2. v1.bsatn subscribe — expect IdentityToken + InitialSubscription
+    ///   3. v1.json  subscribe — expect IdentityToken + InitialSubscription
+    ///   4. schema-over-HTTP GET .../schema — expect 200
+    ///
+    /// Use `--table` (default `admin_broadcast`, a small table present
+    /// in every mirror) for the subscribe queries. This is the canonical
+    /// post-deploy verification exercised by `tools/check-integrity.sh`.
+    #[arg(long, env = "TEST_CHECK_INTEGRITY")]
+    check_integrity: bool,
+
     /// Optional fixed test name. If omitted, generates a random one
     /// per run so concurrent harness runs don't collide.
     #[arg(long, env = "TEST_NAME")]
@@ -146,6 +163,15 @@ async fn main() -> Result<()> {
     let table = args.table.clone();
     let reducer = args.reducer.clone();
     let expected = name.clone();
+
+    if args.check_integrity {
+        let check_table = if table.trim().is_empty() {
+            "admin_broadcast".to_string()
+        } else {
+            table.split(',').next().unwrap_or("admin_broadcast").trim().to_string()
+        };
+        return run_check_integrity(subscriber_url, database, check_table, timeout).await;
+    }
 
     if args.subscribe_only {
         let tables: Vec<String> = table
@@ -409,6 +435,169 @@ async fn run_subscribe_only_v1(
         bail!("no InitialSubscription received within timeout");
     }
     Ok(())
+}
+
+/// Integrity-check a single frontend URL against the four primary
+/// client paths. Each check runs under `timeout`; a check fails on the
+/// first error or timeout. Prints `[OK]`/`[FAIL]` per check and returns
+/// `Ok(())` only if all four pass. Exits non-zero on any failure (the
+/// caller wraps the returned `Result`).
+///
+/// Reuses the real SDK client modules (`stdb_client` for v2 BSATN,
+/// `stdb_client_v1` for v1 BSATN, `stdb_client_json` for v1 JSON) so
+/// the wire handling is identical to production clients — no hand-rolled
+/// framing. The schema fetch uses `reqwest`, the same crate
+/// `relay-upstream` uses for its schema fetch.
+async fn run_check_integrity(
+    frontend: Url,
+    database: String,
+    table: String,
+    timeout: Duration,
+) -> Result<()> {
+    use crate::stdb_client as v2c;
+    use crate::stdb_client_json as jsonc;
+    use crate::stdb_client_v1 as v1c;
+
+    let query = format!("SELECT * FROM {table}");
+    let mut failures: Vec<(&'static str, String)> = Vec::new();
+
+    // ---- check 1: v2.bsatn subscribe ----
+    match tokio::time::timeout(timeout, async {
+        let mut conn = v2c::open_connection(&frontend, &database).await?;
+        let init = v2c::expect_initial_connection(&mut conn).await?;
+        v2c::send_subscribe(&mut conn, 1, 1, vec![query.clone()]).await?;
+        // Drain up to a few frames looking for SubscribeApplied (an
+        // intervening TransactionUpdateLight is fine on a live mirror).
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("no SubscribeApplied within timeout");
+            }
+            let msg = tokio::time::timeout(remaining, v2c::recv_server_message(&mut conn))
+                .await
+                .map_err(|_| anyhow::anyhow!("no SubscribeApplied within timeout"))??;
+            if matches!(
+                msg,
+                spacetimedb_client_api_messages::websocket::v2::ServerMessage::SubscribeApplied(_)
+            ) {
+                return Ok::<_, anyhow::Error>(init.identity.to_hex().to_string());
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(id)) => println!("[OK]   v2.bsatn  subscribed (identity {id})"),
+        Ok(Err(e)) => failures.push(("v2.bsatn", format!("{e:#}"))),
+        Err(_) => failures.push(("v2.bsatn", "timed out".into())),
+    }
+
+    // ---- check 2: v1.bsatn subscribe ----
+    match tokio::time::timeout(timeout, async {
+        let mut conn = v1c::open_connection(&frontend, &database).await?;
+        let it = v1c::expect_identity_token(&mut conn).await?;
+        v1c::send_subscribe(&mut conn, 1, vec![query.clone()]).await?;
+        // Drain until InitialSubscription.
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("no InitialSubscription within timeout");
+            }
+            let msg = tokio::time::timeout(remaining, v1c::recv_server_message(&mut conn))
+                .await
+                .map_err(|_| anyhow::anyhow!("no InitialSubscription within timeout"))??;
+            if matches!(msg, v1::ServerMessage::InitialSubscription(_)) {
+                return Ok::<_, anyhow::Error>(hex::encode(it.identity.to_byte_array()));
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(id)) => println!("[OK]   v1.bsatn  subscribed (identity {id})"),
+        Ok(Err(e)) => failures.push(("v1.bsatn", format!("{e:#}"))),
+        Err(_) => failures.push(("v1.bsatn", "timed out".into())),
+    }
+
+    // ---- check 3: v1.json subscribe ----
+    match tokio::time::timeout(timeout, async {
+        let mut conn = jsonc::open_connection(&frontend, &database).await?;
+        let it = jsonc::expect_identity_token(&mut conn).await?;
+        jsonc::send_subscribe(&mut conn, 1, vec![query.clone()]).await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("no InitialSubscription within timeout");
+            }
+            let msg = tokio::time::timeout(remaining, jsonc::recv_server_message(&mut conn))
+                .await
+                .map_err(|_| anyhow::anyhow!("no InitialSubscription within timeout"))??;
+            if matches!(msg, v1::ServerMessage::InitialSubscription(_)) {
+                return Ok::<_, anyhow::Error>(hex::encode(it.identity.to_byte_array()));
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(id)) => println!("[OK]   v1.json  subscribed (identity {id})"),
+        Ok(Err(e)) => failures.push(("v1.json", format!("{e:#}"))),
+        Err(_) => failures.push(("v1.json", "timed out".into())),
+    }
+
+    // ---- check 4: schema-over-HTTP ----
+    // Rewrite the WS frontend URL to its https form and GET .../schema.
+    // The schema bytes are the ones the relay cached and codegen'd from;
+    // a 200 here confirms the HTTP path that the 2026-07-17 probe bug
+    // broke (a probe that consumed WS handshake bytes on non-schema
+    // requests).
+    match tokio::time::timeout(timeout, async {
+        let mut url = frontend.clone();
+        match url.scheme() {
+            "ws" => url.set_scheme("http").map_err(|_| anyhow::anyhow!("scheme"))?,
+            "wss" => url.set_scheme("https").map_err(|_| anyhow::anyhow!("scheme"))?,
+            "http" | "https" => {}
+            other => anyhow::bail!("unsupported scheme: {other}"),
+        }
+        let mut path = url.path().trim_end_matches('/').to_string();
+        // The frontend URL already carries /v1/database/<db>/subscribe;
+        // swap the trailing segment for /schema.
+        if path.ends_with("/subscribe") {
+            path.truncate(path.len() - "/subscribe".len());
+        }
+        path.push_str("/schema");
+        url.set_path(&path);
+        url.query_pairs_mut().clear().append_pair("version", "9");
+
+        let resp = reqwest::get(url.as_str()).await?;
+        let status = resp.status();
+        // We only need the status — the schema endpoint sends
+        // `Connection: close` and may close before the (large) body
+        // finishes, which surfaces as a body-read error on a *successful*
+        // 200. Drain best-effort; the status line is the source of truth.
+        let _ = resp.bytes().await;
+        if status.is_success() {
+            Ok::<_, anyhow::Error>(())
+        } else {
+            anyhow::bail!("schema GET returned {status}")
+        }
+    })
+    .await
+    {
+        Ok(Ok(())) => println!("[OK]   schema   HTTP 200"),
+        Ok(Err(e)) => failures.push(("schema", format!("{e:#}"))),
+        Err(_) => failures.push(("schema", "timed out".into())),
+    }
+
+    if failures.is_empty() {
+        println!("PASS: v2.bsatn + v1.bsatn + v1.json + schema all OK");
+        Ok(())
+    } else {
+        for (name, msg) in &failures {
+            eprintln!("[FAIL] {name}: {msg}");
+        }
+        std::process::exit(1);
+    }
 }
 
 async fn run_writer(
@@ -726,6 +915,16 @@ async fn run_subscriber_v1(
 }
 
 fn v1_variant_name(msg: &v1::ServerMessage<v1::BsatnFormat>) -> &'static str {
+    v1_variant_name_any(msg)
+}
+
+/// Format-generic variant of [`v1_variant_name`]. The enum arm names
+/// don't depend on the `WebsocketFormat` parameter, so a single helper
+/// serves both the BSATN (`BsatnFormat`) and JSON (`JsonFormat`) server
+/// messages. Used by the v1 BSATN and v1.json client modules.
+pub(crate) fn v1_variant_name_any<F: v1::WebsocketFormat>(
+    msg: &v1::ServerMessage<F>,
+) -> &'static str {
     match msg {
         v1::ServerMessage::InitialSubscription(_) => "InitialSubscription",
         v1::ServerMessage::TransactionUpdate(_) => "TransactionUpdate",

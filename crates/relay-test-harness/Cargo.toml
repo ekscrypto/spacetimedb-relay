@@ -27,6 +27,8 @@ http.workspace = true
 url.workspace = true
 bytes.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
+serde_json.workspace = true
+reqwest.workspace = true
 
 clap.workspace = true
 tracing.workspace = true
