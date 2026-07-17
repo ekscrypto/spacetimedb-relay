@@ -331,7 +331,7 @@ class Codegen:
         # so downstream subscribers can recover upstream context as
         # `ctx.event.reducer.args.upstream`.
         insert_reducer = "\n".join([
-            f"#[spacetimedb::reducer]",
+            f"#[spacetimedb::reducer(name = \"relay_insert_{rust_name}\")]",
             f"pub fn relay_insert_{rust_name}(",
             f"    ctx: &ReducerContext,",
             f"    upstream: Option<UpstreamReducerInfo>,",
@@ -350,7 +350,7 @@ class Codegen:
         if pk_field_name is not None:
             delete_update_apply = "\n".join([
                 "",
-                f"#[spacetimedb::reducer]",
+                f"#[spacetimedb::reducer(name = \"relay_delete_{rust_name}\")]",
                 f"pub fn relay_delete_{rust_name}(",
                 f"    ctx: &ReducerContext,",
                 f"    upstream: Option<UpstreamReducerInfo>,",
@@ -364,7 +364,7 @@ class Codegen:
                 f"    Ok(())",
                 f"}}",
                 "",
-                f"#[spacetimedb::reducer]",
+                f"#[spacetimedb::reducer(name = \"relay_update_{rust_name}\")]",
                 f"pub fn relay_update_{rust_name}(",
                 f"    ctx: &ReducerContext,",
                 f"    upstream: Option<UpstreamReducerInfo>,",
@@ -388,7 +388,7 @@ class Codegen:
                 # over deletes is fine here — TableUpdates are typically
                 # small (initial subscribe-applied is pure-insert, no
                 # pairing work).
-                f"#[spacetimedb::reducer]",
+                f"#[spacetimedb::reducer(name = \"relay_apply_{rust_name}\")]",
                 f"pub fn relay_apply_{rust_name}(",
                 f"    ctx: &ReducerContext,",
                 f"    upstream: Option<UpstreamReducerInfo>,",
@@ -456,7 +456,7 @@ class Codegen:
             # typically low-churn descriptors/state.
             delete_update_apply += "\n".join([
                 "",
-                f"#[spacetimedb::reducer]",
+                f"#[spacetimedb::reducer(name = \"relay_apply_{rust_name}\")]",
                 f"pub fn relay_apply_{rust_name}(",
                 f"    ctx: &ReducerContext,",
                 f"    upstream: Option<UpstreamReducerInfo>,",

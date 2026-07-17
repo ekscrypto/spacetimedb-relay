@@ -267,6 +267,12 @@ impl MirrorDriver {
             .map_err(|_| DriverError::Closed)?;
         permit.forget();
         let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: "relay::mirror_driver",
+            request_id,
+            reducer,
+            "calling local reducer"
+        );
         if let Some(reg) = &self.meta_registry {
             reg.record(request_id, meta.cloned());
         }
