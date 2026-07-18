@@ -307,9 +307,7 @@
     <b>Subscriptions only.</b> <code>OneOffQuery</code> is not supported through
     this relay. Issuing a one-off query will return an error immediately. Use
     SDK table subscriptions instead &mdash; subscribe to the tables your tool
-    needs and read rows from the local cache. For ad-hoc lookups across all
-    regions, use the convenience HTTP endpoints below (<code>/players</code>,
-    <code>/claims</code>, &hellip;).
+    needs and read rows from the local cache.
   </div>
   <div class="panel">
     <table>
@@ -328,12 +326,11 @@
     </table>
   </div>
 
-  <!-- Section 3: Convenience HTTP endpoints -->
-  <h2>Convenience HTTP endpoints</h2>
+  <!-- Section 3: Health endpoint -->
+  <h2>Health endpoint</h2>
   <p class="section-note">
-    Read-only JSON endpoints for quick lookups across all mirrored regions.
-    Every result row carries an <code>__source</code> field naming the region it
-    came from. Lists are capped at 100 rows; narrow with the query params.
+    Read-only JSON snapshot of the whole fleet, refreshed every 30 seconds.
+    Drives the table above and is suitable for monitoring dashboards.
   </p>
   <div class="panel">
     <table class="endpoints">
@@ -350,35 +347,13 @@
           <td>
             Fleet source map: per-source <code>port</code>, mirror
             <code>database</code> name, <code>schema_cached</code> flag,
-            live <code>metrics.upstream.state</code> and throughput, and
-            total <code>schema_count</code>.
+            live <code>metrics.upstream.state</code> and throughput, plus
+            the host&rsquo;s <code>system.cpu.load_average</code> and
+            <code>system.network</code> rolling rate. <code>schema_count</code>
+            reflects the number of discovered sources.
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/health</div>
           </td>
           <td>&mdash;</td>
-        </tr>
-        <tr>
-          <td><a class="ep" href="/players" target="_blank" rel="noopener">/players</a></td>
-          <td>
-            Players across all regions:
-            <code>{count, players:[{entity_id, username, __source}]}</code>
-            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/players?q=Marshal'</div>
-          </td>
-          <td>
-            <code>?q=&lt;username&gt;</code> &mdash; substring filter<br>
-            <code>?source=bitcraft-live-&lt;N&gt;</code> &mdash; one region
-          </td>
-        </tr>
-        <tr>
-          <td><a class="ep" href="/claims" target="_blank" rel="noopener">/claims</a></td>
-          <td>
-            Land claims across all regions:
-            <code>{count, claims:[{entity_id, owner_player_entity_id, owner_building_entity_id, name, neutral, __source}]}</code>
-            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/claims?source=bitcraft-live-14'</div>
-          </td>
-          <td>
-            <code>?q=&lt;name&gt;</code> &mdash; substring filter<br>
-            <code>?source=bitcraft-live-&lt;N&gt;</code> &mdash; one region
-          </td>
         </tr>
       </tbody>
     </table>

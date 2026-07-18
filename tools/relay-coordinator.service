@@ -1,10 +1,19 @@
-# Relay reconnect coordinator — serialises stdb initial-sync floods.
-# Start this before (or alongside) the relay instances. Each relay that
-# has --coordinator-socket set will queue here and be granted a permit
-# one at a time, preventing the shared local stdb from being hammered by
-# 14 concurrent initial syncs after a parallel restart.
+# Relay reconnect coordinator + /health aggregator.
+#
+# Two host-scoped fleet utilities in one process:
+#   1. A bounded reconnect-permit semaphore over /run/relay/coordinator.sock
+#      (each relay that has --coordinator-socket set acquires a permit
+#      before its initial sequential subscribe, preventing a fleet-wide
+#      stdb flood after a parallel restart).
+#   2. A /health + / (dashboard) HTTP endpoint on 127.0.0.1:8082 that
+#      aggregates each instance's loopback /metrics. nginx proxies the
+#      public 80/443 listener to this address — drop-in replacement for
+#      the retired BitCraft-Relay.
+#
+# Start before (or alongside) the relay instances. Both jobs are independent
+# inside the process: a failure in one cannot wedge the other.
 [Unit]
-Description=spacetimedb-relay reconnect coordinator
+Description=spacetimedb-relay reconnect coordinator + /health aggregator
 After=network-online.target
 Wants=network-online.target
 
@@ -14,7 +23,9 @@ User=relay
 Group=relay
 ExecStart=/srv/relay/spacetimedb-relay/target/release/relay-coordinator \
     --socket /run/relay/coordinator.sock \
-    --max-concurrent 1
+    --max-concurrent 1 \
+    --health-bind 127.0.0.1:8082 \
+    --unit-dir /etc/systemd/system
 RuntimeDirectory=relay
 RuntimeDirectoryMode=0750
 WorkingDirectory=/srv/relay/spacetimedb-relay

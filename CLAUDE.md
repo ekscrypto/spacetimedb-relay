@@ -377,6 +377,7 @@ Source of truth: `clockworklabs/SpacetimeDB`,
 | `relay-mirror-driver`  | v2 WS client to local SpacetimeDB. Sends `relay_apply_<table>(upstream, deletes, inserts)` calls with semaphore backpressure (≤8 K in-flight) and chunking by row count + payload bytes. Hosts `MetaRegistry` (`registry.rs`) — a shared `DashMap<request_id, Option<UpstreamReducerMeta>>` the driver writes to on every CallReducer and the frontend reads to synthesise full v1 TUs. |
 | `relay-frontend`       | Public-facing WS proxy. `listener.rs` accepts connections, negotiates v1/v2 subprotocol; `client.rs` runs the per-connection un-split-socket select loop pairing downstream ↔ local-stdb; `rewrite.rs` synthesises full v1 `TransactionUpdate`s from local stdb's `TransactionUpdateLight` via the meta registry; `metrics.rs` + `state.rs` track per-client and aggregate counters surfaced on the dashboard. v2 path is pure passthrough plus metrics. |
 | `relay`                | Binary. Args, schema fetch, dashboard, dispatches to `stdb_mode`. The `stdb_mode.rs` run loop drives publisher → driver → `relay_bind_writer` → upstream subscribe (set-replace OR sequential SubscribeMulti) → routes `SubscribeApplied` + `TransactionUpdate` into `driver.apply()`. Wires the shared `MetaRegistry` into both the driver and the frontend, plus a periodic sweep task. |
+| `relay-coordinator`    | Host-scoped daemon (one per host, not per region). Two independent jobs in one process: (1) a bounded reconnect-permit semaphore over `/run/relay/coordinator.sock` — each relay with `--coordinator-socket` set acquires a permit before its initial sequential subscribe, serialising the post-restart stdb flood; (2) a `/health` + `/` HTTP aggregator on `127.0.0.1:8082` (configurable via `--health-bind`) that discovers `relay-*.service` units, polls each instance's loopback `/metrics` every 30 s, samples host CPU + NIC rate every 15 s, and serves the fleet-wide JSON that `www/index.html` renders. nginx proxies the public 80/443 listener to 8082 — this is the drop-in replacement for the retired BitCraft-Relay. The two jobs share no state; a failure in one cannot wedge the other. |
 | `relay-test-harness`   | Standalone binary that plays the C/D role. Default v2; pass `--subscriber-protocol v1` to exercise the frontend's TUL→TU synthesis path, and `--via-frontend ws://host:3009` to route through the proxy instead of hitting local stdb directly. |
 | `bc14-sdk-test`        | Standalone bin (excluded from the workspace). Vendors v1.12.0 SDK's `websocket.rs` + `compression.rs` verbatim with `pub` accessors, no codegen. Used to prove that BitCraft's 90 s RST on a 250-table set-replace is server/middlebox behavior, not a client-side bug. See `crates/bc14-sdk-test/README.md`. |
 | `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table (`relay_insert/delete/update/apply_<table>`), each taking an `Option<UpstreamReducerInfo>` arg that downstream subscribers see in `ctx.event.reducer.args`. |
@@ -454,6 +455,44 @@ Panels:
   `/events?since=N&max=200` every 1 s.
 
 Source: `crates/relay/src/dashboard.rs` + `dashboard.html`.
+
+## Fleet `/health` (relay-coordinator)
+
+The per-instance dashboard above is loopback-only and shows one relay.
+The public `https://relay.bitcraftsync.app/health` endpoint (and the
+`www/index.html` page that renders it) is served by **relay-coordinator**
+on `127.0.0.1:8082`, with nginx proxying the public 80/443 listener to
+it. This replaced the retired standalone BitCraft-Relay process.
+
+The coordinator discovers the fleet by walking
+`/etc/systemd/system/relay-*.service` (`--unit-dir`), parsing each
+unit's `--frontend-bind` / `--dashboard-bind` / `--mirror-database`
+flags — no hardcoded region list, same shape as `tools/fleet-status.sh`.
+It then polls every instance's loopback `/metrics` every 30 s (4 s
+timeout each, concurrent) and folds the results into the JSON the page
+expects: `sources[name].{port, database, schema_cached, metrics}`,
+`schema_count`, and `system.{cpu, network}`.
+
+Three fields the page reads are **derived** from the raw `/metrics`
+body (the per-instance relay doesn't emit them itself):
+
+- `metrics.process_uptime_seconds = now - started_at` (0 if either is 0)
+- `metrics.upstream.uptime_seconds = now - last_up_at` — only when
+  `state == "up"` and `last_up_at != 0`, else `null`
+- `metrics.local_stdb.uptime_seconds` — same rule on the local_stdb link
+
+This mirrors what BitCraft-Relay's `mirror_metrics::to_json` used to do
+and what `tools/fleet-status.sh` does for its UPTIME column. Derivation
+lives in `relay_coordinator::health::derive_uptime_fields`.
+
+`schema_count` is **not** the upstream's ~280-table count anymore —
+each relay has its own stdb since `--stdb-spawn`, so a host-wide
+table count no longer maps cleanly. It's `sources.len()`, which
+`index.html` already accepts as the default.
+
+Source: `crates/relay-coordinator/src/{health,sys_metrics}.rs` +
+`daemon.rs` (HTTP wiring). See the unit file
+`tools/relay-coordinator.service` for production flags.
 
 ## Historical / superseded docs
 
