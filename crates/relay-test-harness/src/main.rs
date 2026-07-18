@@ -33,6 +33,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, ValueEnum};
 use rand::Rng;
+use relay_protocol::parse_schema;
 use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -547,11 +548,13 @@ async fn run_check_integrity(
 
     // ---- check 4: schema-over-HTTP ----
     // Rewrite the WS frontend URL to its https form and GET .../schema.
-    // The schema bytes are the ones the relay cached and codegen'd from;
-    // a 200 here confirms the HTTP path that the 2026-07-17 probe bug
-    // broke (a probe that consumed WS handshake bytes on non-schema
-    // requests).
-    match tokio::time::timeout(timeout, async {
+    // The schema bytes are the ones the relay cached and codegen'd from.
+    // This is NOT just a status-code probe: a 200 with a truncated body
+    // (the relay's 2026-07-17 serve_schema RST bug) is a protocol
+    // violation, and this check must catch it. We therefore read the full
+    // body and run it through the same parse_schema the relay codegens
+    // from — anything less than a complete, well-formed schema fails.
+    let schema_result = tokio::time::timeout(timeout, async {
         let mut url = frontend.clone();
         match url.scheme() {
             "ws" => url.set_scheme("http").map_err(|_| anyhow::anyhow!("scheme"))?,
@@ -571,20 +574,23 @@ async fn run_check_integrity(
 
         let resp = reqwest::get(url.as_str()).await?;
         let status = resp.status();
-        // We only need the status — the schema endpoint sends
-        // `Connection: close` and may close before the (large) body
-        // finishes, which surfaces as a body-read error on a *successful*
-        // 200. Drain best-effort; the status line is the source of truth.
-        let _ = resp.bytes().await;
-        if status.is_success() {
-            Ok::<_, anyhow::Error>(())
-        } else {
-            anyhow::bail!("schema GET returned {status}")
+        // Read the full body. A premature close surfaces here as a body-
+        // read error — which is exactly the failure we want to surface,
+        // not swallow. The old code did `let _ = resp.bytes().await;` and
+        // trusted only the status line, which let a truncated 200 pass.
+        let bytes = resp.bytes().await?;
+        if !status.is_success() {
+            bail!("schema GET returned {status}");
         }
+        let table_count = validate_schema_body(&bytes)?;
+        Ok::<_, anyhow::Error>(table_count)
     })
-    .await
-    {
-        Ok(Ok(())) => println!("[OK]   schema   HTTP 200"),
+    .await;
+
+    match schema_result {
+        Ok(Ok(table_count)) => {
+            println!("[OK]   schema   HTTP 200, {table_count} tables")
+        }
         Ok(Err(e)) => failures.push(("schema", format!("{e:#}"))),
         Err(_) => failures.push(("schema", "timed out".into())),
     }
@@ -598,6 +604,23 @@ async fn run_check_integrity(
         }
         std::process::exit(1);
     }
+}
+
+/// Validate a `/schema?version=9` response body is complete and well
+/// formed. Returns the table count on success. Uses the same `parse_schema`
+/// the relay codegens from, so a truncated JSON body (incomplete string →
+/// `serde_json` error) or a valid-JSON-but-wrong-shape body (precise
+/// `Shape { path, msg }` error) both fail. Pure and allocation-free apart
+/// from the parse — kept separate from the async fetch so it's unit-
+/// testable without a socket.
+fn validate_schema_body(bytes: &[u8]) -> Result<usize> {
+    let schema = parse_schema(bytes)
+        .map_err(|e| anyhow!("schema body invalid: {e}"))?;
+    let count = schema.tables.len();
+    if count == 0 {
+        bail!("schema parsed but contains zero tables");
+    }
+    Ok(count)
 }
 
 async fn run_writer(
@@ -1020,4 +1043,69 @@ fn database_update_contains_string(db: &v1::DatabaseUpdate<v1::BsatnFormat>, nee
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The schema-body validator is what stands between a broken
+    // /schema endpoint and a green integrity check. The 2026-07-17
+    // incident: the relay RST'd the schema body at ~127 KB of ~583 KB,
+    // and check-integrity passed anyway because it only looked at the
+    // HTTP 200 status line. These tests pin the property that actually
+    // broke: a truncated body must fail, and a real schema must report
+    // its table count.
+
+    /// Minimal hand-rolled SATS-JSON schema that `parse_schema` accepts:
+    /// a typespace with one Product type and one Public User table backed
+    /// by it. Kept inline so the test has no external file dependency.
+    fn minimal_schema_json() -> Vec<u8> {
+        b"{\"typespace\":{\"types\":[{\"Product\":{\"elements\":[\
+            {\"name\":{\"some\":\"id\"},\"algebraic_type\":{\"U64\":[]}}\
+        ]}}]},\"tables\":[{\"name\":\"t1\",\"product_type_ref\":0,\
+        \"primary_key\":[0],\"table_access\":{\"Public\":{}},\
+        \"table_type\":{\"User\":{}}}],\"misc_exports\":[]}"
+        .to_vec()
+    }
+
+    #[test]
+    fn validate_schema_body_accepts_well_formed_schema() {
+        let bytes = minimal_schema_json();
+        let count = validate_schema_body(&bytes).expect("minimal schema should parse");
+        assert_eq!(count, 1, "one table in the fixture");
+    }
+
+    #[test]
+    fn validate_schema_body_rejects_truncated_json() {
+        // Mimic the exact failure mode of the serve_schema RST bug: the
+        // body is cut mid-string, so the JSON is unterminated. This is
+        // what every /schema client received on 2026-07-17. The old
+        // status-only check passed on this; the validator must fail.
+        let full = minimal_schema_json();
+        // Cut at ~70% — guaranteed to land inside a string literal.
+        let cut = full.len() * 7 / 10;
+        let truncated = &full[..cut];
+        let err = validate_schema_body(truncated)
+            .expect_err("truncated JSON must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid"),
+            "error should mention invalidity: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_schema_body_rejects_zero_tables() {
+        // Valid JSON, correct top-level shape, but no tables — a
+        // degenerate body that's technically parseable but clearly not
+        // a real schema. The relay should never serve this.
+        let bytes = br#"{"typespace":{"types":[]},"tables":[]}"#;
+        let err = validate_schema_body(bytes)
+            .expect_err("zero-table schema must be rejected");
+        assert!(
+            format!("{err:#}").contains("zero tables"),
+            "error should mention zero tables"
+        );
+    }
 }

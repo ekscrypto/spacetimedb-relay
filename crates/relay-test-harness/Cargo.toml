@@ -12,12 +12,15 @@ path = "src/main.rs"
 # Intentionally NOT depending on relay-upstream — this harness is the
 # C and D clients in the architecture diagram, not the R-to-S code.
 # It speaks v2.bsatn.spacetimedb directly using the upstream protocol
-# crates.
+# crates. relay-protocol IS allowed: it's wire-types-only (no I/O) and
+# owns parse_schema, the same schema parser the relay codegens from —
+# reused here to validate the /schema body end-to-end.
 spacetimedb-sats.workspace = true
 spacetimedb-client-api-messages.workspace = true
 spacetimedb-lib.workspace = true
 spacetimedb-client-api-messages-v1.workspace = true
 spacetimedb-lib-v1.workspace = true
+relay-protocol.workspace = true
 
 tokio.workspace = true
 tokio-tungstenite.workspace = true
