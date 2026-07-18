@@ -326,7 +326,39 @@
     </table>
   </div>
 
-  <!-- Section 3: Health endpoint -->
+  <!-- Section 3: Schema endpoint -->
+  <h2>Schema endpoint</h2>
+  <p class="section-note">
+    Each relay also serves its upstream&rsquo;s schema as SATS-JSON over plain
+    HTTP on the same port as its <code>wss://</code> listener. Substitute the
+    <b>Port</b> and <b>Database (mirror)</b> values from the table above.
+    The response carries <code>Content-Type: application/json</code> and is the
+    cached upstream schema (the bytes the relay fetched at startup and codegen
+    &rsquo;d its mirror from) &mdash; about 580&nbsp;KB for a BitCraft module,
+    with <code>Cache-Control: public, max-age=60</code>. The
+    <code>?version=9</code> query is accepted but ignored: only the v9 format
+    is cached. Useful for codegen, type inspection, or feeding a local SDK
+    without hitting upstream.
+  </p>
+  <div class="panel">
+    <table class="endpoints">
+      <thead>
+        <tr>
+          <th>URL template</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <code>https://relay.bitcraftsync.app:&lt;port&gt;/v1/database/&lt;mirror-database&gt;/schema?version=9</code>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app:3014/v1/database/relay-mirror-bc14/schema?version=9</div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Section 4: Health endpoint -->
   <h2>Health endpoint</h2>
   <p class="section-note">
     Read-only JSON snapshot of the whole fleet, refreshed every 30 seconds.
