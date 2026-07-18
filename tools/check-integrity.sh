@@ -73,17 +73,29 @@ database_for() {
 # HTTPS; 200 means yes, 502 (nginx: no upstream) or unreachable means no.
 # Prints "yes" / "no".
 #
-# Note on curl's exit code: the schema endpoint sends `Connection: close`
-# and may close before the body finishes, so curl returns 18
-# (CURLE_PARTIAL_FILE) even on a successful 200. We therefore trust the
-# http_code curl printed, not its exit status — capture them separately.
+# This is a coarse liveness probe, NOT a schema-completeness check — the
+# authoritative validation (full body + parse_schema) lives in the harness
+# run below. We require both a 200 status AND a non-trivial body size so a
+# server that answers headers but serves an empty/truncated body isn't
+# mistaken for live. A real schema is kilobytes minimum, so a floor of a
+# few hundred bytes catches the degenerate empty-200 case without ever
+# false-positiving on a genuine schema.
+#
+# Note on curl's exit code: the schema endpoint sends `Connection: close`,
+# and `Connection: close` only means "no keep-alive after this response" —
+# it does NOT license the server to truncate the body. A body shorter than
+# Content-Length is a protocol violation. We still tolerate curl exit 18
+# (CURLE_PARTIAL_FILE) here because some middleboxes misbehave and the
+# harness is the source of truth; we just won't call a tiny body "live".
 port_is_live() {
     port=$1
     db=$(database_for "$port")
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 \
+    out=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 6 \
         "https://${HOST}:${port}/v1/database/${db}/schema" 2>/dev/null)
-    # curl printed nothing (dns/connect failure) → treat as not live.
-    [ "$code" = "200" ] && echo yes || echo no
+    code=${out%% *}
+    size=${out##* }
+    # 200 + a real body (>= 512 bytes; any schema is kilobytes).
+    [ "$code" = "200" ] && [ "${size:-0}" -ge 512 ] && echo yes || echo no
 }
 
 # Discover live ports. Either the caller's explicit list, or scan the

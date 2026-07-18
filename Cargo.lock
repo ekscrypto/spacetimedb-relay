@@ -1836,6 +1836,7 @@ dependencies = [
  "hex",
  "http",
  "rand 0.8.6",
+ "relay-protocol",
  "reqwest",
  "rustls",
  "serde_json",
