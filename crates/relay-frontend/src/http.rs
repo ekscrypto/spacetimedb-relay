@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -45,6 +45,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// well under this; if a client sends more, we treat it as Passthrough
 /// and let the WS handshake (or its 400) handle it.
 const PROBE_MAX_BYTES: usize = 64 * 1024;
+/// Bound [`drain_request`] so a client that keeps its write half open
+/// (or a half-open connection) can't pin a frontend task after the
+/// schema response is already written. Generous for any real HTTP
+/// client, which sends its full request in one burst and then waits.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Inspect the first bytes of `stream` without consuming them and decide
 /// whether this is a schema HTTP request. Returns `Passthrough` on any
@@ -197,10 +202,42 @@ fn build_response(body: &[u8]) -> Vec<u8> {
 
 /// Write a minimal HTTP/1.1 200 response carrying `body` as JSON, then
 /// flush and leave the stream for the caller to close.
+///
+/// After writing, drains any bytes the client sent that [`probe`] left
+/// unread in the socket's receive buffer. The probe classifies requests
+/// via non-destructive `peek`, so the full HTTP request line + headers
+/// (and anything else the client pipelined) are still sitting in the
+/// kernel receive buffer when we come to write the response. If we let
+/// the caller drop the stream with those bytes unread, the kernel sends
+/// an RST rather than a FIN — which discards whatever remains in the
+/// *send* buffer too. For the ~580 KB BitCraft schema that truncated
+/// every client at ~127 KB. Draining the receive buffer first lets the
+/// subsequent close deliver the full payload cleanly.
 pub async fn serve_schema(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
     let response = build_response(body);
     stream.write_all(&response).await?;
-    stream.flush().await
+    stream.flush().await?;
+    drain_request(stream).await;
+    Ok(())
+}
+
+/// Read and discard whatever the client sent that hasn't been read yet,
+/// so the caller can drop the stream without the kernel converting an
+/// unread receive buffer into a connection-reset. Bounded by
+/// [`DRAIN_TIMEOUT`] so a client that holds its write side open (or a
+/// half-open connection) can't pin a frontend task. A client that has
+/// already closed its side returns promptly with `Ok(0)`.
+async fn drain_request(stream: &mut TcpStream) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match timeout(DRAIN_TIMEOUT, stream.read(&mut buf)).await {
+            // Clean EOF or error: nothing left to drain (or the peer is
+            // gone, in which case there's no RST risk either way).
+            Ok(Ok(0)) | Ok(Err(_)) => return,
+            Ok(Ok(_)) => continue,
+            Err(_) => return, // timed out — give up rather than hang
+        }
+    }
 }
 
 #[cfg(test)]
@@ -415,5 +452,125 @@ mod tests {
         // classify the re-read bytes to prove the WS layer would see the
         // real request, not a truncated prefix.
         assert_eq!(classify_final(&got[..n]), HttpProbe::Passthrough);
+    }
+
+    // ---- regression: serve_schema must deliver the full body ----
+    //
+    // The 2026-07-17 schema-download outage: serve_schema did write_all +
+    // flush and returned, leaving the client's HTTP request unread in the
+    // socket's receive buffer (probe peeks non-destructively). When the
+    // caller then dropped the stream, the kernel saw unread receive data
+    // at close time and sent RST instead of FIN — discarding whatever was
+    // still in the send buffer. The ~580 KB BitCraft schema truncated
+    // every client at ~127 KB. The fix drains the receive buffer before
+    // returning so the caller's drop produces a clean close. This test
+    // asserts the property that broke: a body larger than a typical socket
+    // send buffer is delivered in full with a clean EOF, no reset.
+
+    #[tokio::test]
+    async fn serve_schema_delivers_large_body_in_full() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Large enough to overflow the kernel send buffer (~128-256 KB on
+        // most platforms) so a premature close would visibly truncate.
+        // Mirrors the real BitCraft schema (~580 KB).
+        let body = vec![b'{'; 600_000];
+        let body_len = body.len();
+
+        let req = b"GET /v1/database/relay-mirror-bc-global/schema?version=9 \
+                    HTTP/1.1\r\nHost: x\r\n\r\n";
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // probe peeks without consuming — the request bytes stay in the
+            // receive buffer, exactly as in handle_accept.
+            let outcome = tokio::time::timeout(Duration::from_secs(2), probe(&stream))
+                .await
+                .expect("probe did not return within 2s");
+            assert_eq!(outcome, HttpProbe::Schema);
+            serve_schema(&mut stream, &body)
+                .await
+                .expect("serve_schema should succeed");
+            // Caller drops the stream here — this is where the RST used to
+            // originate. The drain inside serve_schema must prevent it.
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client.write_all(req).await.unwrap();
+        client.flush().await.unwrap();
+
+        // Read the response incrementally. Once we have the full body
+        // (headers parsed for Content-Length), close our write side —
+        // mirroring how a real HTTP client behaves on `Connection: close`,
+        // and giving the server's drain a clean `Ok(0)` to exit on.
+        let blank = b"\r\n\r\n";
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16384];
+        let read_result: Result<(), std::io::Error> = loop {
+            match tokio::time::timeout(Duration::from_secs(10), client.read(&mut buf)).await {
+                Err(_) => break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "client read did not complete within 10s — likely deadlocked",
+                )),
+                Ok(Err(e)) => break Err(e),
+                Ok(Ok(0)) => break Err(std::io::Error::new(
+                    // Unexpected early EOF — with the bug we saw RST here.
+                    std::io::ErrorKind::ConnectionReset,
+                    "unexpected EOF before full body — connection was reset",
+                )),
+                Ok(Ok(n)) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = got.windows(blank.len()).position(|w| w == blank) {
+                        let header_end = pos + blank.len();
+                        let cl = extract_content_length(&got[..header_end]);
+                        if got.len() >= header_end + cl {
+                            // Full body received — close our write side so
+                            // the server's drain exits promptly.
+                            client.shutdown().await.ok();
+                            break Ok(());
+                        }
+                    }
+                }
+            }
+        };
+
+        // With the bug this branch hit ConnectionReset or TimedOut; with
+        // the fix we get a clean Ok after the full body.
+        read_result.expect("expected clean full-body read, got reset or timeout");
+
+        let header_end = got
+            .windows(blank.len())
+            .position(|w| w == blank)
+            .expect("missing header terminator");
+        let received_body = &got[header_end + blank.len()..];
+        assert_eq!(
+            received_body.len(),
+            body_len,
+            "body truncated: received {} of {} bytes",
+            received_body.len(),
+            body_len
+        );
+        assert_eq!(received_body, &vec![b'{'; body_len][..], "body content mismatch");
+
+        server.await.unwrap();
+    }
+
+    /// Parse the `Content-Length` value out of an HTTP response header
+    /// block. Used by the schema-delivery test to know when the full body
+    /// has arrived so it can close its write side.
+    fn extract_content_length(headers: &[u8]) -> usize {
+        let s = std::str::from_utf8(headers).unwrap_or("");
+        for line in s.split("\r\n") {
+            if line.to_ascii_lowercase().starts_with("content-length:") {
+                return line
+                    .split(':')
+                    .nth(1)
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        0
     }
 }
