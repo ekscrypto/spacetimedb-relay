@@ -20,3 +20,12 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# /health aggregator: HTTP server, instance poller, host metrics.
+axum = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+sysinfo = { workspace = true, features = ["network"] }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

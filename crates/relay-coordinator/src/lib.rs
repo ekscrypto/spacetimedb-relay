@@ -15,6 +15,8 @@
 //! stdb backoff that lives in `stdb_mode.rs`.
 
 pub mod daemon;
+pub mod health;
+pub mod sys_metrics;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -81,12 +83,9 @@ impl CoordinatorClient {
     }
 
     async fn try_acquire(&self) -> Result<ReconnectPermit> {
-        let stream = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            UnixStream::connect(&self.socket_path),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("connect timeout"))??;
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket_path))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect timeout"))??;
 
         let (reader, mut writer) = stream.into_split();
 
@@ -102,7 +101,9 @@ impl CoordinatorClient {
             .map_err(|_| anyhow::anyhow!("grant timeout after {}s", GRANT_TIMEOUT.as_secs()))??;
 
         if line.trim().is_empty() {
-            return Err(anyhow::anyhow!("coordinator closed connection before granting"));
+            return Err(anyhow::anyhow!(
+                "coordinator closed connection before granting"
+            ));
         }
 
         // Keep the writer alive — closing it signals the daemon to release.
