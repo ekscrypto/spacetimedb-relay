@@ -993,23 +993,20 @@ fn respond_storage_logs(headers: &HeaderMap, body: pb::StorageLogList) -> Respon
             .logs
             .iter()
             .map(|e| {
+                let building = e.building.as_ref();
                 let mut map = serde_json::Map::new();
                 map.insert("id".into(), json!(e.id.to_string()));
                 map.insert("region".into(), json!(e.region));
                 map.insert(
-                    "storage_entity_id".into(),
-                    json!(e.storage_entity_id.to_string()),
+                    "building".into(),
+                    json!({
+                        "entity_id": building
+                            .map(|b| b.entity_id.to_string())
+                            .unwrap_or_default(),
+                        "name": building.and_then(|b| b.name.as_ref()),
+                        "nickname": building.and_then(|b| b.nickname.as_ref()),
+                    }),
                 );
-                if let Some(ref n) = e.building_name {
-                    map.insert("building_name".into(), json!(n));
-                } else {
-                    map.insert("building_name".into(), Value::Null);
-                }
-                if let Some(ref n) = e.building_nickname {
-                    map.insert("building_nickname".into(), json!(n));
-                } else {
-                    map.insert("building_nickname".into(), Value::Null);
-                }
                 if let Some(cid) = e.claim_entity_id {
                     map.insert("claim_entity_id".into(), json!(cid.to_string()));
                 } else {
@@ -1043,34 +1040,30 @@ fn enrich_storage_log(s: &RegionStore, slot: u32) -> pb::StorageLogEntry {
 
     let i = slot as usize;
     let storage_id = s.storage_log.storage_entity_id[i];
-    let (building_name, building_nickname, claim_entity_id, claim_name) =
-        match s.building.find(storage_id) {
-            Some(b_slot) => {
-                let bi = b_slot as usize;
-                let desc_id = s.building.building_description_id[bi];
-                let claim_id = s.building.claim_entity_id[bi];
-                let building_name = s.building_desc.get(desc_id).map(str::to_owned);
-                let building_nickname = s.building_nickname.get(storage_id).map(str::to_owned);
-                let claim_name = s
-                    .claim
-                    .find(claim_id)
-                    .map(|c| s.claim.name[c as usize].as_ref().to_owned());
-                (
-                    building_name,
-                    building_nickname,
-                    Some(claim_id),
-                    claim_name,
-                )
-            }
-            None => (None, None, None, None),
-        };
+    let (name, nickname, claim_entity_id, claim_name) = match s.building.find(storage_id) {
+        Some(b_slot) => {
+            let bi = b_slot as usize;
+            let desc_id = s.building.building_description_id[bi];
+            let claim_id = s.building.claim_entity_id[bi];
+            let name = s.building_desc.get(desc_id).map(str::to_owned);
+            let nickname = s.building_nickname.get(storage_id).map(str::to_owned);
+            let claim_name = s
+                .claim
+                .find(claim_id)
+                .map(|c| s.claim.name[c as usize].as_ref().to_owned());
+            (name, nickname, Some(claim_id), claim_name)
+        }
+        None => (None, None, None, None),
+    };
 
     pb::StorageLogEntry {
         id: s.storage_log.id[i],
         region: s.region,
-        storage_entity_id: storage_id,
-        building_name,
-        building_nickname,
+        building: Some(pb::StorageLogBuilding {
+            entity_id: storage_id,
+            name,
+            nickname,
+        }),
         claim_entity_id,
         claim_name,
         player_entity_id: s.storage_log.player_entity_id[i],

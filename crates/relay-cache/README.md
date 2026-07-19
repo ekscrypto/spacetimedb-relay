@@ -140,7 +140,8 @@ curl -s 'http://127.0.0.1:8089/storage-logs?playerId=1297036692699996362'
 curl -s 'http://127.0.0.1:8089/storage-logs?itemId=1080001&claimId=1234567890'
 curl -s 'http://127.0.0.1:8089/storage-logs?itemId=1080001&playerId=1297036692699996362&itemType=Item&region=14'
 # → { "logs": [
-#      { "id", "region", "storage_entity_id", "building_name", "building_nickname",
+#      { "id", "region",
+#        "building": { "entity_id", "name", "nickname" },
 #        "claim_entity_id", "claim_name", "player_entity_id", "player_username",
 #        "action": "deposit"|"withdraw"|"reserved",
 #        "item_id", "item_type", "quantity", "timestamp", "days_since_epoch" }, ...
