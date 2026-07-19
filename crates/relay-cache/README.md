@@ -134,8 +134,9 @@ curl -s 'http://127.0.0.1:8089/deposits?region=14'
 #   playerId=…                          — all actions by that player
 #   itemId=…&claimId=…                  — that item across a claim's buildings
 #   itemId=…&playerId=…                 — that item in one player's actions
-# Optional: itemType=Item|Cargo (item modes only), region=N
+# Optional: itemType=Item|Cargo (item modes only), region=N, limit=N (newest N)
 curl -s 'http://127.0.0.1:8089/storage-logs?storageId=1008806316593474517'
+curl -s 'http://127.0.0.1:8089/storage-logs?storageId=1008806316593474517&limit=50'
 curl -s 'http://127.0.0.1:8089/storage-logs?playerId=1297036692699996362'
 curl -s 'http://127.0.0.1:8089/storage-logs?itemId=1080001&claimId=1234567890'
 curl -s 'http://127.0.0.1:8089/storage-logs?itemId=1080001&playerId=1297036692699996362&itemType=Item&region=14'

@@ -919,6 +919,8 @@ struct StorageLogsQuery {
     #[serde(rename = "itemType")]
     item_type: Option<String>,
     region: Option<u32>,
+    /// Keep only the newest N logs (after sort). Omit for the full retained window.
+    limit: Option<usize>,
 }
 
 enum StorageLogsMode {
@@ -1134,6 +1136,13 @@ async fn storage_logs(
             return no_store_status(StatusCode::BAD_REQUEST, json!({"error": e})).into_response();
         }
     };
+    if let Some(0) = q.limit {
+        return no_store_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "`limit` must be >= 1"}),
+        )
+        .into_response();
+    }
     // itemType only applies to item-scoped modes.
     let item_type = match &mode {
         StorageLogsMode::ItemClaim { .. } | StorageLogsMode::ItemPlayer { .. } => item_type,
@@ -1154,11 +1163,11 @@ async fn storage_logs(
         logs.extend(collect_storage_logs(&s, &mode, item_type));
     }
     logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
+    if let Some(limit) = q.limit {
+        logs.truncate(limit);
+    }
     let count = logs.len() as i32;
-    respond_storage_logs(
-        &headers,
-        pb::StorageLogList { logs, count },
-    )
+    respond_storage_logs(&headers, pb::StorageLogList { logs, count })
 }
 
 fn respond_hexite_deposits(headers: &HeaderMap, body: pb::HexiteDepositList) -> Response {
