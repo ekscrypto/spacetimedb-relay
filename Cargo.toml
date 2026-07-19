@@ -9,6 +9,7 @@ members = [
     "crates/relay-publisher",
     "crates/relay-mirror-driver",
     "crates/relay-frontend",
+    "crates/relay-cache",
     "spike/replay",
 ]
 # bc14-sdk-test is intentionally excluded — it pulls v1.12.0 SpacetimeDB
@@ -29,6 +30,7 @@ relay-publisher = { path = "crates/relay-publisher" }
 relay-mirror-driver = { path = "crates/relay-mirror-driver" }
 relay-frontend = { path = "crates/relay-frontend" }
 relay-coordinator = { path = "crates/relay-coordinator" }
+relay-cache = { path = "crates/relay-cache" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -56,6 +58,7 @@ thiserror = "2"
 
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
+hashbrown = "0.14"
 parking_lot = "0.12"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 dhat = "0.3"
