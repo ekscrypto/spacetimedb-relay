@@ -27,8 +27,14 @@ On the relay host, defaults discover regions from
 - `--debug` / `RELAY_CACHE_DEBUG` — 5s heartbeats while waiting on
   `SubscribeApplied` (phase + elapsed), WS ping during that wait, and
   `relay_cache=debug` when `RUST_LOG` is unset. Always-on info logs already
-  include Subscribe send, wire bytes + wait time on each Applied, and
-  bulk-load duration.
+  include per-query sequential Subscribe, wire bytes + wait time on each
+  Applied, and total bulk-load duration.
+
+Ingest uses **sequential additive** `Subscribe` (one SQL query per unique
+`query_set_id`, wait for Applied, merge, next) — the same strategy as the
+relay's `--subscribe-chunk-size 1` / `SubscribeMulti` path. Hexite
+`location_state` PK queries are further sequential steps after the
+resource filters.
 
 ## Queries
 

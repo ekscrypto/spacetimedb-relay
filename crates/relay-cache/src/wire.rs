@@ -21,6 +21,7 @@ use url::Url;
 use spacetimedb_client_api_messages::websocket::common::QuerySetId;
 use spacetimedb_client_api_messages::websocket::v2::{
     ClientMessage, InitialConnection, ServerMessage, Subscribe, SubscribeApplied,
+    TransactionUpdate,
 };
 use spacetimedb_sats::bsatn;
 
@@ -133,14 +134,15 @@ pub async fn expect_initial_connection(conn: &mut Conn) -> Result<InitialConnect
     }
 }
 
-/// Block until `SubscribeApplied`. When `debug`, emit a 5s heartbeat (and a
-/// WS Ping) so operators can tell a hung assemble apart from a dead socket.
-/// Always logs wire size + wait time when the applied message finally lands.
+/// Block until `SubscribeApplied`. When `debug_mode`, emit a 5s heartbeat
+/// (and a WS Ping). `TransactionUpdate`s during the wait are forwarded to
+/// `on_update` so sequential bootstrap can stay consistent.
 pub async fn expect_subscribe_applied(
     conn: &mut Conn,
     region: u32,
     phase: &str,
     debug_mode: bool,
+    mut on_update: impl FnMut(&TransactionUpdate) -> Result<()>,
 ) -> Result<(SubscribeApplied, usize)> {
     let started = Instant::now();
     let mut heartbeat = tokio::time::interval(WAIT_HEARTBEAT);
@@ -165,6 +167,9 @@ pub async fn expect_subscribe_applied(
                             "SubscribeApplied received"
                         );
                         return Ok((sa, frame.wire_bytes));
+                    }
+                    ServerMessage::TransactionUpdate(tu) => {
+                        on_update(&tu)?;
                     }
                     ServerMessage::SubscriptionError(err) => {
                         bail!(
@@ -207,23 +212,21 @@ pub async fn expect_subscribe_applied(
     }
 }
 
-pub async fn send_subscribe(
+/// Additive single-query `Subscribe` (v2). Each call must use a fresh
+/// `query_set_id` — reusing an id replaces that set; unique ids append,
+/// matching the relay's sequential SubscribeMulti strategy.
+pub async fn send_subscribe_one(
     conn: &mut Conn,
     request_id: u32,
     query_set_id: u32,
-    queries: Vec<String>,
+    query: String,
     region: u32,
     phase: &str,
 ) -> Result<()> {
-    let n_queries = queries.len();
     let msg = ClientMessage::Subscribe(Subscribe {
         request_id,
         query_set_id: QuerySetId::new(query_set_id),
-        query_strings: queries
-            .into_iter()
-            .map(|s| s.into_boxed_str())
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        query_strings: vec![query.clone().into_boxed_str()].into_boxed_slice(),
     });
     let bytes = bsatn::to_vec(&msg).map_err(|e| anyhow!("encode Subscribe: {e}"))?;
     tracing::info!(
@@ -232,9 +235,9 @@ pub async fn send_subscribe(
         phase,
         request_id,
         query_set_id,
-        n_queries,
+        query = %query,
         subscribe_wire_bytes = bytes.len(),
-        "sending Subscribe"
+        "sending Subscribe (one query)"
     );
     conn.send(Message::Binary(bytes)).await?;
     Ok(())

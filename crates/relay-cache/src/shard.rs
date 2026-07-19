@@ -255,70 +255,111 @@ async fn session(
     );
 
     let base_queries = base_subscribe_queries();
-    // Phase 1: discover hexite entity_ids (coords need a follow-up PK
-    // subscribe — full location_state is ~13M rows/region).
-    const PHASE1: &str = "phase1_bulk";
-    wire::send_subscribe(&mut conn, 1, 1, base_queries.clone(), region, PHASE1).await?;
-    let (sa1, phase1_wire_bytes) =
-        wire::expect_subscribe_applied(&mut conn, region, PHASE1, debug_mode).await?;
-    let hexite_ids = collect_hexite_entity_ids(schema, meta, &sa1)?;
-    tracing::info!(
-        target: "relay_cache::shard",
-        region,
-        phase1_wire_bytes,
-        n_hexite = hexite_ids.len(),
-        "phase1 SubscribeApplied decoded; hexite ids collected"
-    );
+    // Sequential additive Subscribe (v2): one query per unique query_set_id,
+    // wait for that Applied, merge rows — same strategy as the relay's
+    // SubscribeMulti chunk-size-1 path. Hexite location PK queries are
+    // appended after the resource filters have populated entity_ids.
+    let load_started = Instant::now();
+    let mut building = RegionStore::empty(region);
+    let mut next_id: u32 = 1;
+    let mut hexite_ids: Vec<u64> = Vec::new();
+    let n_base = base_queries.len();
 
-    let mut queries = base_queries;
-    for entity_id in &hexite_ids {
-        queries.push(format!(
-            "SELECT * FROM {LOCATION_TABLE} WHERE entity_id = {entity_id}"
-        ));
-    }
-    if !hexite_ids.is_empty() {
-        const PHASE2: &str = "phase2_hexite_locations";
-        wire::send_subscribe(&mut conn, 2, 1, queries, region, PHASE2).await?;
-        let (sa, phase2_wire_bytes) =
-            wire::expect_subscribe_applied(&mut conn, region, PHASE2, debug_mode).await?;
+    for (idx, query) in base_queries.into_iter().enumerate() {
+        let id = next_id;
+        next_id = next_id.saturating_add(1);
+        let phase = format!("seq_{idx}_of_{n_base}");
         tracing::info!(
             target: "relay_cache::shard",
             region,
-            phase2_wire_bytes,
-            "phase2 SubscribeApplied received; installing bulk load"
+            idx,
+            n_queries = n_base,
+            query_set_id = id,
+            query = %query,
+            "subscribing to next query sequentially"
         );
-        let load_started = Instant::now();
-        install_bulk_load(region, schema, meta, store, &sa)?;
+        wire::send_subscribe_one(&mut conn, id, id, query, region, &phase).await?;
+        let (sa, wire_bytes) = wire::expect_subscribe_applied(
+            &mut conn,
+            region,
+            &phase,
+            debug_mode,
+            |tu| apply_transaction_to(&mut building, schema, meta, tu),
+        )
+        .await?;
+        let from_resource = sa
+            .rows
+            .tables
+            .iter()
+            .any(|t| t.table.as_ref() == RESOURCE_TABLE);
+        merge_subscribe_applied(&mut building, schema, meta, &sa)?;
+        if from_resource {
+            hexite_ids.extend(collect_hexite_entity_ids(schema, meta, &sa)?);
+        }
         tracing::info!(
             target: "relay_cache::shard",
             region,
-            bulk_load_ms = load_started.elapsed().as_millis() as u64,
-            "phase2 bulk load installed"
-        );
-    } else {
-        tracing::info!(
-            target: "relay_cache::shard",
-            region,
-            "no hexite ids — installing phase1 bulk load"
-        );
-        let load_started = Instant::now();
-        install_bulk_load(region, schema, meta, store, &sa1)?;
-        tracing::info!(
-            target: "relay_cache::shard",
-            region,
-            bulk_load_ms = load_started.elapsed().as_millis() as u64,
-            "phase1 bulk load installed"
+            idx,
+            wire_bytes,
+            "sequential SubscribeApplied merged"
         );
     }
 
-    let n_resource = store.read().resource.len();
+    hexite_ids.sort_unstable();
+    hexite_ids.dedup();
+    let n_hexite = hexite_ids.len();
+    for (hi, entity_id) in hexite_ids.iter().enumerate() {
+        let id = next_id;
+        next_id = next_id.saturating_add(1);
+        let query = format!("SELECT * FROM {LOCATION_TABLE} WHERE entity_id = {entity_id}");
+        let phase = format!("hexite_loc_{hi}_of_{n_hexite}");
+        tracing::info!(
+            target: "relay_cache::shard",
+            region,
+            hi,
+            n_hexite,
+            entity_id,
+            query_set_id = id,
+            "subscribing to hexite location sequentially"
+        );
+        wire::send_subscribe_one(&mut conn, id, id, query, region, &phase).await?;
+        let (sa, wire_bytes) = wire::expect_subscribe_applied(
+            &mut conn,
+            region,
+            &phase,
+            debug_mode,
+            |tu| apply_transaction_to(&mut building, schema, meta, tu),
+        )
+        .await?;
+        merge_subscribe_applied(&mut building, schema, meta, &sa)?;
+        tracing::info!(
+            target: "relay_cache::shard",
+            region,
+            hi,
+            entity_id,
+            wire_bytes,
+            "hexite location SubscribeApplied merged"
+        );
+    }
+
+    building.ready = true;
+    let n_resource = building.resource.len();
+    let n_claim = building.claim.len();
+    let n_growth = building.growth.len();
+    {
+        let mut guard = store.write();
+        *guard = building;
+    }
     tracing::info!(
         target: "relay_cache::shard",
         region,
-        n_hexite = hexite_ids.len(),
+        n_hexite,
         n_resource,
+        n_claim,
+        n_growth,
+        bulk_load_ms = load_started.elapsed().as_millis() as u64,
         session_ms = connected_at.elapsed().as_millis() as u64,
-        "hexite location subscribe complete; entering stream loop"
+        "sequential subscribe complete; entering stream loop"
     );
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -411,8 +452,8 @@ fn base_subscribe_queries() -> Vec<String> {
         format!("SELECT * FROM {BUILDING_NICKNAME_TABLE}"),
         // Full location_state is ~13M rows/region; interiors-only is enough
         // because overworld buildings default to dimension 1 when absent.
-        // Hexite deposit coords are added as per-entity PK queries after
-        // phase-1 discovers their entity_ids.
+        // Hexite deposit coords are subscribed sequentially after the
+        // resource filters below have yielded entity_ids.
         format!("SELECT * FROM {LOCATION_TABLE} WHERE dimension != 1"),
         format!("SELECT * FROM {DIMENSION_NETWORK_TABLE}"),
         format!("SELECT * FROM {PLAYER_USERNAME_TABLE}"),
@@ -466,97 +507,20 @@ fn collect_hexite_entity_ids(
     Ok(ids)
 }
 
-fn install_bulk_load(
-    region: u32,
+fn merge_subscribe_applied(
+    store: &mut RegionStore,
     schema: &MirroredSchema,
     meta: &TableMeta,
-    store: &Arc<RwLock<RegionStore>>,
     sa: &SubscribeApplied,
 ) -> Result<()> {
-    match bulk_load(region, schema, meta, sa) {
-        Ok(fresh) => {
-            let n_claim = fresh.claim.len();
-            let n_claim_local = fresh.claim_local.len();
-            let n_claim_member = fresh.claim_member.len();
-            let n_claim_tech_state = fresh.claim_tech_state.len();
-            let n_claim_tech_desc = fresh.claim_tech_desc.len();
-            let n_claim_tile_cost = fresh.claim_tile_cost.len();
-            let n_building = fresh.building.len();
-            let n_inventory = fresh.inventory.len();
-            let n_building_desc = fresh.building_desc.len();
-            let n_building_nickname = fresh.building_nickname.len();
-            let n_location_dim = fresh.location_dim.len();
-            let n_dimension_network = fresh.dimension_network.len();
-            let n_player_username = fresh.player_username.len();
-            let n_player_state = fresh.player_state.len();
-            let n_deployable = fresh.deployable.len();
-            let n_deployable_desc = fresh.deployable_desc.len();
-            let n_player_housing = fresh.player_housing.len();
-            let n_player_housing_desc = fresh.player_housing_desc.len();
-            let n_rent = fresh.rent.len();
-            let n_experience = fresh.experience.len();
-            let n_skill_desc = fresh.skill_desc.len();
-            let n_progressive_action = fresh.progressive_action.len();
-            let n_passive_craft = fresh.passive_craft.len();
-            let n_crafting_recipe_desc = fresh.crafting_recipe_desc.len();
-            let n_resource = fresh.resource.len();
-            let n_growth = fresh.growth.len();
-            {
-                let mut guard = store.write();
-                *guard = fresh;
-            }
-            tracing::info!(
-                target: "relay_cache::shard",
-                region,
-                n_claim,
-                n_claim_local,
-                n_claim_member,
-                n_claim_tech_state,
-                n_claim_tech_desc,
-                n_claim_tile_cost,
-                n_building,
-                n_inventory,
-                n_building_desc,
-                n_building_nickname,
-                n_location_dim,
-                n_dimension_network,
-                n_player_username,
-                n_player_state,
-                n_deployable,
-                n_deployable_desc,
-                n_player_housing,
-                n_player_housing_desc,
-                n_rent,
-                n_experience,
-                n_skill_desc,
-                n_progressive_action,
-                n_passive_craft,
-                n_crafting_recipe_desc,
-                n_resource,
-                n_growth,
-                "SubscribeApplied loaded"
-            );
-            Ok(())
-        }
-        Err(e) => bail!("bulk load failed: {e}"),
-    }
-}
-
-fn bulk_load(
-    region: u32,
-    schema: &MirroredSchema,
-    meta: &TableMeta,
-    sa: &SubscribeApplied,
-) -> Result<RegionStore> {
-    let mut fresh = RegionStore::empty(region);
-    // Resources before locations so hexite PK location rows can attach x/z.
+    // Non-location tables first so hexite PK location rows can attach x/z.
     for table in sa.rows.tables.iter() {
         let name: &str = table.table.as_ref();
         if name == LOCATION_TABLE {
             continue;
         }
         let rows: Vec<Bytes> = table.rows.into_iter().collect();
-        apply_rows(&mut fresh, schema, meta, name, &[], &rows)?;
+        apply_rows(store, schema, meta, name, &[], &rows)?;
     }
     for table in sa.rows.tables.iter() {
         let name: &str = table.table.as_ref();
@@ -564,10 +528,9 @@ fn bulk_load(
             continue;
         }
         let rows: Vec<Bytes> = table.rows.into_iter().collect();
-        apply_rows(&mut fresh, schema, meta, name, &[], &rows)?;
+        apply_rows(store, schema, meta, name, &[], &rows)?;
     }
-    fresh.ready = true;
-    Ok(fresh)
+    Ok(())
 }
 
 fn apply_transaction(
@@ -577,10 +540,15 @@ fn apply_transaction(
     tu: &TransactionUpdate,
 ) -> Result<()> {
     let mut guard = store.write();
-    if !guard.ready {
-        // Shouldn't happen in the stream phase, but stay defensive.
-        return Ok(());
-    }
+    apply_transaction_to(&mut guard, schema, meta, tu)
+}
+
+fn apply_transaction_to(
+    store: &mut RegionStore,
+    schema: &MirroredSchema,
+    meta: &TableMeta,
+    tu: &TransactionUpdate,
+) -> Result<()> {
     for set in tu.query_sets.iter() {
         for table in set.tables.iter() {
             let name: &str = table.table_name.as_ref();
@@ -600,7 +568,7 @@ fn apply_transaction(
             if deletes.is_empty() && inserts.is_empty() {
                 continue;
             }
-            apply_rows(&mut guard, schema, meta, name, &deletes, &inserts)?;
+            apply_rows(store, schema, meta, name, &deletes, &inserts)?;
         }
     }
     Ok(())
