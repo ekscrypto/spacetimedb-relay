@@ -212,21 +212,25 @@ pub async fn expect_subscribe_applied(
     }
 }
 
-/// Additive single-query `Subscribe` (v2). Each call must use a fresh
-/// `query_set_id` — reusing an id replaces that set; unique ids append,
-/// matching the relay's sequential SubscribeMulti strategy.
-pub async fn send_subscribe_one(
+/// Additive multi-query `Subscribe` (v2). Each call should use a fresh
+/// `query_set_id` — reusing an id replaces that set; a new id appends.
+pub async fn send_subscribe(
     conn: &mut Conn,
     request_id: u32,
     query_set_id: u32,
-    query: String,
+    queries: Vec<String>,
     region: u32,
     phase: &str,
 ) -> Result<()> {
+    let n_queries = queries.len();
     let msg = ClientMessage::Subscribe(Subscribe {
         request_id,
         query_set_id: QuerySetId::new(query_set_id),
-        query_strings: vec![query.clone().into_boxed_str()].into_boxed_slice(),
+        query_strings: queries
+            .into_iter()
+            .map(|s| s.into_boxed_str())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
     });
     let bytes = bsatn::to_vec(&msg).map_err(|e| anyhow!("encode Subscribe: {e}"))?;
     tracing::info!(
@@ -235,9 +239,9 @@ pub async fn send_subscribe_one(
         phase,
         request_id,
         query_set_id,
-        query = %query,
+        n_queries,
         subscribe_wire_bytes = bytes.len(),
-        "sending Subscribe (one query)"
+        "sending Subscribe"
     );
     conn.send(Message::Binary(bytes)).await?;
     Ok(())

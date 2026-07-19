@@ -255,90 +255,93 @@ async fn session(
     );
 
     let base_queries = base_subscribe_queries();
-    // Sequential additive Subscribe (v2): one query per unique query_set_id,
-    // wait for that Applied, merge rows — same strategy as the relay's
-    // SubscribeMulti chunk-size-1 path. Hexite location PK queries are
-    // appended after the resource filters have populated entity_ids.
+    // Local stdb handles a single multi-query SubscribeApplied fine (even
+    // ~40 MB busy regions finish in ~2s). Hexite location PKs need a second
+    // additive query_set after we know entity_ids from resource filters.
+    // (An earlier hang on the second Subscribe was a frontend bug: raw
+    // ClientMessage Subscribe with request_id=2 was misread as OneOffQuery
+    // and dropped — not a local-stdb capacity limit.)
     let load_started = Instant::now();
     let mut building = RegionStore::empty(region);
-    let mut next_id: u32 = 1;
-    let mut hexite_ids: Vec<u64> = Vec::new();
-    let n_base = base_queries.len();
 
-    for (idx, query) in base_queries.into_iter().enumerate() {
-        let id = next_id;
-        next_id = next_id.saturating_add(1);
-        let phase = format!("seq_{idx}_of_{n_base}");
-        tracing::info!(
-            target: "relay_cache::shard",
-            region,
-            idx,
-            n_queries = n_base,
-            query_set_id = id,
-            query = %query,
-            "subscribing to next query sequentially"
-        );
-        wire::send_subscribe_one(&mut conn, id, id, query, region, &phase).await?;
-        let (sa, wire_bytes) = wire::expect_subscribe_applied(
-            &mut conn,
-            region,
-            &phase,
-            debug_mode,
-            |tu| apply_transaction_to(&mut building, schema, meta, tu),
-        )
-        .await?;
-        let from_resource = sa
-            .rows
-            .tables
-            .iter()
-            .any(|t| t.table.as_ref() == RESOURCE_TABLE);
-        merge_subscribe_applied(&mut building, schema, meta, &sa)?;
-        if from_resource {
-            hexite_ids.extend(collect_hexite_entity_ids(schema, meta, &sa)?);
-        }
-        tracing::info!(
-            target: "relay_cache::shard",
-            region,
-            idx,
-            wire_bytes,
-            "sequential SubscribeApplied merged"
-        );
-    }
+    const BASE_PHASE: &str = "base_query_set";
+    tracing::info!(
+        target: "relay_cache::shard",
+        region,
+        n_queries = base_queries.len(),
+        query_set_id = 1,
+        "subscribing base query set"
+    );
+    wire::send_subscribe(
+        &mut conn,
+        1,
+        1,
+        base_queries,
+        region,
+        BASE_PHASE,
+    )
+    .await?;
+    let (sa_base, base_wire_bytes) = wire::expect_subscribe_applied(
+        &mut conn,
+        region,
+        BASE_PHASE,
+        debug_mode,
+        |tu| apply_transaction_to(&mut building, schema, meta, tu),
+    )
+    .await?;
+    let mut hexite_ids = collect_hexite_entity_ids(schema, meta, &sa_base)?;
+    merge_subscribe_applied(&mut building, schema, meta, &sa_base)?;
+    tracing::info!(
+        target: "relay_cache::shard",
+        region,
+        base_wire_bytes,
+        n_hexite = hexite_ids.len(),
+        "base query set Applied and merged"
+    );
 
     hexite_ids.sort_unstable();
     hexite_ids.dedup();
     let n_hexite = hexite_ids.len();
-    for (hi, entity_id) in hexite_ids.iter().enumerate() {
-        let id = next_id;
-        next_id = next_id.saturating_add(1);
-        let query = format!("SELECT * FROM {LOCATION_TABLE} WHERE entity_id = {entity_id}");
-        let phase = format!("hexite_loc_{hi}_of_{n_hexite}");
+    if n_hexite > 0 {
+        let loc_queries: Vec<String> = hexite_ids
+            .iter()
+            .map(|entity_id| {
+                format!("SELECT * FROM {LOCATION_TABLE} WHERE entity_id = {entity_id}")
+            })
+            .collect();
+        const HEXITE_PHASE: &str = "hexite_locations_query_set";
         tracing::info!(
             target: "relay_cache::shard",
             region,
-            hi,
             n_hexite,
-            entity_id,
-            query_set_id = id,
-            "subscribing to hexite location sequentially"
+            n_queries = loc_queries.len(),
+            query_set_id = 2,
+            "subscribing hexite location query set (additive)"
         );
-        wire::send_subscribe_one(&mut conn, id, id, query, region, &phase).await?;
-        let (sa, wire_bytes) = wire::expect_subscribe_applied(
+        wire::send_subscribe(
+            &mut conn,
+            2,
+            2,
+            loc_queries,
+            region,
+            HEXITE_PHASE,
+        )
+        .await?;
+        let (sa_loc, loc_wire_bytes) = wire::expect_subscribe_applied(
             &mut conn,
             region,
-            &phase,
+            HEXITE_PHASE,
             debug_mode,
             |tu| apply_transaction_to(&mut building, schema, meta, tu),
         )
         .await?;
-        merge_subscribe_applied(&mut building, schema, meta, &sa)?;
+        merge_subscribe_applied(&mut building, schema, meta, &sa_loc)?;
         tracing::info!(
             target: "relay_cache::shard",
             region,
-            hi,
-            entity_id,
-            wire_bytes,
-            "hexite location SubscribeApplied merged"
+            loc_wire_bytes,
+            n_hexite,
+            "hexite location query set Applied and merged"
         );
     }
 
@@ -359,7 +362,7 @@ async fn session(
         n_growth,
         bulk_load_ms = load_started.elapsed().as_millis() as u64,
         session_ms = connected_at.elapsed().as_millis() as u64,
-        "sequential subscribe complete; entering stream loop"
+        "subscribe complete; entering stream loop"
     );
 
     let mut ping = tokio::time::interval(PING_INTERVAL);

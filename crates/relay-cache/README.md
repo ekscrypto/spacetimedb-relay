@@ -30,11 +30,11 @@ On the relay host, defaults discover regions from
   include per-query sequential Subscribe, wire bytes + wait time on each
   Applied, and total bulk-load duration.
 
-Ingest uses **sequential additive** `Subscribe` (one SQL query per unique
-`query_set_id`, wait for Applied, merge, next) — the same strategy as the
-relay's `--subscribe-chunk-size 1` / `SubscribeMulti` path. Hexite
-`location_state` PK queries are further sequential steps after the
-resource filters.
+Ingest uses two additive v2 `Subscribe` query sets: (1) all base table
+queries in one set, (2) hexite `location_state` PK queries in a second
+set — so busy regions never re-dump the full snapshot. (A prior hang on
+the second Subscribe was a frontend ClientMessage framing bug, not a
+local SpacetimeDB limit.)
 
 ## Queries
 

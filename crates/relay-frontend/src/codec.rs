@@ -2,11 +2,15 @@
 
 //! Wire-framing helpers shared by the rewrite and listener paths.
 //!
-//! Every SpacetimeDB binary frame starts with a 1-byte compression tag
+//! **Server → client** frames start with a 1-byte compression tag
 //! (we always negotiate `?compression=None`, so tag=0 is what we
 //! produce and what we expect to see). Past that byte sits the BSATN
-//! body whose first byte is the message-tag of the corresponding
-//! `ServerMessage` / `ClientMessage` sum type.
+//! body whose first byte is the `ServerMessage` sum-type discriminant.
+//!
+//! **Client → server** frames are raw `ClientMessage` BSATN with *no*
+//! compression prefix — matching the official SpacetimeDB Rust SDK's
+//! `encode_message`. Do not run [`body`] / [`message_tag`] on inbound
+//! client frames; decode the full buffer as `ClientMessage` instead.
 
 use thiserror::Error;
 
