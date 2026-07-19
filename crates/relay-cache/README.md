@@ -26,6 +26,8 @@ On the relay host, defaults discover regions from
 
 ## Queries
 
+Loopback (on the relay host):
+
 ```sh
 # Claim by PK
 curl -s http://127.0.0.1:8089/claim/1234567890
@@ -45,6 +47,15 @@ curl -s http://127.0.0.1:8089/claim/1234567890/inventory
 
 # Health / readiness
 curl -s http://127.0.0.1:8089/healthz
+```
+
+Public (nginx on `relay.bitcraftsync.app` → loopback `:8089`; see
+[`tools/nginx-relay-cache.snippet`](../../tools/nginx-relay-cache.snippet)):
+
+```sh
+curl -s https://relay.bitcraftsync.app/healthz
+curl -s 'https://relay.bitcraftsync.app/claim?name=concordia'
+curl -s https://relay.bitcraftsync.app/claim/1234567890/inventory
 ```
 
 ## Memory policy
