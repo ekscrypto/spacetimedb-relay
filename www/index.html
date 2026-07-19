@@ -358,11 +358,14 @@
     </table>
   </div>
 
-  <!-- Section 4: Health + claim cache endpoints -->
+  <!-- Section 4: Health + claim/player cache endpoints -->
   <h2>HTTP endpoints</h2>
   <p class="section-note">
-    Read-only JSON. Fleet health refreshes every 30 seconds; the claim
-    cache is live in-memory state mirrored from each region.
+    Read-only JSON (protobuf available via
+    <code>Accept: application/x-protobuf</code> on the cache routes;
+    schemas at <a class="ep" href="/proto" target="_blank" rel="noopener">/proto</a>).
+    Fleet health refreshes every 30 seconds; the claim and player cache is
+    live in-memory state mirrored from each region.
   </p>
   <div class="panel">
     <table class="endpoints">
@@ -403,6 +406,27 @@
           </td>
           <td>
             <code>name</code> (substring, for <code>/claim</code>)
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a class="ep" href="/player?name=maple" target="_blank" rel="noopener">/player</a>
+          </td>
+          <td>
+            Player cache (<code>relay-cache</code>): username search,
+            personal inventories (pockets / bank / wagon / cache /
+            recovery / deployable &mdash; Toolbelt and Wallet omitted),
+            and first-house contents resolved server-side from the
+            player id (<code>status</code> is <code>ok</code> or
+            <code>noHouse</code>).
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/player?name=maple'</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;/inventory</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;/housing</div>
+          </td>
+          <td>
+            <code>name</code> (substring, for <code>/player</code>;
+            clients should send &ge;2 chars)
           </td>
         </tr>
       </tbody>
