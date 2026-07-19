@@ -2248,16 +2248,16 @@ async fn player_inventory(
 
 fn collect_housing_buildings(
     s: &RegionStore,
-    claim_entity_id: u64,
     entrance_dimension_id: u32,
 ) -> Vec<pb::BuildingInventory> {
+    // Player-housing interiors often have claim_entity_id = 0, so we
+    // enumerate by location dimension rather than claim.
     let mut buildings = Vec::new();
-    for &b_slot in s.building.by_claim(claim_entity_id) {
-        let bi = b_slot as usize;
-        let building_entity_id = s.building.entity_id[bi];
-        if s.location_dim.get_or_overworld(building_entity_id) != entrance_dimension_id {
+    for &building_entity_id in s.location_dim.entities_in(entrance_dimension_id) {
+        let Some(b_slot) = s.building.find(building_entity_id) else {
             continue;
-        }
+        };
+        let bi = b_slot as usize;
         let building_description_id = s.building.building_description_id[bi];
         if !s
             .building_desc
@@ -2303,62 +2303,85 @@ async fn player_housing(
             .into_response();
     };
 
+    // player_housing_state.entity_id == player PK. The table is global
+    // (mirrored into every region); region_index selects the shard that
+    // holds the house's interior buildings. rent_state is empty on the
+    // public subscription today, so we must not require it.
+    let mut housing: Option<(u8, u64, u64, i32)> = None;
     for shard in &fleet.shards {
         let s = shard.store.read();
         if !s.ready {
             continue;
         }
-        let Some(&rent_slot) = s.rent.by_player(pk).first() else {
-            continue;
-        };
-        let network_id = s.rent.dimension_network_id[rent_slot as usize];
-        let claim_entity_id = s.rent.claim_entity_id[rent_slot as usize];
-        let Some(net) = s.dimension_network.by_entity_id(network_id) else {
-            continue;
-        };
-        let entrance_dimension_id = net.entrance_dimension_id;
-        let claim_for_buildings = if claim_entity_id != 0 {
-            claim_entity_id
-        } else {
-            net.claim_entity_id
-        };
+        if let Some(h_slot) = s.player_housing.find(pk) {
+            let hi = h_slot as usize;
+            housing = Some((
+                s.player_housing.region_index[hi],
+                s.player_housing.entrance_building_entity_id[hi],
+                s.player_housing.network_entity_id[hi],
+                s.player_housing.rank[hi],
+            ));
+            break;
+        }
+    }
 
-        let (house_entity_id, house_name) =
-            if let Some(h_slot) = s.player_housing.by_network(network_id) {
-                let hi = h_slot as usize;
-                let rank = s.player_housing.rank[hi];
-                let name = s
-                    .player_housing_desc
-                    .name_for_rank(rank)
-                    .unwrap_or("Player Housing")
-                    .to_owned();
-                (s.player_housing.entity_id[hi], name)
-            } else {
-                (net.building_id, "Player Housing".to_owned())
-            };
+    let Some((region_index, entrance_building_id, network_id, rank)) = housing else {
+        return respond_player_housing(
+            &headers,
+            pb::PlayerHousing {
+                status: "noHouse".into(),
+                player: Some(player),
+                house: None,
+                buildings: Vec::new(),
+            },
+        );
+    };
 
-        let buildings = collect_housing_buildings(&s, claim_for_buildings, entrance_dimension_id);
+    let house_region = u32::from(region_index);
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready || s.region != house_region {
+            continue;
+        }
+        let entrance_dimension_id = s
+            .dimension_network
+            .by_entity_id(network_id)
+            .map(|n| n.entrance_dimension_id);
+        let house_name = s
+            .player_housing_desc
+            .name_for_rank(rank)
+            .unwrap_or("Player Housing")
+            .to_owned();
+        let buildings = match entrance_dimension_id {
+            Some(dim) if dim != 0 => collect_housing_buildings(&s, dim),
+            _ => Vec::new(),
+        };
         return respond_player_housing(
             &headers,
             pb::PlayerHousing {
                 status: "ok".into(),
                 player: Some(player),
                 house: Some(pb::HouseSummary {
-                    entity_id: house_entity_id,
+                    entity_id: entrance_building_id,
                     name: house_name,
-                    region: s.region,
+                    region: house_region,
                 }),
                 buildings,
             },
         );
     }
 
+    // Housing row exists but the region shard isn't ready yet.
     respond_player_housing(
         &headers,
         pb::PlayerHousing {
-            status: "noHouse".into(),
+            status: "ok".into(),
             player: Some(player),
-            house: None,
+            house: Some(pb::HouseSummary {
+                entity_id: entrance_building_id,
+                name: "Player Housing".into(),
+                region: house_region,
+            }),
             buildings: Vec::new(),
         },
     )
@@ -2369,7 +2392,7 @@ mod tests {
     use super::*;
     use crate::decode::{
         BuildingDescRow, BuildingRow, DimensionNetworkRow, LocationDimRow, PlayerUsernameRow,
-        RentRow, OVERWORLD_DIMENSION,
+        OVERWORLD_DIMENSION,
     };
     use crate::store::RegionStore;
     use prost::Message;
@@ -2702,53 +2725,49 @@ mod tests {
     }
 
     #[test]
-    fn housing_no_rent_is_no_house_path_data() {
+    fn housing_no_row_is_no_house_path_data() {
         let mut s = RegionStore::empty(14);
         s.ready = true;
         s.player_username.upsert(PlayerUsernameRow {
             entity_id: 7,
             username: "Tester".into(),
         });
-        assert!(s.rent.by_player(7).is_empty());
+        assert!(s.player_housing.find(7).is_none());
     }
 
     #[test]
-    fn housing_rent_join_finds_interior_buildings() {
+    fn housing_by_dimension_finds_interior_buildings() {
         use crate::decode::{InventoryRow, PlayerHousingDescRow, PlayerHousingRow};
         use crate::store::Pocket;
 
         let mut s = RegionStore::empty(14);
         s.ready = true;
-        s.rent.upsert(RentRow {
-            entity_id: 1,
-            dimension_network_id: 500,
-            claim_entity_id: 99,
-            white_list: Box::from([7u64]),
-            active: true,
-        });
-        s.dimension_network.upsert(DimensionNetworkRow {
-            entity_id: 500,
-            building_id: 200,
-            claim_entity_id: 99,
-            rent_entity_id: 1,
-            entrance_dimension_id: 415,
-            is_collapsed: false,
-        });
+        // entity_id == player PK (no rent join needed).
         s.player_housing.upsert(PlayerHousingRow {
-            entity_id: 900,
+            entity_id: 7,
             entrance_building_entity_id: 200,
             network_entity_id: 500,
             rank: 1,
             is_empty: false,
+            region_index: 14,
+        });
+        s.dimension_network.upsert(DimensionNetworkRow {
+            entity_id: 500,
+            building_id: 500, // housing networks often set building_id == entity_id
+            claim_entity_id: 0,
+            rent_entity_id: 0,
+            entrance_dimension_id: 415,
+            is_collapsed: false,
         });
         s.player_housing_desc.upsert(PlayerHousingDescRow {
             secondary_knowledge_id: 1,
             rank: 1,
             name: "Player Housing Catacombs".into(),
         });
+        // Interior storage: claim_entity_id = 0 (live BitCraft shape).
         s.building.upsert(BuildingRow {
             entity_id: 300,
-            claim_entity_id: 99,
+            claim_entity_id: 0,
             building_description_id: 30,
         });
         s.building_desc.upsert(BuildingDescRow {
@@ -2778,7 +2797,13 @@ mod tests {
             player_owner_entity_id: 0,
         });
 
-        let buildings = collect_housing_buildings(&s, 99, 415);
+        let h = s.player_housing.find(7).unwrap();
+        assert_eq!(s.player_housing.region_index[h as usize], 14);
+        let net = s
+            .dimension_network
+            .by_entity_id(s.player_housing.network_entity_id[h as usize])
+            .unwrap();
+        let buildings = collect_housing_buildings(&s, net.entrance_dimension_id);
         assert_eq!(buildings.len(), 1);
         assert_eq!(buildings[0].entity_id, 300);
         assert_eq!(buildings[0].items[0].item_type, "Cargo");

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 
 //! Stores for `player_housing_state` and `player_housing_desc`.
+//!
+//! `player_housing_state.entity_id` is the **player** entity id (PK). The
+//! table is global (every region mirror carries the full set); use
+//! `region_index` to pick the regional shard that holds the house's
+//! buildings and inventories.
 
 use hashbrown::HashMap;
 
@@ -12,6 +17,7 @@ pub struct PlayerHousingSoA {
     pub network_entity_id: Vec<u64>,
     pub rank: Vec<i32>,
     pub is_empty: Vec<bool>,
+    pub region_index: Vec<u8>,
     free_slots: Vec<u32>,
     pk: HashMap<u64, u32>,
     by_network: HashMap<u64, u32>,
@@ -25,9 +31,10 @@ impl PlayerHousingSoA {
             network_entity_id: Vec::with_capacity(cap),
             rank: Vec::with_capacity(cap),
             is_empty: Vec::with_capacity(cap),
+            region_index: Vec::with_capacity(cap),
             free_slots: Vec::new(),
             pk: HashMap::with_capacity(cap),
-            by_network: HashMap::with_capacity(cap),
+            by_network: HashMap::new(),
         }
     }
 
@@ -35,11 +42,13 @@ impl PlayerHousingSoA {
         self.pk.len()
     }
 
-    #[allow(dead_code)] // PK lookup for future queries / debugging
-    pub fn find(&self, entity_id: u64) -> Option<u32> {
-        self.pk.get(&entity_id).copied()
+    /// Slot for the player's housing row (`entity_id` == player PK).
+    pub fn find(&self, player_entity_id: u64) -> Option<u32> {
+        self.pk.get(&player_entity_id).copied()
     }
 
+    /// Slot for a housing row keyed by its dimension network (debug / future).
+    #[allow(dead_code)]
     pub fn by_network(&self, network_entity_id: u64) -> Option<u32> {
         self.by_network.get(&network_entity_id).copied()
     }
@@ -87,6 +96,7 @@ impl PlayerHousingSoA {
             self.network_entity_id.push(0);
             self.rank.push(0);
             self.is_empty.push(false);
+            self.region_index.push(0);
             slot
         }
     }
@@ -98,6 +108,7 @@ impl PlayerHousingSoA {
         self.network_entity_id[i] = row.network_entity_id;
         self.rank[i] = row.rank;
         self.is_empty[i] = row.is_empty;
+        self.region_index[i] = row.region_index;
     }
 }
 
@@ -143,7 +154,10 @@ mod tests {
             network_entity_id: 77,
             rank: 1,
             is_empty: false,
+            region_index: 14,
         });
+        let slot = s.find(100).unwrap();
+        assert_eq!(s.region_index[slot as usize], 14);
         let slot = s.by_network(77).unwrap();
         assert_eq!(s.entity_id[slot as usize], 100);
 

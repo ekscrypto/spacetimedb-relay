@@ -284,6 +284,7 @@ pub struct PlayerHousingCols {
     pub network_entity_id: usize,
     pub rank: usize,
     pub is_empty: usize,
+    pub region_index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -660,6 +661,9 @@ fn resolve_player_housing_cols(schema: &MirroredSchema) -> Result<PlayerHousingC
         network_entity_id: find_field(f, "network_entity_id", PLAYER_HOUSING_TABLE)?,
         rank: find_field(f, "rank", PLAYER_HOUSING_TABLE)?,
         is_empty: find_field(f, "is_empty", PLAYER_HOUSING_TABLE)?,
+        // Global table replicated into every region DB; selects the
+        // region shard that owns the house's buildings / inventories.
+        region_index: find_field(f, "region_index", PLAYER_HOUSING_TABLE)?,
     })
 }
 
@@ -819,11 +823,13 @@ pub struct DeployableDescRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerHousingRow {
+    /// Player entity id (PK) — not a separate housing entity.
     pub entity_id: u64,
     pub entrance_building_entity_id: u64,
     pub network_entity_id: u64,
     pub rank: i32,
     pub is_empty: bool,
+    pub region_index: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1323,6 +1329,7 @@ pub fn decode_player_housing_with_fields(
         )?,
         rank: cell_i32(&cells[cols.rank], "player_housing.rank")?,
         is_empty: cell_bool(&cells[cols.is_empty], "player_housing.is_empty")?,
+        region_index: cell_u8(&cells[cols.region_index], "player_housing.region_index")?,
     })
 }
 
@@ -1881,6 +1888,16 @@ fn cell_string(cell: &Cell, ctx: &str) -> Result<String> {
     match cell {
         Cell::Text(Some(s)) => Ok(s.clone()),
         _ => bail!("{ctx}: expected Text, got {cell:?}"),
+    }
+}
+
+/// U8 is mapped to `Cell::Smallint` by relay-protocol.
+fn cell_u8(cell: &Cell, ctx: &str) -> Result<u8> {
+    match cell {
+        Cell::Smallint(Some(n)) => u8::try_from(*n)
+            .map_err(|_| anyhow!("{ctx}: Smallint {n} out of u8 range")),
+        Cell::Smallint(None) => bail!("{ctx}: Smallint is NULL"),
+        other => bail!("{ctx}: expected Smallint, got {other:?}"),
     }
 }
 

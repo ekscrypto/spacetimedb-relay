@@ -87,7 +87,9 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/inventory
 #        "items": [ { "item_id", "item_type", "quantity" } ] }, ...
 #    ] }
 
-# First house for the player (resolved server-side from rent whitelist).
+# First house for the player (resolved from `player_housing_state`, whose
+# `entity_id` is the player PK — not via rent_state, which is empty on the
+# public subscription). Interior storages are found by dimension.
 curl -s http://127.0.0.1:8089/player/1297036692699996362/housing
 # → { "status": "ok"|"noHouse", "player": {...},
 #     "house": { "entity_id", "name", "region" } | null,
