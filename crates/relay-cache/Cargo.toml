@@ -34,6 +34,7 @@ clap = { workspace = true }
 parking_lot = { workspace = true }
 sysinfo = { workspace = true }
 hashbrown = { workspace = true }
+hex = { workspace = true }
 reqwest = { workspace = true }
 
 spacetimedb-sats = { workspace = true }

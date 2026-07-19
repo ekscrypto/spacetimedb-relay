@@ -17,7 +17,9 @@ use url::Url;
 
 use crate::decode::{
     self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_TABLE,
-    DIMENSION_NETWORK_TABLE, INVENTORY_TABLE, LOCATION_TABLE,
+    DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE, INVENTORY_TABLE,
+    LOCATION_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_USERNAME_TABLE,
+    RENT_TABLE,
 };
 use crate::store::RegionStore;
 use crate::wire;
@@ -44,6 +46,12 @@ struct TableMeta {
     building_nickname_fields: Vec<MirroredField>,
     location_fields: Vec<MirroredField>,
     dimension_network_fields: Vec<MirroredField>,
+    player_username_fields: Vec<MirroredField>,
+    deployable_fields: Vec<MirroredField>,
+    deployable_desc_fields: Vec<MirroredField>,
+    player_housing_fields: Vec<MirroredField>,
+    player_housing_desc_fields: Vec<MirroredField>,
+    rent_fields: Vec<MirroredField>,
 }
 
 impl TableMeta {
@@ -58,6 +66,12 @@ impl TableMeta {
             building_nickname_fields: fields_owned(schema, BUILDING_NICKNAME_TABLE)?,
             location_fields: fields_owned(schema, LOCATION_TABLE)?,
             dimension_network_fields: fields_owned(schema, DIMENSION_NETWORK_TABLE)?,
+            player_username_fields: fields_owned(schema, PLAYER_USERNAME_TABLE)?,
+            deployable_fields: fields_owned(schema, DEPLOYABLE_TABLE)?,
+            deployable_desc_fields: fields_owned(schema, DEPLOYABLE_DESC_TABLE)?,
+            player_housing_fields: fields_owned(schema, PLAYER_HOUSING_TABLE)?,
+            player_housing_desc_fields: fields_owned(schema, PLAYER_HOUSING_DESC_TABLE)?,
+            rent_fields: fields_owned(schema, RENT_TABLE)?,
         })
     }
 }
@@ -195,6 +209,12 @@ async fn session(
         // because overworld buildings default to dimension 1 when absent.
         format!("SELECT * FROM {LOCATION_TABLE} WHERE dimension != 1"),
         format!("SELECT * FROM {DIMENSION_NETWORK_TABLE}"),
+        format!("SELECT * FROM {PLAYER_USERNAME_TABLE}"),
+        format!("SELECT * FROM {DEPLOYABLE_TABLE}"),
+        format!("SELECT * FROM {DEPLOYABLE_DESC_TABLE}"),
+        format!("SELECT * FROM {PLAYER_HOUSING_TABLE}"),
+        format!("SELECT * FROM {PLAYER_HOUSING_DESC_TABLE}"),
+        format!("SELECT * FROM {RENT_TABLE}"),
     ];
     wire::send_subscribe(&mut conn, 1, 1, queries).await?;
 
@@ -208,6 +228,12 @@ async fn session(
             let n_building_nickname = fresh.building_nickname.len();
             let n_location_dim = fresh.location_dim.len();
             let n_dimension_network = fresh.dimension_network.len();
+            let n_player_username = fresh.player_username.len();
+            let n_deployable = fresh.deployable.len();
+            let n_deployable_desc = fresh.deployable_desc.len();
+            let n_player_housing = fresh.player_housing.len();
+            let n_player_housing_desc = fresh.player_housing_desc.len();
+            let n_rent = fresh.rent.len();
             {
                 let mut guard = store.write();
                 *guard = fresh;
@@ -222,6 +248,12 @@ async fn session(
                 n_building_nickname,
                 n_location_dim,
                 n_dimension_network,
+                n_player_username,
+                n_deployable,
+                n_deployable_desc,
+                n_player_housing,
+                n_player_housing_desc,
+                n_rent,
                 "SubscribeApplied loaded"
             );
         }
@@ -483,9 +515,7 @@ fn apply_rows(
                     meta.cols.dimension_network,
                     schema,
                 )?;
-                store
-                    .dimension_network
-                    .delete(decoded.entrance_dimension_id);
+                store.dimension_network.delete_by_entity(decoded.entity_id);
             }
             for row in inserts {
                 let decoded = decode::decode_dimension_network_with_fields(
@@ -495,6 +525,126 @@ fn apply_rows(
                     schema,
                 )?;
                 store.dimension_network.upsert(decoded);
+            }
+        }
+        PLAYER_USERNAME_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_player_username_with_fields(
+                    row,
+                    &meta.player_username_fields,
+                    meta.cols.player_username,
+                    schema,
+                )?;
+                store.player_username.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_player_username_with_fields(
+                    row,
+                    &meta.player_username_fields,
+                    meta.cols.player_username,
+                    schema,
+                )?;
+                store.player_username.upsert(decoded);
+            }
+        }
+        DEPLOYABLE_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_deployable_with_fields(
+                    row,
+                    &meta.deployable_fields,
+                    meta.cols.deployable,
+                    schema,
+                )?;
+                store.deployable.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_deployable_with_fields(
+                    row,
+                    &meta.deployable_fields,
+                    meta.cols.deployable,
+                    schema,
+                )?;
+                store.deployable.upsert(decoded);
+            }
+        }
+        DEPLOYABLE_DESC_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_deployable_desc_with_fields(
+                    row,
+                    &meta.deployable_desc_fields,
+                    meta.cols.deployable_desc,
+                    schema,
+                )?;
+                store.deployable_desc.delete(decoded.id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_deployable_desc_with_fields(
+                    row,
+                    &meta.deployable_desc_fields,
+                    meta.cols.deployable_desc,
+                    schema,
+                )?;
+                store.deployable_desc.upsert(decoded);
+            }
+        }
+        PLAYER_HOUSING_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_player_housing_with_fields(
+                    row,
+                    &meta.player_housing_fields,
+                    meta.cols.player_housing,
+                    schema,
+                )?;
+                store.player_housing.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_player_housing_with_fields(
+                    row,
+                    &meta.player_housing_fields,
+                    meta.cols.player_housing,
+                    schema,
+                )?;
+                store.player_housing.upsert(decoded);
+            }
+        }
+        PLAYER_HOUSING_DESC_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_player_housing_desc_with_fields(
+                    row,
+                    &meta.player_housing_desc_fields,
+                    meta.cols.player_housing_desc,
+                    schema,
+                )?;
+                store.player_housing_desc.delete_rank(decoded.rank);
+            }
+            for row in inserts {
+                let decoded = decode::decode_player_housing_desc_with_fields(
+                    row,
+                    &meta.player_housing_desc_fields,
+                    meta.cols.player_housing_desc,
+                    schema,
+                )?;
+                store.player_housing_desc.upsert(decoded);
+            }
+        }
+        RENT_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_rent_with_fields(
+                    row,
+                    &meta.rent_fields,
+                    meta.cols.rent,
+                    schema,
+                )?;
+                store.rent.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_rent_with_fields(
+                    row,
+                    &meta.rent_fields,
+                    meta.cols.rent,
+                    schema,
+                )?;
+                store.rent.upsert(decoded);
             }
         }
         other => {

@@ -55,3 +55,44 @@ message ClaimInventory {
   ClaimSummary claim = 1;
   repeated DimensionGroup dimensions = 2;
 }
+
+// Mirrors GET /player/:entity_id and name-search hits.
+message Player {
+  uint64 entity_id = 1;
+  string username = 2;
+  uint32 region = 3;
+}
+
+message PlayerList {
+  repeated Player players = 1;
+}
+
+message PlayerInventoryBag {
+  uint64 entity_id = 1;
+  string name = 2;
+  optional string nickname = 3;
+  // "pockets" | "bank" | "wagon" | "cache" | "recovery" | "deployable"
+  string category = 4;
+  optional uint64 claim_entity_id = 5;
+  optional string claim_name = 6;
+  repeated InventoryItem items = 7;
+}
+
+message PlayerInventory {
+  Player player = 1;
+  repeated PlayerInventoryBag inventories = 2;
+}
+
+message HouseSummary {
+  uint64 entity_id = 1;
+  string name = 2;
+  uint32 region = 3;
+}
+
+message PlayerHousing {
+  // "ok" | "noHouse"
+  string status = 1;
+  Player player = 2;
+  optional HouseSummary house = 3;
+  repeated BuildingInventory buildings = 4;
+}

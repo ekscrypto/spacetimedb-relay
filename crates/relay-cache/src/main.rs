@@ -4,12 +4,13 @@
 //!
 //! Holds one long-lived v2 subscription per region frontend on loopback,
 //! decodes BSATN rows into columnar in-memory storage (no JSON hop on the
-//! read path), and serves three queries over HTTP on loopback (JSON
-//! default; protobuf via `Accept: application/x-protobuf`):
-//!   1. claim by PK
-//!   2. claim by full/partial name (case-insensitive substring)
-//!   3. all inventories of a claim PK, grouped by building, items aggregated
-//!      per building across the building's inventories and pockets.
+//! read path), and serves HTTP queries on loopback (JSON default;
+//! protobuf via `Accept: application/x-protobuf`):
+//!   1. claim by PK / name substring
+//!   2. claim inventory rollup by building + dimension
+//!   3. player by PK / name substring
+//!   4. player personal inventories (categorized bags)
+//!   5. player housing (first house + interior buildings)
 
 mod config;
 mod decode;

@@ -9,17 +9,25 @@ pub mod building;
 pub mod building_desc;
 pub mod building_nickname;
 pub mod claim;
+pub mod deployable;
 pub mod dimension_network;
 pub mod inventory;
 pub mod location_dim;
+pub mod player_housing;
+pub mod player_username;
+pub mod rent;
 
 pub use building::BuildingSoA;
 pub use building_desc::BuildingDescStore;
 pub use building_nickname::BuildingNicknameStore;
 pub use claim::ClaimSoA;
+pub use deployable::{DeployableDescStore, DeployableSoA};
 pub use dimension_network::DimensionNetworkStore;
 pub use inventory::{InventorySoA, Pocket};
 pub use location_dim::LocationDimStore;
+pub use player_housing::{PlayerHousingDescStore, PlayerHousingSoA};
+pub use player_username::PlayerUsernameSoA;
+pub use rent::RentSoA;
 
 /// One region's worth of in-memory state. The `ready` flag is `false`
 /// during initial `SubscribeApplied` load and after a disconnect; the
@@ -35,6 +43,12 @@ pub struct RegionStore {
     pub building_nickname: BuildingNicknameStore,
     pub location_dim: LocationDimStore,
     pub dimension_network: DimensionNetworkStore,
+    pub player_username: PlayerUsernameSoA,
+    pub deployable: DeployableSoA,
+    pub deployable_desc: DeployableDescStore,
+    pub player_housing: PlayerHousingSoA,
+    pub player_housing_desc: PlayerHousingDescStore,
+    pub rent: RentSoA,
 }
 
 impl RegionStore {
@@ -49,6 +63,12 @@ impl RegionStore {
             building_nickname: BuildingNicknameStore::new(),
             location_dim: LocationDimStore::new(),
             dimension_network: DimensionNetworkStore::new(),
+            player_username: PlayerUsernameSoA::with_capacity(0),
+            deployable: DeployableSoA::with_capacity(0),
+            deployable_desc: DeployableDescStore::new(),
+            player_housing: PlayerHousingSoA::with_capacity(0),
+            player_housing_desc: PlayerHousingDescStore::new(),
+            rent: RentSoA::with_capacity(0),
         }
     }
 }

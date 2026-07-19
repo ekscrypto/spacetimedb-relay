@@ -125,7 +125,7 @@ impl ClaimSoA {
 
 /// `haystack.contains(needle)` ignoring ASCII case. The needle is already
 /// ASCII-lowercased by the caller to avoid a per-row allocation.
-fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+pub(crate) fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
     let h = haystack.as_bytes();
     let n = needle_lower.as_bytes();
     if n.is_empty() {

@@ -1,10 +1,10 @@
 # relay-cache
 
 Same-host in-memory read cache over the relay fleet. Subscribes to each
-regional frontend on loopback (`ws://127.0.0.1:<port>`, v2), holds
-`claim_state` / `building_state` / `inventory_state` in columnar memory,
-and serves three HTTP queries on `127.0.0.1:8089` (JSON by default;
-protobuf via `Accept: application/x-protobuf`).
+regional frontend on loopback (`ws://127.0.0.1:<port>`, v2), holds claim /
+building / inventory / player tables in columnar memory, and serves HTTP
+queries on `127.0.0.1:8089` (JSON by default; protobuf via
+`Accept: application/x-protobuf`).
 
 Replaces the cross-host polling model of `bitcraft-relay-sync` for
 hot-path reads — no 5-minute snapshot staleness, no Postgres round-trip.
@@ -46,6 +46,27 @@ curl -s http://127.0.0.1:8089/claim/1234567890/inventory
 #        "entrance": { "entity_id", "name", "nickname" }, "buildings": [...] }
 #    ] }
 
+# Player by name substring (case-insensitive; clients should send ≥2 chars)
+curl -s 'http://127.0.0.1:8089/player?name=maple'
+# → [ { "entity_id", "username", "region" }, ... ]
+
+curl -s http://127.0.0.1:8089/player/1297036692699996362
+
+# Personal inventories (pockets / bank / wagon / cache / recovery /
+# deployable). Toolbelt & Wallet omitted. Items aggregated per bag.
+curl -s http://127.0.0.1:8089/player/1297036692699996362/inventory
+# → { "player": {...}, "inventories": [
+#      { "entity_id", "name", "nickname", "category",
+#        "claim_entity_id", "claim_name",
+#        "items": [ { "item_id", "item_type", "quantity" } ] }, ...
+#    ] }
+
+# First house for the player (resolved server-side from rent whitelist).
+curl -s http://127.0.0.1:8089/player/1297036692699996362/housing
+# → { "status": "ok"|"noHouse", "player": {...},
+#     "house": { "entity_id", "name", "region" } | null,
+#     "buildings": [ { "entity_id", "name", "nickname", "items": [...] } ] }
+
 # Health / readiness (always JSON)
 curl -s http://127.0.0.1:8089/healthz
 
@@ -54,14 +75,20 @@ curl -s http://127.0.0.1:8089/proto
 curl -sO http://127.0.0.1:8089/proto/relay_cache.proto
 
 # Same data routes as protobuf (`Accept: application/x-protobuf`).
-# Name-search wraps the array in ClaimList; entity IDs are uint64
-# (JSON keeps them as strings for JS safety).
+# Name-search wraps the array in ClaimList / PlayerList; entity IDs are
+# uint64 (JSON keeps them as strings for JS safety).
 curl -sH 'Accept: application/x-protobuf' \
   http://127.0.0.1:8089/claim/1234567890 -o claim.pb
 curl -sH 'Accept: application/x-protobuf' \
   'http://127.0.0.1:8089/claim?name=concordia' -o claims.pb
 curl -sH 'Accept: application/x-protobuf' \
   http://127.0.0.1:8089/claim/1234567890/inventory -o inventory.pb
+curl -sH 'Accept: application/x-protobuf' \
+  'http://127.0.0.1:8089/player?name=maple' -o players.pb
+curl -sH 'Accept: application/x-protobuf' \
+  http://127.0.0.1:8089/player/1297036692699996362/inventory -o player-inv.pb
+curl -sH 'Accept: application/x-protobuf' \
+  http://127.0.0.1:8089/player/1297036692699996362/housing -o player-housing.pb
 ```
 
 Public (nginx on `relay.bitcraftsync.app` → loopback `:8089`; see
@@ -73,6 +100,9 @@ curl -s https://relay.bitcraftsync.app/proto
 curl -sO https://relay.bitcraftsync.app/proto/relay_cache.proto
 curl -s 'https://relay.bitcraftsync.app/claim?name=concordia'
 curl -s https://relay.bitcraftsync.app/claim/1234567890/inventory
+curl -s 'https://relay.bitcraftsync.app/player?name=maple'
+curl -s https://relay.bitcraftsync.app/player/1297036692699996362/inventory
+curl -s https://relay.bitcraftsync.app/player/1297036692699996362/housing
 curl -sH 'Accept: application/x-protobuf' \
   https://relay.bitcraftsync.app/claim/1234567890/inventory -o inventory.pb
 ```
@@ -81,4 +111,5 @@ curl -sH 'Accept: application/x-protobuf' \
 
 The ceiling is an alarm, not a load shedder. Approaching it logs a warning
 and flips `/healthz` `ready=false`, but queries keep serving with whatever
-data is loaded. Projected resident is ~1 GiB across 13 regions.
+data is loaded. Projected resident grows with player/deployable/rent
+tables on top of the prior claim/inventory set.

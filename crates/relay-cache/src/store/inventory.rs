@@ -52,6 +52,7 @@ pub struct InventorySoA {
     free_slots: Vec<u32>,
     pk: HashMap<u64, u32>,
     by_owner: HashMap<u64, Vec<u32>>,
+    by_player_owner: HashMap<u64, Vec<u32>>,
 }
 
 impl InventorySoA {
@@ -66,6 +67,7 @@ impl InventorySoA {
             free_slots: Vec::new(),
             pk: HashMap::with_capacity(cap),
             by_owner: HashMap::with_capacity(cap),
+            by_player_owner: HashMap::with_capacity(cap),
         }
     }
 
@@ -84,26 +86,45 @@ impl InventorySoA {
         self.by_owner.get(&owner).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Insert or replace a row. On replace, the `by_owner` index is
-    /// updated iff `owner_entity_id` changed. Takes ownership so the
-    /// pockets `Box<[Pocket]>` moves in without cloning.
+    /// Inventories whose `player_owner_entity_id == player` (banks, caches,
+    /// deployables). Body bags use `owner_entity_id == player` instead.
+    pub fn by_player_owner(&self, player: u64) -> &[u32] {
+        self.by_player_owner
+            .get(&player)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Insert or replace a row. On replace, the `by_owner` /
+    /// `by_player_owner` indexes are updated iff those keys changed.
+    /// Takes ownership so the pockets `Box<[Pocket]>` moves in without
+    /// cloning.
     pub fn upsert(&mut self, row: InventoryRow) {
         if let Some(&slot) = self.pk.get(&row.entity_id) {
             let i = slot as usize;
             let old_owner = self.owner_entity_id[i];
+            let old_player = self.player_owner_entity_id[i];
             let new_owner = row.owner_entity_id;
+            let new_player = row.player_owner_entity_id;
             self.write_at(slot, row);
             if old_owner != new_owner {
                 self.reindex_by_owner(slot, old_owner, new_owner);
+            }
+            if old_player != new_player {
+                self.reindex_by_player_owner(slot, old_player, new_player);
             }
             return;
         }
         let entity_id = row.entity_id;
         let owner = row.owner_entity_id;
+        let player = row.player_owner_entity_id;
         let slot = self.alloc_slot();
         self.write_at(slot, row);
         self.pk.insert(entity_id, slot);
         self.by_owner.entry(owner).or_default().push(slot);
+        if player != 0 {
+            self.by_player_owner.entry(player).or_default().push(slot);
+        }
     }
 
     pub fn delete(&mut self, entity_id: u64) {
@@ -112,10 +133,19 @@ impl InventorySoA {
         };
         let i = slot as usize;
         let owner = self.owner_entity_id[i];
+        let player = self.player_owner_entity_id[i];
         if let Some(vec) = self.by_owner.get_mut(&owner) {
             remove_one(vec, slot);
             if vec.is_empty() {
                 self.by_owner.remove(&owner);
+            }
+        }
+        if player != 0 {
+            if let Some(vec) = self.by_player_owner.get_mut(&player) {
+                remove_one(vec, slot);
+                if vec.is_empty() {
+                    self.by_player_owner.remove(&player);
+                }
             }
         }
         self.entity_id[i] = 0;
@@ -156,6 +186,23 @@ impl InventorySoA {
             }
         }
         self.by_owner.entry(new_owner).or_default().push(slot);
+    }
+
+    fn reindex_by_player_owner(&mut self, slot: u32, old_player: u64, new_player: u64) {
+        if old_player != 0 {
+            if let Some(vec) = self.by_player_owner.get_mut(&old_player) {
+                remove_one(vec, slot);
+                if vec.is_empty() {
+                    self.by_player_owner.remove(&old_player);
+                }
+            }
+        }
+        if new_player != 0 {
+            self.by_player_owner
+                .entry(new_player)
+                .or_default()
+                .push(slot);
+        }
     }
 }
 
@@ -272,6 +319,20 @@ mod tests {
         s.upsert(row(100, 1000, &[pocket(1, 10, Pocket::ITEM)]));
         s.delete(999);
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn by_player_owner_tracks_player_key() {
+        let mut s = InventorySoA::with_capacity(4);
+        let mut a = row(100, 1000, &[pocket(1, 10, Pocket::ITEM)]);
+        a.player_owner_entity_id = 7;
+        s.upsert(a);
+        assert_eq!(s.by_player_owner(7).len(), 1);
+        let mut b = row(100, 1000, &[pocket(1, 10, Pocket::ITEM)]);
+        b.player_owner_entity_id = 8;
+        s.upsert(b);
+        assert!(s.by_player_owner(7).is_empty());
+        assert_eq!(s.by_player_owner(8).len(), 1);
     }
 
     #[test]
