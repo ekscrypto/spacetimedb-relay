@@ -61,4 +61,11 @@ pub struct Args {
         default_value_t = 4 * 1024 * 1024 * 1024
     )]
     pub mem_ceiling_bytes: u64,
+
+    /// Extra ingest diagnostics: 5s heartbeats while waiting on
+    /// `SubscribeApplied` (phase + elapsed), ping during that wait, and
+    /// `relay_cache=debug` default filter when `RUST_LOG` is unset. Use when
+    /// a region hangs mid bulk-load and info-only bookends aren't enough.
+    #[arg(long, env = "RELAY_CACHE_DEBUG", default_value_t = false)]
+    pub debug: bool,
 }

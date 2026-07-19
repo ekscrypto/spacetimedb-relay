@@ -473,6 +473,8 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
                 "progressive_action": s.progressive_action.len(),
                 "passive_craft": s.passive_craft.len(),
                 "crafting_recipe_desc": s.crafting_recipe_desc.len(),
+                "resource": s.resource.len(),
+                "growth": s.growth.len(),
             }
         }));
     }

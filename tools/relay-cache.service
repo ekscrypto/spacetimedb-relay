@@ -21,6 +21,8 @@ ExecStart=/srv/relay/spacetimedb-relay/target/release/relay-cache \
     --unit-dir /etc/systemd/system \
     --schema-host 127.0.0.1:3014 \
     --schema-db relay-mirror-bc14
+# Diagnosing a hung SubscribeApplied: append --debug to ExecStart (or set
+# RELAY_CACHE_DEBUG=1). Heartbeats every 5s while waiting on bulk load.
 WorkingDirectory=/srv/relay/spacetimedb-relay
 Environment="PATH=/srv/relay/.local/bin:/srv/relay/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="RUST_LOG=relay_cache=info"

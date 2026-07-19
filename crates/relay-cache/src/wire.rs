@@ -7,7 +7,7 @@
 //! reducers (architecture invariant #0). Speaks the same wire protocol as
 //! `relay-upstream` and the relay frontend.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -26,8 +26,18 @@ use spacetimedb_sats::bsatn;
 
 const SUBPROTOCOL: &str = "v2.bsatn.spacetimedb";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often `--debug` logs "still waiting" while a SubscribeApplied
+/// (often a multi-hundred-MB fragmented Binary) is still assembling.
+const WAIT_HEARTBEAT: Duration = Duration::from_secs(5);
 
 pub type Conn = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Outcome of a completed server Binary frame.
+pub struct RecvFrame {
+    pub message: ServerMessage,
+    /// Full WS Binary payload length (compression byte + BSATN body).
+    pub wire_bytes: usize,
+}
 
 pub async fn open_connection(host: &Url, database: &str) -> Result<Conn> {
     let mut url = host.clone();
@@ -72,7 +82,7 @@ pub async fn open_connection(host: &Url, database: &str) -> Result<Conn> {
     Ok(stream)
 }
 
-pub async fn recv_server_message(conn: &mut Conn) -> Result<ServerMessage> {
+pub async fn recv_server_message(conn: &mut Conn) -> Result<RecvFrame> {
     loop {
         let Some(msg) = conn.next().await else {
             bail!("upstream closed before sending a server message");
@@ -83,14 +93,26 @@ pub async fn recv_server_message(conn: &mut Conn) -> Result<ServerMessage> {
                 if data.is_empty() {
                     bail!("empty binary frame");
                 }
+                let wire_bytes = data.len();
                 let compression = data[0];
                 if compression != 0 {
                     bail!("compression {compression} not supported");
                 }
                 let body = &data[1..];
+                let decode_started = Instant::now();
                 let server_msg: ServerMessage = bsatn::from_slice(body)
                     .map_err(|e| anyhow!("ServerMessage decode failed: {e}"))?;
-                return Ok(server_msg);
+                tracing::debug!(
+                    target: "relay_cache::wire",
+                    wire_bytes,
+                    body_bytes = body.len(),
+                    decode_ms = decode_started.elapsed().as_millis() as u64,
+                    "decoded ServerMessage"
+                );
+                return Ok(RecvFrame {
+                    message: server_msg,
+                    wire_bytes,
+                });
             }
             Message::Ping(_) | Message::Pong(_) => continue,
             Message::Close(frame) => {
@@ -105,25 +127,81 @@ pub async fn recv_server_message(conn: &mut Conn) -> Result<ServerMessage> {
 }
 
 pub async fn expect_initial_connection(conn: &mut Conn) -> Result<InitialConnection> {
-    match recv_server_message(conn).await? {
+    match recv_server_message(conn).await?.message {
         ServerMessage::InitialConnection(ic) => Ok(ic),
         other => bail!("expected InitialConnection, got {other:?}"),
     }
 }
 
-pub async fn expect_subscribe_applied(conn: &mut Conn) -> Result<SubscribeApplied> {
+/// Block until `SubscribeApplied`. When `debug`, emit a 5s heartbeat (and a
+/// WS Ping) so operators can tell a hung assemble apart from a dead socket.
+/// Always logs wire size + wait time when the applied message finally lands.
+pub async fn expect_subscribe_applied(
+    conn: &mut Conn,
+    region: u32,
+    phase: &str,
+    debug_mode: bool,
+) -> Result<(SubscribeApplied, usize)> {
+    let started = Instant::now();
+    let mut heartbeat = tokio::time::interval(WAIT_HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick so we don't log before any wait.
+    heartbeat.tick().await;
+
     loop {
-        match recv_server_message(conn).await? {
-            ServerMessage::SubscribeApplied(sa) => return Ok(sa),
-            ServerMessage::SubscriptionError(err) => {
-                bail!("subscription error: {}", err.error);
+        tokio::select! {
+            frame = recv_server_message(conn) => {
+                let frame = frame?;
+                match frame.message {
+                    ServerMessage::SubscribeApplied(sa) => {
+                        let n_tables = sa.rows.tables.len();
+                        tracing::info!(
+                            target: "relay_cache::wire",
+                            region,
+                            phase,
+                            wire_bytes = frame.wire_bytes,
+                            n_tables,
+                            wait_ms = started.elapsed().as_millis() as u64,
+                            "SubscribeApplied received"
+                        );
+                        return Ok((sa, frame.wire_bytes));
+                    }
+                    ServerMessage::SubscriptionError(err) => {
+                        bail!(
+                            "subscription error (region={region} phase={phase}): {}",
+                            err.error
+                        );
+                    }
+                    other => {
+                        tracing::debug!(
+                            target: "relay_cache::wire",
+                            region,
+                            phase,
+                            wire_bytes = frame.wire_bytes,
+                            ?other,
+                            "ignoring frame while waiting for SubscribeApplied"
+                        );
+                    }
+                }
             }
-            other => {
-                tracing::debug!(
+            _ = heartbeat.tick(), if debug_mode => {
+                tracing::info!(
                     target: "relay_cache::wire",
-                    ?other,
-                    "ignoring frame while waiting for SubscribeApplied"
+                    region,
+                    phase,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "still waiting for SubscribeApplied (WS message may still be assembling)"
                 );
+                if let Err(e) = send_ping(conn).await {
+                    tracing::warn!(
+                        target: "relay_cache::wire",
+                        region,
+                        phase,
+                        error = %e,
+                        "debug wait ping failed"
+                    );
+                    return Err(e);
+                }
             }
         }
     }
@@ -134,7 +212,10 @@ pub async fn send_subscribe(
     request_id: u32,
     query_set_id: u32,
     queries: Vec<String>,
+    region: u32,
+    phase: &str,
 ) -> Result<()> {
+    let n_queries = queries.len();
     let msg = ClientMessage::Subscribe(Subscribe {
         request_id,
         query_set_id: QuerySetId::new(query_set_id),
@@ -145,6 +226,16 @@ pub async fn send_subscribe(
             .into_boxed_slice(),
     });
     let bytes = bsatn::to_vec(&msg).map_err(|e| anyhow!("encode Subscribe: {e}"))?;
+    tracing::info!(
+        target: "relay_cache::wire",
+        region,
+        phase,
+        request_id,
+        query_set_id,
+        n_queries,
+        subscribe_wire_bytes = bytes.len(),
+        "sending Subscribe"
+    );
     conn.send(Message::Binary(bytes)).await?;
     Ok(())
 }

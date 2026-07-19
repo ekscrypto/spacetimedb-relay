@@ -123,6 +123,7 @@ pub fn spawn_shard(
     database: String,
     bind_url: Url,
     schema: Arc<MirroredSchema>,
+    debug_mode: bool,
     mut shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 ) -> Arc<ShardHandle> {
     let handle = Arc::new(ShardHandle {
@@ -131,8 +132,16 @@ pub fn spawn_shard(
     });
     let store = handle.store.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            run_shard_loop(region, database, bind_url, schema, store, &mut shutdown).await
+        if let Err(e) = run_shard_loop(
+            region,
+            database,
+            bind_url,
+            schema,
+            store,
+            debug_mode,
+            &mut shutdown,
+        )
+        .await
         {
             tracing::error!(
                 target: "relay_cache::shard",
@@ -151,6 +160,7 @@ async fn run_shard_loop(
     bind_url: Url,
     schema: Arc<MirroredSchema>,
     store: Arc<RwLock<RegionStore>>,
+    debug_mode: bool,
     shutdown: &mut std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 ) -> Result<()> {
     let meta = TableMeta::from_schema(&schema)?;
@@ -158,7 +168,14 @@ async fn run_shard_loop(
 
     loop {
         let result = session(
-            region, &database, &bind_url, &schema, &meta, &store, shutdown,
+            region,
+            &database,
+            &bind_url,
+            &schema,
+            &meta,
+            &store,
+            debug_mode,
+            shutdown,
         )
         .await;
 
@@ -208,6 +225,7 @@ enum SessionEnd {
     Disconnected { connected_at: Instant },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session(
     region: u32,
     database: &str,
@@ -215,6 +233,7 @@ async fn session(
     schema: &MirroredSchema,
     meta: &TableMeta,
     store: &Arc<RwLock<RegionStore>>,
+    debug_mode: bool,
     shutdown: &mut std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 ) -> Result<SessionEnd> {
     tracing::info!(
@@ -222,18 +241,34 @@ async fn session(
         region,
         database,
         %bind_url,
+        debug_mode,
         "connecting"
     );
     let mut conn = wire::open_connection(bind_url, database).await?;
     let connected_at = Instant::now();
     let _ = wire::expect_initial_connection(&mut conn).await?;
+    tracing::info!(
+        target: "relay_cache::shard",
+        region,
+        handshake_ms = connected_at.elapsed().as_millis() as u64,
+        "InitialConnection received"
+    );
 
     let base_queries = base_subscribe_queries();
     // Phase 1: discover hexite entity_ids (coords need a follow-up PK
     // subscribe — full location_state is ~13M rows/region).
-    wire::send_subscribe(&mut conn, 1, 1, base_queries.clone()).await?;
-    let sa1 = wire::expect_subscribe_applied(&mut conn).await?;
+    const PHASE1: &str = "phase1_bulk";
+    wire::send_subscribe(&mut conn, 1, 1, base_queries.clone(), region, PHASE1).await?;
+    let (sa1, phase1_wire_bytes) =
+        wire::expect_subscribe_applied(&mut conn, region, PHASE1, debug_mode).await?;
     let hexite_ids = collect_hexite_entity_ids(schema, meta, &sa1)?;
+    tracing::info!(
+        target: "relay_cache::shard",
+        region,
+        phase1_wire_bytes,
+        n_hexite = hexite_ids.len(),
+        "phase1 SubscribeApplied decoded; hexite ids collected"
+    );
 
     let mut queries = base_queries;
     for entity_id in &hexite_ids {
@@ -242,11 +277,38 @@ async fn session(
         ));
     }
     if !hexite_ids.is_empty() {
-        wire::send_subscribe(&mut conn, 2, 1, queries).await?;
-        let sa = wire::expect_subscribe_applied(&mut conn).await?;
+        const PHASE2: &str = "phase2_hexite_locations";
+        wire::send_subscribe(&mut conn, 2, 1, queries, region, PHASE2).await?;
+        let (sa, phase2_wire_bytes) =
+            wire::expect_subscribe_applied(&mut conn, region, PHASE2, debug_mode).await?;
+        tracing::info!(
+            target: "relay_cache::shard",
+            region,
+            phase2_wire_bytes,
+            "phase2 SubscribeApplied received; installing bulk load"
+        );
+        let load_started = Instant::now();
         install_bulk_load(region, schema, meta, store, &sa)?;
+        tracing::info!(
+            target: "relay_cache::shard",
+            region,
+            bulk_load_ms = load_started.elapsed().as_millis() as u64,
+            "phase2 bulk load installed"
+        );
     } else {
+        tracing::info!(
+            target: "relay_cache::shard",
+            region,
+            "no hexite ids — installing phase1 bulk load"
+        );
+        let load_started = Instant::now();
         install_bulk_load(region, schema, meta, store, &sa1)?;
+        tracing::info!(
+            target: "relay_cache::shard",
+            region,
+            bulk_load_ms = load_started.elapsed().as_millis() as u64,
+            "phase1 bulk load installed"
+        );
     }
 
     let n_resource = store.read().resource.len();
@@ -255,7 +317,8 @@ async fn session(
         region,
         n_hexite = hexite_ids.len(),
         n_resource,
-        "hexite location subscribe complete"
+        session_ms = connected_at.elapsed().as_millis() as u64,
+        "hexite location subscribe complete; entering stream loop"
     );
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -278,30 +341,42 @@ async fn session(
                     return Ok(SessionEnd::Disconnected { connected_at });
                 }
             }
-            msg = wire::recv_server_message(&mut conn) => {
-                match msg {
-                    Ok(ServerMessage::TransactionUpdate(tu)) => {
-                        if let Err(e) = apply_transaction(store, schema, meta, &tu) {
-                            tracing::warn!(
+            frame = wire::recv_server_message(&mut conn) => {
+                match frame {
+                    Ok(frame) => match frame.message {
+                        ServerMessage::TransactionUpdate(tu) => {
+                            if let Err(e) = apply_transaction(store, schema, meta, &tu) {
+                                tracing::warn!(
+                                    target: "relay_cache::shard",
+                                    region,
+                                    error = %e,
+                                    wire_bytes = frame.wire_bytes,
+                                    "apply TransactionUpdate failed; reconnecting"
+                                );
+                                return Err(e);
+                            }
+                            if debug_mode {
+                                tracing::debug!(
+                                    target: "relay_cache::shard",
+                                    region,
+                                    wire_bytes = frame.wire_bytes,
+                                    "applied TransactionUpdate"
+                                );
+                            }
+                        }
+                        ServerMessage::SubscriptionError(err) => {
+                            bail!("subscription error: {}", err.error);
+                        }
+                        other => {
+                            tracing::debug!(
                                 target: "relay_cache::shard",
                                 region,
-                                error = %e,
-                                "apply TransactionUpdate failed; reconnecting"
+                                wire_bytes = frame.wire_bytes,
+                                ?other,
+                                "ignoring server message"
                             );
-                            return Err(e);
                         }
-                    }
-                    Ok(ServerMessage::SubscriptionError(err)) => {
-                        bail!("subscription error: {}", err.error);
-                    }
-                    Ok(other) => {
-                        tracing::debug!(
-                            target: "relay_cache::shard",
-                            region,
-                            ?other,
-                            "ignoring server message"
-                        );
-                    }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             target: "relay_cache::shard",

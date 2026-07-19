@@ -46,14 +46,19 @@ async fn main() -> Result<()> {
     // Required for HTTPS schema fetch (rustls 0.23 process-wide provider).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    let args = Args::parse();
+    let default_filter = if args.debug {
+        "relay_cache=debug"
+    } else {
+        "relay_cache=info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("relay_cache=info")),
+                .unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .init();
 
-    let args = Args::parse();
     tracing::info!(
         target: "relay_cache",
         bind = %args.bind,
@@ -61,6 +66,7 @@ async fn main() -> Result<()> {
         schema_host = %args.schema_host,
         schema_db = %args.schema_db,
         mem_ceiling_bytes = args.mem_ceiling_bytes,
+        debug_mode = args.debug,
         "starting"
     );
 
@@ -95,6 +101,7 @@ async fn main() -> Result<()> {
             r.database.clone(),
             bind_url,
             schema.clone(),
+            args.debug,
             shutdown_signal_clone(),
         );
         shards.push(handle);
