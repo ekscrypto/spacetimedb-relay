@@ -400,16 +400,19 @@
             claim lookup by PK or name substring (PK includes supplies,
             upkeep, tier, researched techs, owner username), per-claim
             inventory, members (incl. last login), citizens (skill levels),
-            and hexcoin totals. Town Banks are omitted from inventory.
+            hexcoin totals, and crafts (progressive + passive, optional
+            <code>completed</code> filter). Town Banks are omitted from inventory.
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/cache-health</div>
             <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/claim?name=concordia'</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/inventory</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/members</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/citizens</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/hexcoins</div>
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/claim/&lt;id&gt;/crafts?completed=false'</div>
           </td>
           <td>
-            <code>name</code> (substring, for <code>/claim</code>)
+            <code>name</code> (substring, for <code>/claim</code>);
+            <code>completed</code> (optional bool, for <code>/crafts</code>)
           </td>
         </tr>
         <tr>
@@ -423,16 +426,19 @@
             wagon / cache / recovery / deployable),
             first-house contents resolved server-side from the
             player id (<code>status</code> is <code>ok</code> or
-            <code>noHouse</code>), and skill levels.
+            <code>noHouse</code>), skill levels, and crafts
+            (optional <code>completed</code> filter).
             <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/player?name=maple'</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;/inventory</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;/housing</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;/skills</div>
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/player/&lt;id&gt;/crafts?completed=true'</div>
           </td>
           <td>
             <code>name</code> (substring, for <code>/player</code>;
-            clients should send &ge;2 chars)
+            clients should send &ge;2 chars);
+            <code>completed</code> (optional bool, for <code>/crafts</code>)
           </td>
         </tr>
       </tbody>

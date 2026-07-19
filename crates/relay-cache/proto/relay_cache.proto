@@ -200,3 +200,40 @@ message PlayerHousing {
   optional HouseSummary house = 3;
   repeated BuildingInventory buildings = 4;
 }
+
+// Output stack from crafting_recipe_desc.crafted_item_stacks.
+message CraftedItem {
+  int32 item_id = 1;
+  int64 quantity = 2;
+  // "Item" | "Cargo"
+  string item_type = 3;
+}
+
+// Unified craft row from progressive_action_state + passive_craft_state,
+// enriched with recipe outputs and building/owner labels.
+message Craft {
+  uint64 entity_id = 1;
+  int32 recipe_id = 2;
+  int64 craft_count = 3;
+  int64 progress = 4;
+  int64 total_actions_required = 5;
+  bool completed = 6;
+  uint64 owner_entity_id = 7;
+  string owner_username = 8;
+  uint64 building_entity_id = 9;
+  string building_name = 10;
+  uint64 claim_entity_id = 11;
+  repeated CraftedItem crafted_item = 12;
+}
+
+message ClaimCrafts {
+  ClaimSummary claim = 1;
+  repeated Craft crafts = 2;
+  int32 count = 3;
+}
+
+message PlayerCrafts {
+  Player player = 1;
+  repeated Craft crafts = 2;
+  int32 count = 3;
+}

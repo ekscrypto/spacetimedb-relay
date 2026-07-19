@@ -105,9 +105,7 @@ impl DeployableDescStore {
     }
 
     pub fn get(&self, id: i32) -> Option<(&str, DeployableKind)> {
-        self.by_id
-            .get(&id)
-            .map(|e| (e.name.as_ref(), e.kind))
+        self.by_id.get(&id).map(|e| (e.name.as_ref(), e.kind))
     }
 
     pub fn upsert(&mut self, row: DeployableDescRow) {
@@ -139,7 +137,10 @@ mod tests {
             deployable_description_id: 5,
             nickname: "Bird".into(),
         });
-        assert_eq!(s.find(10).map(|slot| s.nickname[slot as usize].as_ref()), Some("Bird"));
+        assert_eq!(
+            s.find(10).map(|slot| s.nickname[slot as usize].as_ref()),
+            Some("Bird")
+        );
 
         let mut d = DeployableDescStore::new();
         d.upsert(DeployableDescRow {

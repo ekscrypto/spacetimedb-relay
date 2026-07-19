@@ -122,8 +122,7 @@ impl PlayerHousingDescStore {
     }
 
     pub fn upsert(&mut self, row: PlayerHousingDescRow) {
-        self.by_rank
-            .insert(row.rank, Box::from(row.name.as_str()));
+        self.by_rank.insert(row.rank, Box::from(row.name.as_str()));
     }
 
     pub fn delete_rank(&mut self, rank: i32) {

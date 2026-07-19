@@ -47,6 +47,9 @@ pub const PLAYER_HOUSING_DESC_TABLE: &str = "player_housing_desc";
 pub const RENT_TABLE: &str = "rent_state";
 pub const EXPERIENCE_TABLE: &str = "experience_state";
 pub const SKILL_DESC_TABLE: &str = "skill_desc";
+pub const PROGRESSIVE_ACTION_TABLE: &str = "progressive_action_state";
+pub const PASSIVE_CRAFT_TABLE: &str = "passive_craft_state";
+pub const CRAFTING_RECIPE_DESC_TABLE: &str = "crafting_recipe_desc";
 
 /// Overworld dimension id used when a building has no interior location row.
 pub const OVERWORLD_DIMENSION: u32 = 1;
@@ -126,6 +129,32 @@ pub struct SkillDescCols {
     pub name: usize,
     pub title: usize,
     pub max_level: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ProgressiveActionCols {
+    pub entity_id: usize,
+    pub building_entity_id: usize,
+    pub progress: usize,
+    pub recipe_id: usize,
+    pub craft_count: usize,
+    pub owner_entity_id: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct PassiveCraftCols {
+    pub entity_id: usize,
+    pub owner_entity_id: usize,
+    pub recipe_id: usize,
+    pub building_entity_id: usize,
+    pub status: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct CraftingRecipeDescCols {
+    pub id: usize,
+    pub crafted_item_stacks: usize,
+    pub actions_required: usize,
 }
 
 /// Resolved column indices for `building_state`.
@@ -259,6 +288,9 @@ pub struct ColMaps {
     pub rent: RentCols,
     pub experience: ExperienceCols,
     pub skill_desc: SkillDescCols,
+    pub progressive_action: ProgressiveActionCols,
+    pub passive_craft: PassiveCraftCols,
+    pub crafting_recipe_desc: CraftingRecipeDescCols,
 }
 
 /// Resolve column indices for the tables we hold. Errors if any expected
@@ -286,6 +318,9 @@ pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
         rent: resolve_rent_cols(schema)?,
         experience: resolve_experience_cols(schema)?,
         skill_desc: resolve_skill_desc_cols(schema)?,
+        progressive_action: resolve_progressive_action_cols(schema)?,
+        passive_craft: resolve_passive_craft_cols(schema)?,
+        crafting_recipe_desc: resolve_crafting_recipe_desc_cols(schema)?,
     })
 }
 
@@ -409,6 +444,38 @@ fn resolve_skill_desc_cols(schema: &MirroredSchema) -> Result<SkillDescCols> {
     })
 }
 
+fn resolve_progressive_action_cols(schema: &MirroredSchema) -> Result<ProgressiveActionCols> {
+    let f = fields_of(schema, PROGRESSIVE_ACTION_TABLE)?;
+    Ok(ProgressiveActionCols {
+        entity_id: find_field(f, "entity_id", PROGRESSIVE_ACTION_TABLE)?,
+        building_entity_id: find_field(f, "building_entity_id", PROGRESSIVE_ACTION_TABLE)?,
+        progress: find_field(f, "progress", PROGRESSIVE_ACTION_TABLE)?,
+        recipe_id: find_field(f, "recipe_id", PROGRESSIVE_ACTION_TABLE)?,
+        craft_count: find_field(f, "craft_count", PROGRESSIVE_ACTION_TABLE)?,
+        owner_entity_id: find_field(f, "owner_entity_id", PROGRESSIVE_ACTION_TABLE)?,
+    })
+}
+
+fn resolve_passive_craft_cols(schema: &MirroredSchema) -> Result<PassiveCraftCols> {
+    let f = fields_of(schema, PASSIVE_CRAFT_TABLE)?;
+    Ok(PassiveCraftCols {
+        entity_id: find_field(f, "entity_id", PASSIVE_CRAFT_TABLE)?,
+        owner_entity_id: find_field(f, "owner_entity_id", PASSIVE_CRAFT_TABLE)?,
+        recipe_id: find_field(f, "recipe_id", PASSIVE_CRAFT_TABLE)?,
+        building_entity_id: find_field(f, "building_entity_id", PASSIVE_CRAFT_TABLE)?,
+        status: find_field(f, "status", PASSIVE_CRAFT_TABLE)?,
+    })
+}
+
+fn resolve_crafting_recipe_desc_cols(schema: &MirroredSchema) -> Result<CraftingRecipeDescCols> {
+    let f = fields_of(schema, CRAFTING_RECIPE_DESC_TABLE)?;
+    Ok(CraftingRecipeDescCols {
+        id: find_field(f, "id", CRAFTING_RECIPE_DESC_TABLE)?,
+        crafted_item_stacks: find_field(f, "crafted_item_stacks", CRAFTING_RECIPE_DESC_TABLE)?,
+        actions_required: find_field(f, "actions_required", CRAFTING_RECIPE_DESC_TABLE)?,
+    })
+}
+
 fn resolve_building_cols(schema: &MirroredSchema) -> Result<BuildingCols> {
     let f = fields_of(schema, BUILDING_TABLE)?;
     Ok(BuildingCols {
@@ -523,11 +590,7 @@ fn resolve_player_housing_cols(schema: &MirroredSchema) -> Result<PlayerHousingC
 fn resolve_player_housing_desc_cols(schema: &MirroredSchema) -> Result<PlayerHousingDescCols> {
     let f = fields_of(schema, PLAYER_HOUSING_DESC_TABLE)?;
     Ok(PlayerHousingDescCols {
-        secondary_knowledge_id: find_field(
-            f,
-            "secondary_knowledge_id",
-            PLAYER_HOUSING_DESC_TABLE,
-        )?,
+        secondary_knowledge_id: find_field(f, "secondary_knowledge_id", PLAYER_HOUSING_DESC_TABLE)?,
         rank: find_field(f, "rank", PLAYER_HOUSING_DESC_TABLE)?,
         name: find_field(f, "name", PLAYER_HOUSING_DESC_TABLE)?,
     })
@@ -736,6 +799,53 @@ pub struct SkillDescRow {
     pub name: String,
     pub title: String,
     pub max_level: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveCraftStatus {
+    Queued,
+    Processing,
+    Complete,
+}
+
+impl PassiveCraftStatus {
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressiveActionRow {
+    pub entity_id: u64,
+    pub building_entity_id: u64,
+    pub progress: i32,
+    pub recipe_id: i32,
+    pub craft_count: i32,
+    pub owner_entity_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassiveCraftRow {
+    pub entity_id: u64,
+    pub owner_entity_id: u64,
+    pub recipe_id: i32,
+    pub building_entity_id: u64,
+    pub status: PassiveCraftStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CraftedItemStack {
+    pub item_id: i32,
+    pub quantity: i32,
+    /// `Pocket::ITEM` or `Pocket::CARGO`.
+    pub item_type: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CraftingRecipeDescRow {
+    pub id: i32,
+    pub actions_required: i32,
+    pub crafted_item: Box<[CraftedItemStack]>,
 }
 
 // --- Decoders ---
@@ -1184,6 +1294,117 @@ pub fn decode_skill_desc_with_fields(
     })
 }
 
+pub fn decode_progressive_action_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ProgressiveActionCols,
+    schema: &MirroredSchema,
+) -> Result<ProgressiveActionRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ProgressiveActionRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "progressive_action.entity_id")?,
+        building_entity_id: cell_u64(
+            &cells[cols.building_entity_id],
+            "progressive_action.building_entity_id",
+        )?,
+        progress: cell_i32(&cells[cols.progress], "progressive_action.progress")?,
+        recipe_id: cell_i32(&cells[cols.recipe_id], "progressive_action.recipe_id")?,
+        craft_count: cell_i32(&cells[cols.craft_count], "progressive_action.craft_count")?,
+        owner_entity_id: cell_u64(
+            &cells[cols.owner_entity_id],
+            "progressive_action.owner_entity_id",
+        )?,
+    })
+}
+
+pub fn decode_passive_craft_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: PassiveCraftCols,
+    schema: &MirroredSchema,
+) -> Result<PassiveCraftRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(PassiveCraftRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "passive_craft.entity_id")?,
+        owner_entity_id: cell_u64(
+            &cells[cols.owner_entity_id],
+            "passive_craft.owner_entity_id",
+        )?,
+        recipe_id: cell_i32(&cells[cols.recipe_id], "passive_craft.recipe_id")?,
+        building_entity_id: cell_u64(
+            &cells[cols.building_entity_id],
+            "passive_craft.building_entity_id",
+        )?,
+        status: decode_passive_craft_status(&cells[cols.status])?,
+    })
+}
+
+pub fn decode_crafting_recipe_desc_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: CraftingRecipeDescCols,
+    schema: &MirroredSchema,
+) -> Result<CraftingRecipeDescRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(CraftingRecipeDescRow {
+        id: cell_i32(&cells[cols.id], "crafting_recipe_desc.id")?,
+        actions_required: cell_i32(
+            &cells[cols.actions_required],
+            "crafting_recipe_desc.actions_required",
+        )?,
+        crafted_item: decode_crafted_item_stacks(&cells[cols.crafted_item_stacks])?,
+    })
+}
+
+fn decode_passive_craft_status(cell: &Cell) -> Result<PassiveCraftStatus> {
+    let json = cell_json(cell)?;
+    let Value::Object(obj) = json else {
+        bail!("passive_craft.status: expected object, got {json}");
+    };
+    let key = obj
+        .keys()
+        .next()
+        .ok_or_else(|| anyhow!("passive_craft.status: empty sum object"))?;
+    match key.as_str() {
+        "Queued" => Ok(PassiveCraftStatus::Queued),
+        "Processing" => Ok(PassiveCraftStatus::Processing),
+        "Complete" => Ok(PassiveCraftStatus::Complete),
+        other => bail!("passive_craft.status: unknown variant {other}"),
+    }
+}
+
+fn decode_crafted_item_stacks(cell: &Cell) -> Result<Box<[CraftedItemStack]>> {
+    let json = cell_json(cell)?;
+    let Value::Array(arr) = json else {
+        bail!("crafted_item_stacks is not a JSON array: {json}");
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let Value::Object(obj) = entry else {
+            bail!("crafted_item_stacks[{i}] is not an object: {entry}");
+        };
+        let item_id = json_i32(
+            obj.get("item_id"),
+            &format!("crafted_item_stacks[{i}].item_id"),
+        )?;
+        let quantity = json_i32(
+            obj.get("quantity"),
+            &format!("crafted_item_stacks[{i}].quantity"),
+        )?;
+        let item_type = match obj.get("item_type") {
+            Some(Value::Object(t)) if t.contains_key("Item") => Pocket::ITEM,
+            Some(Value::Object(t)) if t.contains_key("Cargo") => Pocket::CARGO,
+            other => bail!("crafted_item_stacks[{i}].item_type unexpected: {other:?}"),
+        };
+        out.push(CraftedItemStack {
+            item_id,
+            quantity,
+            item_type,
+        });
+    }
+    Ok(out.into())
+}
+
 /// `Array<U64>` is rendered as JSON array of hex-encoded LE byte strings.
 fn decode_u64_array(cell: &Cell, ctx: &str) -> Result<Box<[u64]>> {
     let json = cell_json(cell)?;
@@ -1322,7 +1543,8 @@ fn decode_optional_location(cell: &Cell) -> Result<(bool, i32, i32, u32)> {
             .get("dimension")
             .and_then(Value::as_u64)
             .ok_or_else(|| anyhow!("location.dimension missing"))?;
-        let dimension = u32::try_from(dimension).map_err(|_| anyhow!("location.dimension overflow"))?;
+        let dimension =
+            u32::try_from(dimension).map_err(|_| anyhow!("location.dimension overflow"))?;
         return Ok((true, x, z, dimension));
     }
     Ok((false, 0, 0, 0))
@@ -1503,6 +1725,21 @@ mod tests {
         ]));
         let err = decode_pockets(&cell).unwrap_err();
         assert!(err.to_string().contains("item_type"));
+    }
+
+    #[test]
+    fn decode_crafted_item_stacks_walks_item_and_cargo() {
+        let cell = Cell::Jsonb(json!([
+            {"item_id": 11006, "quantity": 10, "item_type": {"Item": {}}, "durability": {"none": {}}},
+            {"item_id": 5001, "quantity": 1, "item_type": {"Cargo": {}}, "durability": {"some": 0}}
+        ]));
+        let stacks = decode_crafted_item_stacks(&cell).unwrap();
+        assert_eq!(stacks.len(), 2);
+        assert_eq!(stacks[0].item_id, 11006);
+        assert_eq!(stacks[0].quantity, 10);
+        assert_eq!(stacks[0].item_type, Pocket::ITEM);
+        assert_eq!(stacks[1].item_id, 5001);
+        assert_eq!(stacks[1].item_type, Pocket::CARGO);
     }
 
     #[test]

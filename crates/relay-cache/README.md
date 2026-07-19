@@ -85,6 +85,23 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/housing
 # Player skill levels (from experience_state + vendored XP thresholds)
 curl -s http://127.0.0.1:8089/player/1297036692699996362/skills
 
+# Crafts at a claim (progressive + passive). Optional `completed=true|false`
+# filter; omit to return both. Owners with inventory permission are filtered
+# client-side via /claim/<id>/members.
+curl -s 'http://127.0.0.1:8089/claim/1234567890/crafts'
+curl -s 'http://127.0.0.1:8089/claim/1234567890/crafts?completed=false'
+# → { "claim": {...}, "crafts": [
+#      { "entity_id", "recipe_id", "craft_count", "progress",
+#        "total_actions_required", "completed",
+#        "owner_entity_id", "owner_username",
+#        "building_entity_id", "building_name", "claim_entity_id",
+#        "crafted_item": [ { "item_id", "quantity", "item_type" } ] }, ...
+#    ], "count": N }
+
+# Crafts owned by a player (any claim), same completed filter.
+curl -s 'http://127.0.0.1:8089/player/1297036692699996362/crafts'
+curl -s 'http://127.0.0.1:8089/player/1297036692699996362/crafts?completed=true'
+
 # Health / readiness (always JSON)
 curl -s http://127.0.0.1:8089/cache-health
 
@@ -109,6 +126,10 @@ curl -sH 'Accept: application/x-protobuf' \
   http://127.0.0.1:8089/player/1297036692699996362/housing -o player-housing.pb
 curl -sH 'Accept: application/x-protobuf' \
   http://127.0.0.1:8089/player/1297036692699996362/skills -o player-skills.pb
+curl -sH 'Accept: application/x-protobuf' \
+  'http://127.0.0.1:8089/claim/1234567890/crafts' -o claim-crafts.pb
+curl -sH 'Accept: application/x-protobuf' \
+  'http://127.0.0.1:8089/player/1297036692699996362/crafts' -o player-crafts.pb
 ```
 
 Public (nginx on `relay.bitcraftsync.app` → loopback `:8089`; see

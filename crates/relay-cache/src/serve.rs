@@ -67,11 +67,13 @@ pub async fn serve(
         .route("/claim/:entity_id/members", get(claim_members))
         .route("/claim/:entity_id/citizens", get(claim_citizens))
         .route("/claim/:entity_id/hexcoins", get(claim_hexcoins))
+        .route("/claim/:entity_id/crafts", get(claim_crafts))
         .route("/player", get(player_by_name))
         .route("/player/:entity_id", get(player_by_pk))
         .route("/player/:entity_id/inventory", get(player_inventory))
         .route("/player/:entity_id/housing", get(player_housing))
         .route("/player/:entity_id/skills", get(player_skills))
+        .route("/player/:entity_id/crafts", get(player_crafts))
         .with_state(fleet);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -467,6 +469,9 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
                 "rent": s.rent.len(),
                 "experience": s.experience.len(),
                 "skill_desc": s.skill_desc.len(),
+                "progressive_action": s.progressive_action.len(),
+                "passive_craft": s.passive_craft.len(),
+                "crafting_recipe_desc": s.crafting_recipe_desc.len(),
             }
         }));
     }
@@ -480,6 +485,13 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
 #[derive(Debug, Deserialize)]
 struct NameQuery {
     name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletedQuery {
+    /// When set, only crafts with matching `completed` are returned.
+    /// Omit to return both in-progress and completed.
+    completed: Option<bool>,
 }
 
 async fn claim_by_name(
@@ -819,6 +831,70 @@ fn respond_player_skills(headers: &HeaderMap, body: pb::PlayerSkills) -> Respons
     }
 }
 
+fn craft_to_json(c: &pb::Craft) -> Value {
+    let crafted_item: Vec<Value> = c
+        .crafted_item
+        .iter()
+        .map(|it| {
+            json!({
+                "item_id": it.item_id,
+                "quantity": it.quantity,
+                "item_type": it.item_type,
+            })
+        })
+        .collect();
+    json!({
+        "entity_id": c.entity_id.to_string(),
+        "recipe_id": c.recipe_id,
+        "craft_count": c.craft_count,
+        "progress": c.progress,
+        "total_actions_required": c.total_actions_required,
+        "completed": c.completed,
+        "owner_entity_id": c.owner_entity_id.to_string(),
+        "owner_username": c.owner_username,
+        "building_entity_id": c.building_entity_id.to_string(),
+        "building_name": c.building_name,
+        "claim_entity_id": c.claim_entity_id.to_string(),
+        "crafted_item": crafted_item,
+    })
+}
+
+fn respond_claim_crafts(headers: &HeaderMap, body: pb::ClaimCrafts) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(body.encode_to_vec())
+    } else {
+        let claim = body.claim.as_ref().map(|c| {
+            json!({
+                "entity_id": c.entity_id.to_string(),
+                "name": c.name,
+                "region": c.region,
+            })
+        });
+        let crafts: Vec<Value> = body.crafts.iter().map(craft_to_json).collect();
+        no_store_json(json!({
+            "claim": claim,
+            "crafts": crafts,
+            "count": body.count,
+        }))
+        .into_response()
+    }
+}
+
+fn respond_player_crafts(headers: &HeaderMap, body: pb::PlayerCrafts) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(body.encode_to_vec())
+    } else {
+        let player = body.player.as_ref().map(player_to_json);
+        let crafts: Vec<Value> = body.crafts.iter().map(craft_to_json).collect();
+        no_store_json(json!({
+            "player": player,
+            "crafts": crafts,
+            "count": body.count,
+        }))
+        .into_response()
+    }
+}
+
 async fn claim_members(
     State(fleet): State<Fleet>,
     headers: HeaderMap,
@@ -1053,11 +1129,7 @@ async fn player_skills(
         if let Some(stacks) = s.experience.get(pk) {
             for &(skill_id, xp) in stacks {
                 let level = crate::xp::xp_to_level(i64::from(xp));
-                let name = s
-                    .skill_desc
-                    .name(skill_id)
-                    .unwrap_or("")
-                    .to_owned();
+                let name = s.skill_desc.name(skill_id).unwrap_or("").to_owned();
                 skills.push(pb::PlayerSkill {
                     skill_id,
                     name,
@@ -1080,6 +1152,219 @@ async fn player_skills(
         pb::PlayerSkills {
             player: Some(player),
             skills: Vec::new(),
+        },
+    )
+}
+
+fn recipe_outputs(s: &RegionStore, recipe_id: i32) -> (i64, Vec<pb::CraftedItem>) {
+    let Some(recipe) = s.crafting_recipe_desc.get(recipe_id) else {
+        return (0, Vec::new());
+    };
+    let crafted_item = recipe
+        .crafted_item
+        .iter()
+        .map(|it| pb::CraftedItem {
+            item_id: it.item_id,
+            quantity: i64::from(it.quantity),
+            item_type: item_type_label(it.item_type).to_owned(),
+        })
+        .collect();
+    (i64::from(recipe.actions_required), crafted_item)
+}
+
+fn craft_building_labels(s: &RegionStore, building_entity_id: u64) -> (u64, String) {
+    let Some(slot) = s.building.find(building_entity_id) else {
+        return (0, String::new());
+    };
+    let i = slot as usize;
+    let claim_entity_id = s.building.claim_entity_id[i];
+    let desc_id = s.building.building_description_id[i];
+    let building_name = s.building_desc.get(desc_id).unwrap_or("").to_owned();
+    (claim_entity_id, building_name)
+}
+
+fn owner_username(s: &RegionStore, owner_entity_id: u64) -> String {
+    s.player_username
+        .find(owner_entity_id)
+        .map(|us| s.player_username.username[us as usize].to_string())
+        .unwrap_or_default()
+}
+
+fn craft_from_progressive(s: &RegionStore, slot: u32) -> pb::Craft {
+    let i = slot as usize;
+    let entity_id = s.progressive_action.entity_id[i];
+    let recipe_id = s.progressive_action.recipe_id[i];
+    let craft_count = i64::from(s.progressive_action.craft_count[i]).max(1);
+    let progress = i64::from(s.progressive_action.progress[i]);
+    let owner_entity_id = s.progressive_action.owner_entity_id[i];
+    let building_entity_id = s.progressive_action.building_entity_id[i];
+    let (actions_required, crafted_item) = recipe_outputs(s, recipe_id);
+    let total_actions_required = actions_required.saturating_mul(craft_count);
+    let completed = total_actions_required > 0 && progress >= total_actions_required;
+    let (claim_entity_id, building_name) = craft_building_labels(s, building_entity_id);
+    pb::Craft {
+        entity_id,
+        recipe_id,
+        craft_count,
+        progress,
+        total_actions_required,
+        completed,
+        owner_entity_id,
+        owner_username: owner_username(s, owner_entity_id),
+        building_entity_id,
+        building_name,
+        claim_entity_id,
+        crafted_item,
+    }
+}
+
+fn craft_from_passive(s: &RegionStore, slot: u32) -> pb::Craft {
+    let i = slot as usize;
+    let entity_id = s.passive_craft.entity_id[i];
+    let recipe_id = s.passive_craft.recipe_id[i];
+    let owner_entity_id = s.passive_craft.owner_entity_id[i];
+    let building_entity_id = s.passive_craft.building_entity_id[i];
+    let completed = s.passive_craft.status[i].is_complete();
+    let craft_count = 1i64;
+    let (actions_required, crafted_item) = recipe_outputs(s, recipe_id);
+    let total_actions_required = actions_required.max(1);
+    let progress = if completed { total_actions_required } else { 0 };
+    let (claim_entity_id, building_name) = craft_building_labels(s, building_entity_id);
+    pb::Craft {
+        entity_id,
+        recipe_id,
+        craft_count,
+        progress,
+        total_actions_required,
+        completed,
+        owner_entity_id,
+        owner_username: owner_username(s, owner_entity_id),
+        building_entity_id,
+        building_name,
+        claim_entity_id,
+        crafted_item,
+    }
+}
+
+fn push_if_matches(out: &mut Vec<pb::Craft>, craft: pb::Craft, completed: Option<bool>) {
+    if completed.is_none_or(|want| craft.completed == want) {
+        out.push(craft);
+    }
+}
+
+fn collect_crafts_at_claim(
+    s: &RegionStore,
+    claim_pk: u64,
+    completed: Option<bool>,
+) -> Vec<pb::Craft> {
+    let mut crafts = Vec::new();
+    for &b_slot in s.building.by_claim(claim_pk) {
+        let building_id = s.building.entity_id[b_slot as usize];
+        for &slot in s.progressive_action.by_building(building_id) {
+            push_if_matches(&mut crafts, craft_from_progressive(s, slot), completed);
+        }
+        for &slot in s.passive_craft.by_building(building_id) {
+            push_if_matches(&mut crafts, craft_from_passive(s, slot), completed);
+        }
+    }
+    crafts.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+    crafts
+}
+
+fn collect_crafts_for_player(
+    s: &RegionStore,
+    player_pk: u64,
+    completed: Option<bool>,
+) -> Vec<pb::Craft> {
+    let mut crafts = Vec::new();
+    for &slot in s.progressive_action.by_owner(player_pk) {
+        push_if_matches(&mut crafts, craft_from_progressive(s, slot), completed);
+    }
+    for &slot in s.passive_craft.by_owner(player_pk) {
+        push_if_matches(&mut crafts, craft_from_passive(s, slot), completed);
+    }
+    crafts.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+    crafts
+}
+
+async fn claim_crafts(
+    State(fleet): State<Fleet>,
+    headers: HeaderMap,
+    Path(entity_id): Path<String>,
+    Query(q): Query<CompletedQuery>,
+) -> Response {
+    let Ok(pk) = entity_id.parse::<u64>() else {
+        return no_store_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "entity_id must be a u64"}),
+        )
+        .into_response();
+    };
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready {
+            continue;
+        }
+        let Some(claim_slot) = s.claim.find(pk) else {
+            continue;
+        };
+        let crafts = collect_crafts_at_claim(&s, pk, q.completed);
+        let count = crafts.len() as i32;
+        return respond_claim_crafts(
+            &headers,
+            pb::ClaimCrafts {
+                claim: Some(pb::ClaimSummary {
+                    entity_id: pk,
+                    name: s.claim.name[claim_slot as usize].to_string(),
+                    region: s.region,
+                }),
+                crafts,
+                count,
+            },
+        );
+    }
+    no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+}
+
+async fn player_crafts(
+    State(fleet): State<Fleet>,
+    headers: HeaderMap,
+    Path(entity_id): Path<String>,
+    Query(q): Query<CompletedQuery>,
+) -> Response {
+    let Ok(pk) = entity_id.parse::<u64>() else {
+        return no_store_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "entity_id must be a u64"}),
+        )
+        .into_response();
+    };
+    let Some(player) = find_player(&fleet, pk) else {
+        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
+            .into_response();
+    };
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready || s.region != player.region {
+            continue;
+        }
+        let crafts = collect_crafts_for_player(&s, pk, q.completed);
+        let count = crafts.len() as i32;
+        return respond_player_crafts(
+            &headers,
+            pb::PlayerCrafts {
+                player: Some(player),
+                crafts,
+                count,
+            },
+        );
+    }
+    respond_player_crafts(
+        &headers,
+        pb::PlayerCrafts {
+            player: Some(player),
+            crafts: Vec::new(),
+            count: 0,
         },
     )
 }
@@ -1119,7 +1404,10 @@ fn item_type_label(t: u8) -> &'static str {
     }
 }
 
-fn aggregate_pockets(s: &RegionStore, inv_slots: impl Iterator<Item = u32>) -> Vec<pb::InventoryItem> {
+fn aggregate_pockets(
+    s: &RegionStore,
+    inv_slots: impl Iterator<Item = u32>,
+) -> Vec<pb::InventoryItem> {
     let mut agg: HashMap<(i32, u8), i64> = HashMap::new();
     for inv_slot in inv_slots {
         for p in s.inventory.pockets[inv_slot as usize].iter() {
@@ -1191,7 +1479,11 @@ fn player_to_json(p: &pb::Player) -> Value {
     Value::Object(map)
 }
 
-fn player_from_store(s: &crate::store::RegionStore, entity_id: u64, username: String) -> pb::Player {
+fn player_from_store(
+    s: &crate::store::RegionStore,
+    entity_id: u64,
+    username: String,
+) -> pb::Player {
     let (last_login_timestamp, signed_in) = match s.player_state.find(entity_id) {
         Some(slot) => {
             let i = slot as usize;
@@ -1352,10 +1644,8 @@ async fn player_by_pk(
     };
     match find_player(&fleet, pk) {
         Some(player) => respond_player(&headers, player),
-        None => {
-            no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-                .into_response()
-        }
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
+            .into_response(),
     }
 }
 
@@ -1401,7 +1691,10 @@ fn classify_player_bag(
                 Some(claim_id).filter(|&id| id != 0),
                 claim_name,
             )
-        } else if let Some(d_slot) = s.deployable.find(owner).or_else(|| s.deployable.find(entity_id))
+        } else if let Some(d_slot) = s
+            .deployable
+            .find(owner)
+            .or_else(|| s.deployable.find(entity_id))
         {
             let desc_id = s.deployable.deployable_description_id[d_slot as usize];
             let (desc_name, kind) = s
@@ -1414,9 +1707,7 @@ fn classify_player_bag(
             } else {
                 Some(nick.to_owned())
             };
-            let name = nickname
-                .clone()
-                .unwrap_or_else(|| desc_name.to_owned());
+            let name = nickname.clone().unwrap_or_else(|| desc_name.to_owned());
             let category = match kind {
                 DeployableKind::Cart => "wagon",
                 DeployableKind::Cache => "cache",
@@ -1661,8 +1952,8 @@ async fn player_housing(
 mod tests {
     use super::*;
     use crate::decode::{
-        BuildingDescRow, BuildingRow, DimensionNetworkRow, LocationDimRow, OVERWORLD_DIMENSION,
-        PlayerUsernameRow, RentRow,
+        BuildingDescRow, BuildingRow, DimensionNetworkRow, LocationDimRow, PlayerUsernameRow,
+        RentRow, OVERWORLD_DIMENSION,
     };
     use crate::store::RegionStore;
     use prost::Message;
@@ -1870,10 +2161,7 @@ mod tests {
         assert_eq!(categorize_building_bag("Town Bank"), Some("bank"));
         assert_eq!(categorize_building_bag("Ancient Bank"), Some("bank"));
         assert_eq!(categorize_building_bag("Recovery Chest"), Some("recovery"));
-        assert_eq!(
-            categorize_building_bag("Personal Cache"),
-            Some("cache")
-        );
+        assert_eq!(categorize_building_bag("Personal Cache"), Some("cache"));
         assert_eq!(categorize_building_bag("Sturdy Large Chest"), None);
     }
 
@@ -1975,7 +2263,10 @@ mod tests {
         assert_eq!(wallet.category, "wallet");
         assert_eq!(wallet.name, "Wallet");
         assert_eq!(wallet.items.len(), 2);
-        assert!(wallet.items.iter().any(|i| i.item_id == 1 && i.quantity == 50));
+        assert!(wallet
+            .items
+            .iter()
+            .any(|i| i.item_id == 1 && i.quantity == 50));
         // Checkpoint shape matches live Maplesugar wallet (27488 / 180).
         assert!(wallet
             .items
@@ -2087,7 +2378,10 @@ mod tests {
         let decoded = pb::Player::decode(player.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, player);
         assert_eq!(player_to_json(&player)["entity_id"], "7");
-        assert_eq!(player_to_json(&player)["last_login_timestamp"], 1_700_000_000);
+        assert_eq!(
+            player_to_json(&player)["last_login_timestamp"],
+            1_700_000_000
+        );
         assert_eq!(player_to_json(&player)["signed_in"], true);
     }
 }

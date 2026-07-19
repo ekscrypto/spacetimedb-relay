@@ -42,10 +42,7 @@ impl ClaimMemberSoA {
     }
 
     pub fn by_claim(&self, claim: u64) -> &[u32] {
-        self.by_claim
-            .get(&claim)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_claim.get(&claim).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn upsert(&mut self, row: ClaimMemberRow) {

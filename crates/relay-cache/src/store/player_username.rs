@@ -108,6 +108,9 @@ mod tests {
         let mut hits = s.search_name("maple");
         hits.sort();
         assert_eq!(hits.len(), 2);
-        assert_eq!(s.find(1).map(|slot| s.username[slot as usize].as_ref()), Some("Maplesugar"));
+        assert_eq!(
+            s.find(1).map(|slot| s.username[slot as usize].as_ref()),
+            Some("Maplesugar")
+        );
     }
 }

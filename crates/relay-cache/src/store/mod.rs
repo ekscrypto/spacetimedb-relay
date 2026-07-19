@@ -13,14 +13,17 @@ pub mod claim_local;
 pub mod claim_member;
 pub mod claim_tech;
 pub mod claim_tile_cost;
+pub mod crafting_recipe_desc;
 pub mod deployable;
 pub mod dimension_network;
 pub mod experience;
 pub mod inventory;
 pub mod location_dim;
+pub mod passive_craft;
 pub mod player_housing;
 pub mod player_state;
 pub mod player_username;
+pub mod progressive_action;
 pub mod rent;
 pub mod skill_desc;
 
@@ -32,14 +35,17 @@ pub use claim_local::ClaimLocalSoA;
 pub use claim_member::ClaimMemberSoA;
 pub use claim_tech::{ClaimTechDescStore, ClaimTechStateStore};
 pub use claim_tile_cost::ClaimTileCostStore;
+pub use crafting_recipe_desc::CraftingRecipeDescStore;
 pub use deployable::{DeployableDescStore, DeployableSoA};
 pub use dimension_network::DimensionNetworkStore;
 pub use experience::ExperienceSoA;
 pub use inventory::{InventorySoA, Pocket};
 pub use location_dim::LocationDimStore;
+pub use passive_craft::PassiveCraftSoA;
 pub use player_housing::{PlayerHousingDescStore, PlayerHousingSoA};
 pub use player_state::PlayerStateSoA;
 pub use player_username::PlayerUsernameSoA;
+pub use progressive_action::ProgressiveActionSoA;
 pub use rent::RentSoA;
 pub use skill_desc::SkillDescStore;
 
@@ -71,6 +77,9 @@ pub struct RegionStore {
     pub rent: RentSoA,
     pub experience: ExperienceSoA,
     pub skill_desc: SkillDescStore,
+    pub progressive_action: ProgressiveActionSoA,
+    pub passive_craft: PassiveCraftSoA,
+    pub crafting_recipe_desc: CraftingRecipeDescStore,
 }
 
 impl RegionStore {
@@ -99,6 +108,9 @@ impl RegionStore {
             rent: RentSoA::with_capacity(0),
             experience: ExperienceSoA::with_capacity(0),
             skill_desc: SkillDescStore::new(),
+            progressive_action: ProgressiveActionSoA::with_capacity(0),
+            passive_craft: PassiveCraftSoA::with_capacity(0),
+            crafting_recipe_desc: CraftingRecipeDescStore::new(),
         }
     }
 }

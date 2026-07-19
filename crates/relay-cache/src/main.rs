@@ -13,6 +13,7 @@
 //!   5. player personal inventories (categorized bags)
 //!   6. player housing (first house + interior buildings)
 //!   7. player skills (XP → level)
+//!   8. claim / player crafts (progressive + passive)
 
 mod config;
 mod decode;

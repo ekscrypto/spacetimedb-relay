@@ -20,11 +20,7 @@ impl ClaimTileCostStore {
     }
 
     pub fn upsert(&mut self, row: ClaimTileCostRow) {
-        if let Some(existing) = self
-            .rows
-            .iter_mut()
-            .find(|(tc, _)| *tc == row.tile_count)
-        {
+        if let Some(existing) = self.rows.iter_mut().find(|(tc, _)| *tc == row.tile_count) {
             existing.1 = row.cost_per_tile;
             return;
         }

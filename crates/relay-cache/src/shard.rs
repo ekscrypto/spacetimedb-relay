@@ -18,9 +18,10 @@ use url::Url;
 use crate::decode::{
     self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_LOCAL_TABLE,
     CLAIM_MEMBER_TABLE, CLAIM_TABLE, CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE,
-    CLAIM_TILE_COST_TABLE, DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE,
-    EXPERIENCE_TABLE, INVENTORY_TABLE, LOCATION_TABLE, PLAYER_HOUSING_DESC_TABLE,
-    PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE, PLAYER_USERNAME_TABLE, RENT_TABLE, SKILL_DESC_TABLE,
+    CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE, DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE,
+    DIMENSION_NETWORK_TABLE, EXPERIENCE_TABLE, INVENTORY_TABLE, LOCATION_TABLE,
+    PASSIVE_CRAFT_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE,
+    PLAYER_USERNAME_TABLE, PROGRESSIVE_ACTION_TABLE, RENT_TABLE, SKILL_DESC_TABLE,
 };
 use crate::store::RegionStore;
 use crate::wire;
@@ -61,6 +62,9 @@ struct TableMeta {
     rent_fields: Vec<MirroredField>,
     experience_fields: Vec<MirroredField>,
     skill_desc_fields: Vec<MirroredField>,
+    progressive_action_fields: Vec<MirroredField>,
+    passive_craft_fields: Vec<MirroredField>,
+    crafting_recipe_desc_fields: Vec<MirroredField>,
 }
 
 impl TableMeta {
@@ -89,6 +93,9 @@ impl TableMeta {
             rent_fields: fields_owned(schema, RENT_TABLE)?,
             experience_fields: fields_owned(schema, EXPERIENCE_TABLE)?,
             skill_desc_fields: fields_owned(schema, SKILL_DESC_TABLE)?,
+            progressive_action_fields: fields_owned(schema, PROGRESSIVE_ACTION_TABLE)?,
+            passive_craft_fields: fields_owned(schema, PASSIVE_CRAFT_TABLE)?,
+            crafting_recipe_desc_fields: fields_owned(schema, CRAFTING_RECIPE_DESC_TABLE)?,
         })
     }
 }
@@ -240,6 +247,9 @@ async fn session(
         format!("SELECT * FROM {RENT_TABLE}"),
         format!("SELECT * FROM {EXPERIENCE_TABLE}"),
         format!("SELECT * FROM {SKILL_DESC_TABLE}"),
+        format!("SELECT * FROM {PROGRESSIVE_ACTION_TABLE}"),
+        format!("SELECT * FROM {PASSIVE_CRAFT_TABLE}"),
+        format!("SELECT * FROM {CRAFTING_RECIPE_DESC_TABLE}"),
     ];
     wire::send_subscribe(&mut conn, 1, 1, queries).await?;
 
@@ -267,6 +277,9 @@ async fn session(
             let n_rent = fresh.rent.len();
             let n_experience = fresh.experience.len();
             let n_skill_desc = fresh.skill_desc.len();
+            let n_progressive_action = fresh.progressive_action.len();
+            let n_passive_craft = fresh.passive_craft.len();
+            let n_crafting_recipe_desc = fresh.crafting_recipe_desc.len();
             {
                 let mut guard = store.write();
                 *guard = fresh;
@@ -295,6 +308,9 @@ async fn session(
                 n_rent,
                 n_experience,
                 n_skill_desc,
+                n_progressive_action,
+                n_passive_craft,
+                n_crafting_recipe_desc,
                 "SubscribeApplied loaded"
             );
         }
@@ -846,6 +862,66 @@ fn apply_rows(
                     schema,
                 )?;
                 store.skill_desc.upsert(decoded);
+            }
+        }
+        PROGRESSIVE_ACTION_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_progressive_action_with_fields(
+                    row,
+                    &meta.progressive_action_fields,
+                    meta.cols.progressive_action,
+                    schema,
+                )?;
+                store.progressive_action.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_progressive_action_with_fields(
+                    row,
+                    &meta.progressive_action_fields,
+                    meta.cols.progressive_action,
+                    schema,
+                )?;
+                store.progressive_action.upsert(decoded);
+            }
+        }
+        PASSIVE_CRAFT_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_passive_craft_with_fields(
+                    row,
+                    &meta.passive_craft_fields,
+                    meta.cols.passive_craft,
+                    schema,
+                )?;
+                store.passive_craft.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_passive_craft_with_fields(
+                    row,
+                    &meta.passive_craft_fields,
+                    meta.cols.passive_craft,
+                    schema,
+                )?;
+                store.passive_craft.upsert(decoded);
+            }
+        }
+        CRAFTING_RECIPE_DESC_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_crafting_recipe_desc_with_fields(
+                    row,
+                    &meta.crafting_recipe_desc_fields,
+                    meta.cols.crafting_recipe_desc,
+                    schema,
+                )?;
+                store.crafting_recipe_desc.delete(decoded.id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_crafting_recipe_desc_with_fields(
+                    row,
+                    &meta.crafting_recipe_desc_fields,
+                    meta.cols.crafting_recipe_desc,
+                    schema,
+                )?;
+                store.crafting_recipe_desc.upsert(decoded);
             }
         }
         other => {
