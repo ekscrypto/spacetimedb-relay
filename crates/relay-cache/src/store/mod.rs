@@ -9,13 +9,17 @@ pub mod building;
 pub mod building_desc;
 pub mod building_nickname;
 pub mod claim;
+pub mod dimension_network;
 pub mod inventory;
+pub mod location_dim;
 
 pub use building::BuildingSoA;
 pub use building_desc::BuildingDescStore;
 pub use building_nickname::BuildingNicknameStore;
 pub use claim::ClaimSoA;
+pub use dimension_network::DimensionNetworkStore;
 pub use inventory::{InventorySoA, Pocket};
+pub use location_dim::LocationDimStore;
 
 /// One region's worth of in-memory state. The `ready` flag is `false`
 /// during initial `SubscribeApplied` load and after a disconnect; the
@@ -29,6 +33,8 @@ pub struct RegionStore {
     pub inventory: InventorySoA,
     pub building_desc: BuildingDescStore,
     pub building_nickname: BuildingNicknameStore,
+    pub location_dim: LocationDimStore,
+    pub dimension_network: DimensionNetworkStore,
 }
 
 impl RegionStore {
@@ -41,6 +47,8 @@ impl RegionStore {
             inventory: InventorySoA::with_capacity(0),
             building_desc: BuildingDescStore::new(),
             building_nickname: BuildingNicknameStore::new(),
+            location_dim: LocationDimStore::new(),
+            dimension_network: DimensionNetworkStore::new(),
         }
     }
 }

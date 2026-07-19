@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::decode::{
     self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_TABLE,
-    INVENTORY_TABLE,
+    DIMENSION_NETWORK_TABLE, INVENTORY_TABLE, LOCATION_TABLE,
 };
 use crate::store::RegionStore;
 use crate::wire;
@@ -42,6 +42,8 @@ struct TableMeta {
     inventory_fields: Vec<MirroredField>,
     building_desc_fields: Vec<MirroredField>,
     building_nickname_fields: Vec<MirroredField>,
+    location_fields: Vec<MirroredField>,
+    dimension_network_fields: Vec<MirroredField>,
 }
 
 impl TableMeta {
@@ -54,6 +56,8 @@ impl TableMeta {
             inventory_fields: fields_owned(schema, INVENTORY_TABLE)?,
             building_desc_fields: fields_owned(schema, BUILDING_DESC_TABLE)?,
             building_nickname_fields: fields_owned(schema, BUILDING_NICKNAME_TABLE)?,
+            location_fields: fields_owned(schema, LOCATION_TABLE)?,
+            dimension_network_fields: fields_owned(schema, DIMENSION_NETWORK_TABLE)?,
         })
     }
 }
@@ -187,6 +191,10 @@ async fn session(
         format!("SELECT * FROM {INVENTORY_TABLE}"),
         format!("SELECT * FROM {BUILDING_DESC_TABLE}"),
         format!("SELECT * FROM {BUILDING_NICKNAME_TABLE}"),
+        // Full location_state is ~13M rows/region; interiors-only is enough
+        // because overworld buildings default to dimension 1 when absent.
+        format!("SELECT * FROM {LOCATION_TABLE} WHERE dimension != 1"),
+        format!("SELECT * FROM {DIMENSION_NETWORK_TABLE}"),
     ];
     wire::send_subscribe(&mut conn, 1, 1, queries).await?;
 
@@ -198,6 +206,8 @@ async fn session(
             let n_inventory = fresh.inventory.len();
             let n_building_desc = fresh.building_desc.len();
             let n_building_nickname = fresh.building_nickname.len();
+            let n_location_dim = fresh.location_dim.len();
+            let n_dimension_network = fresh.dimension_network.len();
             {
                 let mut guard = store.write();
                 *guard = fresh;
@@ -210,6 +220,8 @@ async fn session(
                 n_inventory,
                 n_building_desc,
                 n_building_nickname,
+                n_location_dim,
+                n_dimension_network,
                 "SubscribeApplied loaded"
             );
         }
@@ -441,6 +453,48 @@ fn apply_rows(
                     schema,
                 )?;
                 store.building_nickname.upsert(decoded);
+            }
+        }
+        LOCATION_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_location_dim_with_fields(
+                    row,
+                    &meta.location_fields,
+                    meta.cols.location,
+                    schema,
+                )?;
+                store.location_dim.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_location_dim_with_fields(
+                    row,
+                    &meta.location_fields,
+                    meta.cols.location,
+                    schema,
+                )?;
+                store.location_dim.upsert(decoded);
+            }
+        }
+        DIMENSION_NETWORK_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_dimension_network_with_fields(
+                    row,
+                    &meta.dimension_network_fields,
+                    meta.cols.dimension_network,
+                    schema,
+                )?;
+                store
+                    .dimension_network
+                    .delete(decoded.entrance_dimension_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_dimension_network_with_fields(
+                    row,
+                    &meta.dimension_network_fields,
+                    meta.cols.dimension_network,
+                    schema,
+                )?;
+                store.dimension_network.upsert(decoded);
             }
         }
         other => {

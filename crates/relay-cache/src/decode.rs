@@ -31,6 +31,11 @@ pub const BUILDING_TABLE: &str = "building_state";
 pub const INVENTORY_TABLE: &str = "inventory_state";
 pub const BUILDING_DESC_TABLE: &str = "building_desc";
 pub const BUILDING_NICKNAME_TABLE: &str = "building_nickname_state";
+pub const LOCATION_TABLE: &str = "location_state";
+pub const DIMENSION_NETWORK_TABLE: &str = "dimension_network_state";
+
+/// Overworld dimension id used when a building has no interior location row.
+pub const OVERWORLD_DIMENSION: u32 = 1;
 
 /// Resolved column indices for `claim_state`, looked up once per shard.
 #[derive(Clone, Copy)]
@@ -76,6 +81,22 @@ pub struct BuildingNicknameCols {
     pub nickname: usize,
 }
 
+/// Resolved column indices for `location_state` (we only keep entity + dimension).
+#[derive(Clone, Copy)]
+pub struct LocationCols {
+    pub entity_id: usize,
+    pub dimension: usize,
+}
+
+/// Resolved column indices for `dimension_network_state`.
+#[derive(Clone, Copy)]
+pub struct DimensionNetworkCols {
+    pub building_id: usize,
+    pub claim_entity_id: usize,
+    pub entrance_dimension_id: usize,
+    pub is_collapsed: usize,
+}
+
 /// Per-shard bundle of column indices. Built once at shard init from the
 /// shared schema.
 pub struct ColMaps {
@@ -84,6 +105,8 @@ pub struct ColMaps {
     pub inventory: InventoryCols,
     pub building_desc: BuildingDescCols,
     pub building_nickname: BuildingNicknameCols,
+    pub location: LocationCols,
+    pub dimension_network: DimensionNetworkCols,
 }
 
 /// Resolve column indices for the tables we hold. Errors if any expected
@@ -95,6 +118,8 @@ pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
         inventory: resolve_inventory_cols(schema)?,
         building_desc: resolve_building_desc_cols(schema)?,
         building_nickname: resolve_building_nickname_cols(schema)?,
+        location: resolve_location_cols(schema)?,
+        dimension_network: resolve_dimension_network_cols(schema)?,
     })
 }
 
@@ -171,6 +196,24 @@ fn resolve_inventory_cols(schema: &MirroredSchema) -> Result<InventoryCols> {
     })
 }
 
+fn resolve_location_cols(schema: &MirroredSchema) -> Result<LocationCols> {
+    let f = fields_of(schema, LOCATION_TABLE)?;
+    Ok(LocationCols {
+        entity_id: find_field(f, "entity_id", LOCATION_TABLE)?,
+        dimension: find_field(f, "dimension", LOCATION_TABLE)?,
+    })
+}
+
+fn resolve_dimension_network_cols(schema: &MirroredSchema) -> Result<DimensionNetworkCols> {
+    let f = fields_of(schema, DIMENSION_NETWORK_TABLE)?;
+    Ok(DimensionNetworkCols {
+        building_id: find_field(f, "building_id", DIMENSION_NETWORK_TABLE)?,
+        claim_entity_id: find_field(f, "claim_entity_id", DIMENSION_NETWORK_TABLE)?,
+        entrance_dimension_id: find_field(f, "entrance_dimension_id", DIMENSION_NETWORK_TABLE)?,
+        is_collapsed: find_field(f, "is_collapsed", DIMENSION_NETWORK_TABLE)?,
+    })
+}
+
 // --- Typed row structs (mirrors bitcraft-relay-sync::decode shapes) ---
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +256,20 @@ pub struct InventoryRow {
     pub cargo_index: i32,
     pub owner_entity_id: u64,
     pub player_owner_entity_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationDimRow {
+    pub entity_id: u64,
+    pub dimension: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DimensionNetworkRow {
+    pub building_id: u64,
+    pub claim_entity_id: u64,
+    pub entrance_dimension_id: u32,
+    pub is_collapsed: bool,
 }
 
 // --- Decoders ---
@@ -330,6 +387,40 @@ pub fn decode_inventory_with_fields(
     })
 }
 
+pub fn decode_location_dim_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: LocationCols,
+    schema: &MirroredSchema,
+) -> Result<LocationDimRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(LocationDimRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "location.entity_id")?,
+        dimension: cell_u32(&cells[cols.dimension], "location.dimension")?,
+    })
+}
+
+pub fn decode_dimension_network_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: DimensionNetworkCols,
+    schema: &MirroredSchema,
+) -> Result<DimensionNetworkRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(DimensionNetworkRow {
+        building_id: cell_u64(&cells[cols.building_id], "dimension_network.building_id")?,
+        claim_entity_id: cell_u64(
+            &cells[cols.claim_entity_id],
+            "dimension_network.claim_entity_id",
+        )?,
+        entrance_dimension_id: cell_u32(
+            &cells[cols.entrance_dimension_id],
+            "dimension_network.entrance_dimension_id",
+        )?,
+        is_collapsed: cell_bool(&cells[cols.is_collapsed], "dimension_network.is_collapsed")?,
+    })
+}
+
 /// Walk a `pockets` JSON array (as produced by `relay_protocol::bsatn`'s
 /// fallback for nested sum-product arrays) into a typed `Box<[Pocket]>`.
 /// The JSON only exists transiently during decode — the stored row carries
@@ -441,6 +532,16 @@ fn cell_i32(cell: &Cell, ctx: &str) -> Result<i32> {
     match cell {
         Cell::Integer(Some(n)) => Ok(*n),
         _ => bail!("{ctx}: expected Integer, got {cell:?}"),
+    }
+}
+
+/// U32 is mapped to `Cell::Bigint` by relay-protocol.
+fn cell_u32(cell: &Cell, ctx: &str) -> Result<u32> {
+    match cell {
+        Cell::Bigint(Some(n)) => {
+            u32::try_from(*n).map_err(|_| anyhow!("{ctx}: Bigint {n} out of u32 range"))
+        }
+        _ => bail!("{ctx}: expected Bigint, got {cell:?}"),
     }
 }
 

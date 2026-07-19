@@ -15,8 +15,9 @@ use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::decode::OVERWORLD_DIMENSION;
 use crate::shard::ShardHandle;
-use crate::store::Pocket;
+use crate::store::{Pocket, RegionStore};
 
 /// Shared axum state: all region shards plus the memory-pressure flag.
 #[derive(Clone)]
@@ -80,6 +81,8 @@ async fn healthz(State(fleet): State<Fleet>) -> impl IntoResponse {
                 "inventory": s.inventory.len(),
                 "building_desc": s.building_desc.len(),
                 "building_nickname": s.building_nickname.len(),
+                "location_dim": s.location_dim.len(),
+                "dimension_network": s.dimension_network.len(),
             }
         }));
     }
@@ -185,18 +188,24 @@ async fn claim_inventory(
         let claim_name = s.claim.name[ci].as_ref();
         let region = s.region;
 
-        let mut buildings_out = Vec::new();
+        // dimension_id → buildings in that dimension
+        let mut by_dim: HashMap<u32, Vec<Value>> = HashMap::new();
+
         for &b_slot in s.building.by_claim(pk) {
             let bi = b_slot as usize;
             let building_entity_id = s.building.entity_id[bi];
             let building_description_id = s.building.building_description_id[bi];
-            // Skip walls, totems, crafting stations, etc. — only types
-            // whose catalog functions advertise storage/cargo slots.
-            if !s.building_desc.is_storage(building_description_id) {
+            // Skip walls/totems/crafting stations (no storage slots) and
+            // Town Banks (personal storage — BitJita omits these too).
+            if !s
+                .building_desc
+                .include_in_claim_inventory(building_description_id)
+            {
                 continue;
             }
             let name = s.building_desc.get(building_description_id);
             let nickname = s.building_nickname.get(building_entity_id);
+            let dimension_id = s.location_dim.get_or_overworld(building_entity_id);
 
             let mut agg: HashMap<(i32, u8), i64> = HashMap::new();
             for &inv_slot in s.inventory.by_owner(building_entity_id) {
@@ -227,7 +236,7 @@ async fn claim_inventory(
                 })
             });
 
-            buildings_out.push(json!({
+            by_dim.entry(dimension_id).or_default().push(json!({
                 "entity_id": building_entity_id.to_string(),
                 "name": name,
                 "nickname": nickname,
@@ -235,19 +244,45 @@ async fn claim_inventory(
             }));
         }
 
-        buildings_out.sort_by(|a, b| {
-            let aid = a
-                .get("entity_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            let bid = b
-                .get("entity_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            aid.cmp(&bid)
+        let mut dimensions_out = Vec::with_capacity(by_dim.len());
+        for (dimension_id, mut buildings) in by_dim {
+            buildings.sort_by(|a, b| {
+                let aid = a
+                    .get("entity_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let bid = b
+                    .get("entity_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                aid.cmp(&bid)
+            });
+
+            let (kind, entrance) = dimension_meta(&s, dimension_id);
+            dimensions_out.push((
+                dimension_id,
+                entrance_sort_key(&entrance),
+                json!({
+                    "dimension_id": dimension_id,
+                    "kind": kind,
+                    "entrance": entrance,
+                    "buildings": buildings,
+                }),
+            ));
+        }
+
+        dimensions_out.sort_by(|a, b| {
+            // Overworld first, then by entrance name, then dimension_id.
+            let a_ow = a.0 == OVERWORLD_DIMENSION;
+            let b_ow = b.0 == OVERWORLD_DIMENSION;
+            b_ow.cmp(&a_ow)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
         });
+
+        let dimensions: Vec<Value> = dimensions_out.into_iter().map(|(_, _, v)| v).collect();
 
         return no_store_json(json!({
             "claim": {
@@ -255,7 +290,7 @@ async fn claim_inventory(
                 "name": claim_name,
                 "region": region,
             },
-            "buildings": buildings_out,
+            "dimensions": dimensions,
         }))
         .into_response();
     }
@@ -263,9 +298,114 @@ async fn claim_inventory(
     no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
 }
 
+fn dimension_meta(s: &RegionStore, dimension_id: u32) -> (&'static str, Value) {
+    if dimension_id == OVERWORLD_DIMENSION {
+        return ("overworld", Value::Null);
+    }
+    let Some(net) = s.dimension_network.by_entrance_dim(dimension_id) else {
+        return ("unknown", Value::Null);
+    };
+    let (name, nickname) = entrance_labels(s, net.building_id);
+    (
+        "building_interior",
+        json!({
+            "entity_id": net.building_id.to_string(),
+            "name": name,
+            "nickname": nickname,
+        }),
+    )
+}
+
+fn entrance_labels(s: &RegionStore, building_id: u64) -> (Option<&str>, Option<&str>) {
+    let nickname = s.building_nickname.get(building_id);
+    let name = s
+        .building
+        .find(building_id)
+        .map(|slot| s.building.building_description_id[slot as usize])
+        .and_then(|desc_id| s.building_desc.get(desc_id));
+    (name, nickname)
+}
+
+fn entrance_sort_key(entrance: &Value) -> String {
+    entrance
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
 fn item_type_label(t: u8) -> &'static str {
     match t {
         Pocket::CARGO => "Cargo",
         _ => "Item",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::{
+        BuildingDescRow, BuildingRow, DimensionNetworkRow, LocationDimRow, OVERWORLD_DIMENSION,
+    };
+    use crate::store::RegionStore;
+
+    fn seed_concordia_like(s: &mut RegionStore) {
+        // Outdoor chest in overworld (no location row).
+        s.building.upsert(BuildingRow {
+            entity_id: 1,
+            claim_entity_id: 99,
+            building_description_id: 10,
+        });
+        s.building_desc.upsert(BuildingDescRow {
+            id: 10,
+            name: "Sturdy Large Chest".into(),
+            is_storage: true,
+        });
+
+        // Storehouse entrance (not storage itself).
+        s.building.upsert(BuildingRow {
+            entity_id: 200,
+            claim_entity_id: 99,
+            building_description_id: 20,
+        });
+        s.building_desc.upsert(BuildingDescRow {
+            id: 20,
+            name: "Sturdy Storehouse".into(),
+            is_storage: false,
+        });
+        s.dimension_network.upsert(DimensionNetworkRow {
+            building_id: 200,
+            claim_entity_id: 99,
+            entrance_dimension_id: 1649,
+            is_collapsed: false,
+        });
+
+        // Interior wicker storage.
+        s.building.upsert(BuildingRow {
+            entity_id: 300,
+            claim_entity_id: 99,
+            building_description_id: 30,
+        });
+        s.building_desc.upsert(BuildingDescRow {
+            id: 30,
+            name: "Wicker Item Storage".into(),
+            is_storage: true,
+        });
+        s.location_dim.upsert(LocationDimRow {
+            entity_id: 300,
+            dimension: 1649,
+        });
+    }
+
+    #[test]
+    fn grouping_defaults_missing_location_to_overworld() {
+        let mut s = RegionStore::empty(14);
+        seed_concordia_like(&mut s);
+        assert_eq!(s.location_dim.get_or_overworld(1), OVERWORLD_DIMENSION);
+        assert_eq!(s.location_dim.get_or_overworld(300), 1649);
+        let net = s.dimension_network.by_entrance_dim(1649).unwrap();
+        assert_eq!(net.building_id, 200);
+        let (name, _) = entrance_labels(&s, net.building_id);
+        assert_eq!(name, Some("Sturdy Storehouse"));
     }
 }

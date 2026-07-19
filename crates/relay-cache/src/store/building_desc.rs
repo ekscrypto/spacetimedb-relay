@@ -9,10 +9,17 @@ use crate::decode::BuildingDescRow;
 struct Entry {
     name: Box<str>,
     is_storage: bool,
+    /// Town Bank / bank-category buildings — personal storage; omitted
+    /// from the claim inventory rollup (matches BitJita's policy).
+    is_bank: bool,
 }
 
 pub struct BuildingDescStore {
     by_id: HashMap<i32, Entry>,
+}
+
+fn name_is_bank(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("bank")
 }
 
 impl BuildingDescStore {
@@ -30,16 +37,19 @@ impl BuildingDescStore {
         self.by_id.get(&id).map(|e| e.name.as_ref())
     }
 
-    /// Whether this catalog id is a storage-capable building type.
-    /// Missing ids are treated as non-storage (filtered out).
-    pub fn is_storage(&self, id: i32) -> bool {
-        self.by_id.get(&id).is_some_and(|e| e.is_storage)
+    /// Claim-inventory inclusion: storage-capable and not a bank.
+    /// Missing ids are treated as excluded.
+    pub fn include_in_claim_inventory(&self, id: i32) -> bool {
+        self.by_id
+            .get(&id)
+            .is_some_and(|e| e.is_storage && !e.is_bank)
     }
 
     pub fn upsert(&mut self, row: BuildingDescRow) {
         self.by_id.insert(
             row.id,
             Entry {
+                is_bank: name_is_bank(&row.name),
                 name: Box::from(row.name.as_str()),
                 is_storage: row.is_storage,
             },
@@ -68,15 +78,23 @@ mod tests {
         let mut s = BuildingDescStore::new();
         s.upsert(row(1007, "Storage Hut", true));
         assert_eq!(s.get(1007), Some("Storage Hut"));
-        assert!(s.is_storage(1007));
+        assert!(s.include_in_claim_inventory(1007));
         assert_eq!(s.len(), 1);
         s.upsert(row(1007, "Storage Chest", true));
         assert_eq!(s.get(1007), Some("Storage Chest"));
         assert_eq!(s.len(), 1);
         s.delete(1007);
         assert!(s.get(1007).is_none());
-        assert!(!s.is_storage(1007));
+        assert!(!s.include_in_claim_inventory(1007));
         assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn town_bank_excluded_despite_storage_slots() {
+        let mut s = BuildingDescStore::new();
+        s.upsert(row(985246037, "Town Bank", true));
+        assert_eq!(s.get(985246037), Some("Town Bank"));
+        assert!(!s.include_in_claim_inventory(985246037));
     }
 
     #[test]
@@ -84,8 +102,8 @@ mod tests {
         let mut s = BuildingDescStore::new();
         s.upsert(row(405, "Settlement Totem", false));
         assert_eq!(s.get(405), Some("Settlement Totem"));
-        assert!(!s.is_storage(405));
-        assert!(!s.is_storage(999));
+        assert!(!s.include_in_claim_inventory(405));
+        assert!(!s.include_in_claim_inventory(999));
     }
 
     #[test]

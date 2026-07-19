@@ -33,8 +33,15 @@ curl -s http://127.0.0.1:8089/claim/1234567890
 # Claim by name substring (case-insensitive)
 curl -s 'http://127.0.0.1:8089/claim?name=concordia'
 
-# Per-building inventory rollup (storage buildings only; name + nickname)
+# Per-building inventory rollup, grouped by dimension (overworld +
+# building interiors). Shared storage only — no Town Banks. Each interior
+# group includes an `entrance` (e.g. Sturdy Storehouse).
 curl -s http://127.0.0.1:8089/claim/1234567890/inventory
+# → { "claim": {...}, "dimensions": [
+#      { "dimension_id": 1, "kind": "overworld", "entrance": null, "buildings": [...] },
+#      { "dimension_id": 1649, "kind": "building_interior",
+#        "entrance": { "entity_id", "name", "nickname" }, "buildings": [...] }
+#    ] }
 
 # Health / readiness
 curl -s http://127.0.0.1:8089/healthz
