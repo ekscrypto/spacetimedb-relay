@@ -14,6 +14,7 @@
 //!   6. player housing (first house + interior buildings)
 //!   7. player skills (XP → level)
 //!   8. claim / player crafts (progressive + passive)
+//!   9. Hexite Deposits (resource_state + location)
 
 mod config;
 mod decode;

@@ -102,6 +102,21 @@ curl -s 'http://127.0.0.1:8089/claim/1234567890/crafts?completed=false'
 curl -s 'http://127.0.0.1:8089/player/1297036692699996362/crafts'
 curl -s 'http://127.0.0.1:8089/player/1297036692699996362/crafts?completed=true'
 
+# Hexite Deposits (global flat list). Optional `?region=N` filter.
+# `resource_state` (Hexite / Depleted Hexite) ⋈ `location_state` for coords
+# (north=z, east=x) ⋈ `growth_state` for depleted countdowns.
+# Active: omit `respawn_at`. Depleted: `respawn_at` from
+# `growth_state.end_timestamp` (public; Depleted→Hexite grows 6–8 days).
+curl -s 'http://127.0.0.1:8089/deposits'
+curl -s 'http://127.0.0.1:8089/deposits?region=14'
+# → { "deposits": [
+#      { "north": 6158, "east": 8174, "entity_id": "...",
+#        "name": "Hexite Deposit (N: 6158, E: 8174)", "region": 14 },
+#      { "north": 7050, "east": 4609, "entity_id": "...",
+#        "name": "Hexite Deposit (N: 7050, E: 4609)",
+#        "respawn_at": "2026-07-26T08:43:52.011Z", "region": 13 }, ...
+#    ], "count": N }
+
 # Health / readiness (always JSON)
 curl -s http://127.0.0.1:8089/cache-health
 
@@ -148,6 +163,8 @@ curl -s 'https://relay.bitcraftsync.app/player?name=maple'
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/inventory
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/housing
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/skills
+curl -s 'https://relay.bitcraftsync.app/deposits'
+curl -s 'https://relay.bitcraftsync.app/deposits?region=14'
 curl -sH 'Accept: application/x-protobuf' \
   https://relay.bitcraftsync.app/claim/1234567890/inventory -o inventory.pb
 ```

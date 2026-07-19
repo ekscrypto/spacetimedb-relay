@@ -17,6 +17,7 @@ pub mod crafting_recipe_desc;
 pub mod deployable;
 pub mod dimension_network;
 pub mod experience;
+pub mod growth;
 pub mod inventory;
 pub mod location_dim;
 pub mod passive_craft;
@@ -25,6 +26,7 @@ pub mod player_state;
 pub mod player_username;
 pub mod progressive_action;
 pub mod rent;
+pub mod resource;
 pub mod skill_desc;
 
 pub use building::BuildingSoA;
@@ -39,6 +41,7 @@ pub use crafting_recipe_desc::CraftingRecipeDescStore;
 pub use deployable::{DeployableDescStore, DeployableSoA};
 pub use dimension_network::DimensionNetworkStore;
 pub use experience::ExperienceSoA;
+pub use growth::GrowthStore;
 pub use inventory::{InventorySoA, Pocket};
 pub use location_dim::LocationDimStore;
 pub use passive_craft::PassiveCraftSoA;
@@ -47,6 +50,7 @@ pub use player_state::PlayerStateSoA;
 pub use player_username::PlayerUsernameSoA;
 pub use progressive_action::ProgressiveActionSoA;
 pub use rent::RentSoA;
+pub use resource::ResourceSoA;
 pub use skill_desc::SkillDescStore;
 
 /// One region's worth of in-memory state. The `ready` flag is `false`
@@ -80,6 +84,8 @@ pub struct RegionStore {
     pub progressive_action: ProgressiveActionSoA,
     pub passive_craft: PassiveCraftSoA,
     pub crafting_recipe_desc: CraftingRecipeDescStore,
+    pub resource: ResourceSoA,
+    pub growth: GrowthStore,
 }
 
 impl RegionStore {
@@ -111,6 +117,8 @@ impl RegionStore {
             progressive_action: ProgressiveActionSoA::with_capacity(0),
             passive_craft: PassiveCraftSoA::with_capacity(0),
             crafting_recipe_desc: CraftingRecipeDescStore::new(),
+            resource: ResourceSoA::with_capacity(0),
+            growth: GrowthStore::new(),
         }
     }
 }

@@ -18,10 +18,11 @@ use url::Url;
 use crate::decode::{
     self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_LOCAL_TABLE,
     CLAIM_MEMBER_TABLE, CLAIM_TABLE, CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE,
-    CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE, DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE,
-    DIMENSION_NETWORK_TABLE, EXPERIENCE_TABLE, INVENTORY_TABLE, LOCATION_TABLE,
-    PASSIVE_CRAFT_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE,
-    PLAYER_USERNAME_TABLE, PROGRESSIVE_ACTION_TABLE, RENT_TABLE, SKILL_DESC_TABLE,
+    CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+    DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE, EXPERIENCE_TABLE,
+    GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE, LOCATION_TABLE, PASSIVE_CRAFT_TABLE,
+    PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE, PLAYER_USERNAME_TABLE,
+    PROGRESSIVE_ACTION_TABLE, RENT_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE,
 };
 use crate::store::RegionStore;
 use crate::wire;
@@ -65,6 +66,8 @@ struct TableMeta {
     progressive_action_fields: Vec<MirroredField>,
     passive_craft_fields: Vec<MirroredField>,
     crafting_recipe_desc_fields: Vec<MirroredField>,
+    resource_fields: Vec<MirroredField>,
+    growth_fields: Vec<MirroredField>,
 }
 
 impl TableMeta {
@@ -96,6 +99,8 @@ impl TableMeta {
             progressive_action_fields: fields_owned(schema, PROGRESSIVE_ACTION_TABLE)?,
             passive_craft_fields: fields_owned(schema, PASSIVE_CRAFT_TABLE)?,
             crafting_recipe_desc_fields: fields_owned(schema, CRAFTING_RECIPE_DESC_TABLE)?,
+            resource_fields: fields_owned(schema, RESOURCE_TABLE)?,
+            growth_fields: fields_owned(schema, GROWTH_TABLE)?,
         })
     }
 }
@@ -223,101 +228,35 @@ async fn session(
     let connected_at = Instant::now();
     let _ = wire::expect_initial_connection(&mut conn).await?;
 
-    let queries = vec![
-        format!("SELECT * FROM {CLAIM_TABLE}"),
-        format!("SELECT * FROM {CLAIM_LOCAL_TABLE}"),
-        format!("SELECT * FROM {CLAIM_MEMBER_TABLE}"),
-        format!("SELECT * FROM {CLAIM_TECH_STATE_TABLE}"),
-        format!("SELECT * FROM {CLAIM_TECH_DESC_TABLE}"),
-        format!("SELECT * FROM {CLAIM_TILE_COST_TABLE}"),
-        format!("SELECT * FROM {BUILDING_TABLE}"),
-        format!("SELECT * FROM {INVENTORY_TABLE}"),
-        format!("SELECT * FROM {BUILDING_DESC_TABLE}"),
-        format!("SELECT * FROM {BUILDING_NICKNAME_TABLE}"),
-        // Full location_state is ~13M rows/region; interiors-only is enough
-        // because overworld buildings default to dimension 1 when absent.
-        format!("SELECT * FROM {LOCATION_TABLE} WHERE dimension != 1"),
-        format!("SELECT * FROM {DIMENSION_NETWORK_TABLE}"),
-        format!("SELECT * FROM {PLAYER_USERNAME_TABLE}"),
-        format!("SELECT * FROM {PLAYER_STATE_TABLE}"),
-        format!("SELECT * FROM {DEPLOYABLE_TABLE}"),
-        format!("SELECT * FROM {DEPLOYABLE_DESC_TABLE}"),
-        format!("SELECT * FROM {PLAYER_HOUSING_TABLE}"),
-        format!("SELECT * FROM {PLAYER_HOUSING_DESC_TABLE}"),
-        format!("SELECT * FROM {RENT_TABLE}"),
-        format!("SELECT * FROM {EXPERIENCE_TABLE}"),
-        format!("SELECT * FROM {SKILL_DESC_TABLE}"),
-        format!("SELECT * FROM {PROGRESSIVE_ACTION_TABLE}"),
-        format!("SELECT * FROM {PASSIVE_CRAFT_TABLE}"),
-        format!("SELECT * FROM {CRAFTING_RECIPE_DESC_TABLE}"),
-    ];
-    wire::send_subscribe(&mut conn, 1, 1, queries).await?;
+    let base_queries = base_subscribe_queries();
+    // Phase 1: discover hexite entity_ids (coords need a follow-up PK
+    // subscribe — full location_state is ~13M rows/region).
+    wire::send_subscribe(&mut conn, 1, 1, base_queries.clone()).await?;
+    let sa1 = wire::expect_subscribe_applied(&mut conn).await?;
+    let hexite_ids = collect_hexite_entity_ids(schema, meta, &sa1)?;
 
-    let sa = wire::expect_subscribe_applied(&mut conn).await?;
-    match bulk_load(region, schema, meta, &sa) {
-        Ok(fresh) => {
-            let n_claim = fresh.claim.len();
-            let n_claim_local = fresh.claim_local.len();
-            let n_claim_member = fresh.claim_member.len();
-            let n_claim_tech_state = fresh.claim_tech_state.len();
-            let n_claim_tech_desc = fresh.claim_tech_desc.len();
-            let n_claim_tile_cost = fresh.claim_tile_cost.len();
-            let n_building = fresh.building.len();
-            let n_inventory = fresh.inventory.len();
-            let n_building_desc = fresh.building_desc.len();
-            let n_building_nickname = fresh.building_nickname.len();
-            let n_location_dim = fresh.location_dim.len();
-            let n_dimension_network = fresh.dimension_network.len();
-            let n_player_username = fresh.player_username.len();
-            let n_player_state = fresh.player_state.len();
-            let n_deployable = fresh.deployable.len();
-            let n_deployable_desc = fresh.deployable_desc.len();
-            let n_player_housing = fresh.player_housing.len();
-            let n_player_housing_desc = fresh.player_housing_desc.len();
-            let n_rent = fresh.rent.len();
-            let n_experience = fresh.experience.len();
-            let n_skill_desc = fresh.skill_desc.len();
-            let n_progressive_action = fresh.progressive_action.len();
-            let n_passive_craft = fresh.passive_craft.len();
-            let n_crafting_recipe_desc = fresh.crafting_recipe_desc.len();
-            {
-                let mut guard = store.write();
-                *guard = fresh;
-            }
-            tracing::info!(
-                target: "relay_cache::shard",
-                region,
-                n_claim,
-                n_claim_local,
-                n_claim_member,
-                n_claim_tech_state,
-                n_claim_tech_desc,
-                n_claim_tile_cost,
-                n_building,
-                n_inventory,
-                n_building_desc,
-                n_building_nickname,
-                n_location_dim,
-                n_dimension_network,
-                n_player_username,
-                n_player_state,
-                n_deployable,
-                n_deployable_desc,
-                n_player_housing,
-                n_player_housing_desc,
-                n_rent,
-                n_experience,
-                n_skill_desc,
-                n_progressive_action,
-                n_passive_craft,
-                n_crafting_recipe_desc,
-                "SubscribeApplied loaded"
-            );
-        }
-        Err(e) => {
-            bail!("bulk load failed: {e}");
-        }
+    let mut queries = base_queries;
+    for entity_id in &hexite_ids {
+        queries.push(format!(
+            "SELECT * FROM {LOCATION_TABLE} WHERE entity_id = {entity_id}"
+        ));
     }
+    if !hexite_ids.is_empty() {
+        wire::send_subscribe(&mut conn, 2, 1, queries).await?;
+        let sa = wire::expect_subscribe_applied(&mut conn).await?;
+        install_bulk_load(region, schema, meta, store, &sa)?;
+    } else {
+        install_bulk_load(region, schema, meta, store, &sa1)?;
+    }
+
+    let n_resource = store.read().resource.len();
+    tracing::info!(
+        target: "relay_cache::shard",
+        region,
+        n_hexite = hexite_ids.len(),
+        n_resource,
+        "hexite location subscribe complete"
+    );
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -383,6 +322,151 @@ fn clear_store(store: &Arc<RwLock<RegionStore>>, region: u32) {
     *guard = RegionStore::empty(region);
 }
 
+fn base_subscribe_queries() -> Vec<String> {
+    vec![
+        format!("SELECT * FROM {CLAIM_TABLE}"),
+        format!("SELECT * FROM {CLAIM_LOCAL_TABLE}"),
+        format!("SELECT * FROM {CLAIM_MEMBER_TABLE}"),
+        format!("SELECT * FROM {CLAIM_TECH_STATE_TABLE}"),
+        format!("SELECT * FROM {CLAIM_TECH_DESC_TABLE}"),
+        format!("SELECT * FROM {CLAIM_TILE_COST_TABLE}"),
+        format!("SELECT * FROM {BUILDING_TABLE}"),
+        format!("SELECT * FROM {INVENTORY_TABLE}"),
+        format!("SELECT * FROM {BUILDING_DESC_TABLE}"),
+        format!("SELECT * FROM {BUILDING_NICKNAME_TABLE}"),
+        // Full location_state is ~13M rows/region; interiors-only is enough
+        // because overworld buildings default to dimension 1 when absent.
+        // Hexite deposit coords are added as per-entity PK queries after
+        // phase-1 discovers their entity_ids.
+        format!("SELECT * FROM {LOCATION_TABLE} WHERE dimension != 1"),
+        format!("SELECT * FROM {DIMENSION_NETWORK_TABLE}"),
+        format!("SELECT * FROM {PLAYER_USERNAME_TABLE}"),
+        format!("SELECT * FROM {PLAYER_STATE_TABLE}"),
+        format!("SELECT * FROM {DEPLOYABLE_TABLE}"),
+        format!("SELECT * FROM {DEPLOYABLE_DESC_TABLE}"),
+        format!("SELECT * FROM {PLAYER_HOUSING_TABLE}"),
+        format!("SELECT * FROM {PLAYER_HOUSING_DESC_TABLE}"),
+        format!("SELECT * FROM {RENT_TABLE}"),
+        format!("SELECT * FROM {EXPERIENCE_TABLE}"),
+        format!("SELECT * FROM {SKILL_DESC_TABLE}"),
+        format!("SELECT * FROM {PROGRESSIVE_ACTION_TABLE}"),
+        format!("SELECT * FROM {PASSIVE_CRAFT_TABLE}"),
+        format!("SELECT * FROM {CRAFTING_RECIPE_DESC_TABLE}"),
+        // Two equality filters — safer than OR for SpacetimeDB SQL.
+        format!(
+            "SELECT * FROM {RESOURCE_TABLE} WHERE resource_id = {HEXITE_DEPOSIT_RESOURCE_ID}"
+        ),
+        format!(
+            "SELECT * FROM {RESOURCE_TABLE} WHERE resource_id = {DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID}"
+        ),
+        // Public growth countdowns (Hexite depleted→grown, Maker's Tree, …).
+        // Exact respawn_at for depleted Hexite is growth_state.end_timestamp.
+        format!("SELECT * FROM {GROWTH_TABLE}"),
+    ]
+}
+
+fn collect_hexite_entity_ids(
+    schema: &MirroredSchema,
+    meta: &TableMeta,
+    sa: &SubscribeApplied,
+) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for table in sa.rows.tables.iter() {
+        let name: &str = table.table.as_ref();
+        if name != RESOURCE_TABLE {
+            continue;
+        }
+        for row in (&table.rows).into_iter() {
+            let decoded = decode::decode_resource_with_fields(
+                &row,
+                &meta.resource_fields,
+                meta.cols.resource,
+                schema,
+            )?;
+            ids.push(decoded.entity_id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn install_bulk_load(
+    region: u32,
+    schema: &MirroredSchema,
+    meta: &TableMeta,
+    store: &Arc<RwLock<RegionStore>>,
+    sa: &SubscribeApplied,
+) -> Result<()> {
+    match bulk_load(region, schema, meta, sa) {
+        Ok(fresh) => {
+            let n_claim = fresh.claim.len();
+            let n_claim_local = fresh.claim_local.len();
+            let n_claim_member = fresh.claim_member.len();
+            let n_claim_tech_state = fresh.claim_tech_state.len();
+            let n_claim_tech_desc = fresh.claim_tech_desc.len();
+            let n_claim_tile_cost = fresh.claim_tile_cost.len();
+            let n_building = fresh.building.len();
+            let n_inventory = fresh.inventory.len();
+            let n_building_desc = fresh.building_desc.len();
+            let n_building_nickname = fresh.building_nickname.len();
+            let n_location_dim = fresh.location_dim.len();
+            let n_dimension_network = fresh.dimension_network.len();
+            let n_player_username = fresh.player_username.len();
+            let n_player_state = fresh.player_state.len();
+            let n_deployable = fresh.deployable.len();
+            let n_deployable_desc = fresh.deployable_desc.len();
+            let n_player_housing = fresh.player_housing.len();
+            let n_player_housing_desc = fresh.player_housing_desc.len();
+            let n_rent = fresh.rent.len();
+            let n_experience = fresh.experience.len();
+            let n_skill_desc = fresh.skill_desc.len();
+            let n_progressive_action = fresh.progressive_action.len();
+            let n_passive_craft = fresh.passive_craft.len();
+            let n_crafting_recipe_desc = fresh.crafting_recipe_desc.len();
+            let n_resource = fresh.resource.len();
+            let n_growth = fresh.growth.len();
+            {
+                let mut guard = store.write();
+                *guard = fresh;
+            }
+            tracing::info!(
+                target: "relay_cache::shard",
+                region,
+                n_claim,
+                n_claim_local,
+                n_claim_member,
+                n_claim_tech_state,
+                n_claim_tech_desc,
+                n_claim_tile_cost,
+                n_building,
+                n_inventory,
+                n_building_desc,
+                n_building_nickname,
+                n_location_dim,
+                n_dimension_network,
+                n_player_username,
+                n_player_state,
+                n_deployable,
+                n_deployable_desc,
+                n_player_housing,
+                n_player_housing_desc,
+                n_rent,
+                n_experience,
+                n_skill_desc,
+                n_progressive_action,
+                n_passive_craft,
+                n_crafting_recipe_desc,
+                n_resource,
+                n_growth,
+                "SubscribeApplied loaded"
+            );
+            Ok(())
+        }
+        Err(e) => bail!("bulk load failed: {e}"),
+    }
+}
+
 fn bulk_load(
     region: u32,
     schema: &MirroredSchema,
@@ -390,8 +474,20 @@ fn bulk_load(
     sa: &SubscribeApplied,
 ) -> Result<RegionStore> {
     let mut fresh = RegionStore::empty(region);
+    // Resources before locations so hexite PK location rows can attach x/z.
     for table in sa.rows.tables.iter() {
         let name: &str = table.table.as_ref();
+        if name == LOCATION_TABLE {
+            continue;
+        }
+        let rows: Vec<Bytes> = table.rows.into_iter().collect();
+        apply_rows(&mut fresh, schema, meta, name, &[], &rows)?;
+    }
+    for table in sa.rows.tables.iter() {
+        let name: &str = table.table.as_ref();
+        if name != LOCATION_TABLE {
+            continue;
+        }
         let rows: Vec<Bytes> = table.rows.into_iter().collect();
         apply_rows(&mut fresh, schema, meta, name, &[], &rows)?;
     }
@@ -546,22 +642,31 @@ fn apply_rows(
         }
         LOCATION_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_location_dim_with_fields(
+                let decoded = decode::decode_location_with_fields(
                     row,
                     &meta.location_fields,
                     meta.cols.location,
                     schema,
                 )?;
                 store.location_dim.delete(decoded.entity_id);
+                store.resource.clear_location(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_location_dim_with_fields(
+                let decoded = decode::decode_location_with_fields(
                     row,
                     &meta.location_fields,
                     meta.cols.location,
                     schema,
                 )?;
-                store.location_dim.upsert(decoded);
+                store.location_dim.upsert(decode::LocationDimRow {
+                    entity_id: decoded.entity_id,
+                    dimension: decoded.dimension,
+                });
+                // Hexite PK location subscribes land here too; stash x/z
+                // onto the resource row (overworld deposits are dimension 1).
+                store
+                    .resource
+                    .set_location(decoded.entity_id, decoded.x, decoded.z);
             }
         }
         DIMENSION_NETWORK_TABLE => {
@@ -922,6 +1027,46 @@ fn apply_rows(
                     schema,
                 )?;
                 store.crafting_recipe_desc.upsert(decoded);
+            }
+        }
+        RESOURCE_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_resource_with_fields(
+                    row,
+                    &meta.resource_fields,
+                    meta.cols.resource,
+                    schema,
+                )?;
+                store.resource.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_resource_with_fields(
+                    row,
+                    &meta.resource_fields,
+                    meta.cols.resource,
+                    schema,
+                )?;
+                store.resource.upsert(decoded);
+            }
+        }
+        GROWTH_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_growth_with_fields(
+                    row,
+                    &meta.growth_fields,
+                    meta.cols.growth,
+                    schema,
+                )?;
+                store.growth.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_growth_with_fields(
+                    row,
+                    &meta.growth_fields,
+                    meta.cols.growth,
+                    schema,
+                )?;
+                store.growth.upsert(decoded);
             }
         }
         other => {

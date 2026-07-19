@@ -237,3 +237,24 @@ message PlayerCrafts {
   repeated Craft crafts = 2;
   int32 count = 3;
 }
+
+// Hexite Deposit from resource_state ⋈ location_state ⋈ growth_state.
+// Game coords: north = location.z, east = location.x.
+// Active deposits omit respawn_at. Depleted deposits set respawn_at from
+// public growth_state.end_timestamp (Depleted → Hexite growth recipe).
+message HexiteDeposit {
+  int32 north = 1;
+  int32 east = 2;
+  optional uint64 entity_id = 3;
+  optional string name = 4;
+  // ISO-8601 UTC from growth_state.end_timestamp; absent when harvestable.
+  optional string respawn_at = 5;
+  // Only set when depleted but growth row is missing (rare). Prefer respawn_at.
+  optional string status = 6;
+  optional uint32 region = 7;
+}
+
+message HexiteDepositList {
+  repeated HexiteDeposit deposits = 1;
+  int32 count = 2;
+}

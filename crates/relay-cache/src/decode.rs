@@ -50,6 +50,17 @@ pub const SKILL_DESC_TABLE: &str = "skill_desc";
 pub const PROGRESSIVE_ACTION_TABLE: &str = "progressive_action_state";
 pub const PASSIVE_CRAFT_TABLE: &str = "passive_craft_state";
 pub const CRAFTING_RECIPE_DESC_TABLE: &str = "crafting_recipe_desc";
+pub const RESOURCE_TABLE: &str = "resource_state";
+pub const GROWTH_TABLE: &str = "growth_state";
+
+/// Hexite Deposit (`resource_desc.id`). Live / harvestable form.
+pub const HEXITE_DEPOSIT_RESOURCE_ID: i32 = 348497955;
+/// Depleted Hexite Deposit — same entity, growing back via `growth_state`.
+pub const DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID: i32 = 854132798;
+
+pub fn is_hexite_resource_id(resource_id: i32) -> bool {
+    resource_id == HEXITE_DEPOSIT_RESOURCE_ID || resource_id == DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID
+}
 
 /// Overworld dimension id used when a building has no interior location row.
 pub const OVERWORLD_DIMENSION: u32 = 1;
@@ -191,11 +202,26 @@ pub struct BuildingNicknameCols {
     pub nickname: usize,
 }
 
-/// Resolved column indices for `location_state` (we only keep entity + dimension).
+/// Resolved column indices for `location_state`.
 #[derive(Clone, Copy)]
 pub struct LocationCols {
     pub entity_id: usize,
+    pub x: usize,
+    pub z: usize,
     pub dimension: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ResourceCols {
+    pub entity_id: usize,
+    pub resource_id: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct GrowthCols {
+    pub entity_id: usize,
+    pub end_timestamp: usize,
+    pub growth_recipe_id: usize,
 }
 
 /// Resolved column indices for `dimension_network_state`.
@@ -291,6 +317,8 @@ pub struct ColMaps {
     pub progressive_action: ProgressiveActionCols,
     pub passive_craft: PassiveCraftCols,
     pub crafting_recipe_desc: CraftingRecipeDescCols,
+    pub resource: ResourceCols,
+    pub growth: GrowthCols,
 }
 
 /// Resolve column indices for the tables we hold. Errors if any expected
@@ -321,6 +349,8 @@ pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
         progressive_action: resolve_progressive_action_cols(schema)?,
         passive_craft: resolve_passive_craft_cols(schema)?,
         crafting_recipe_desc: resolve_crafting_recipe_desc_cols(schema)?,
+        resource: resolve_resource_cols(schema)?,
+        growth: resolve_growth_cols(schema)?,
     })
 }
 
@@ -518,7 +548,26 @@ fn resolve_location_cols(schema: &MirroredSchema) -> Result<LocationCols> {
     let f = fields_of(schema, LOCATION_TABLE)?;
     Ok(LocationCols {
         entity_id: find_field(f, "entity_id", LOCATION_TABLE)?,
+        x: find_field(f, "x", LOCATION_TABLE)?,
+        z: find_field(f, "z", LOCATION_TABLE)?,
         dimension: find_field(f, "dimension", LOCATION_TABLE)?,
+    })
+}
+
+fn resolve_resource_cols(schema: &MirroredSchema) -> Result<ResourceCols> {
+    let f = fields_of(schema, RESOURCE_TABLE)?;
+    Ok(ResourceCols {
+        entity_id: find_field(f, "entity_id", RESOURCE_TABLE)?,
+        resource_id: find_field(f, "resource_id", RESOURCE_TABLE)?,
+    })
+}
+
+fn resolve_growth_cols(schema: &MirroredSchema) -> Result<GrowthCols> {
+    let f = fields_of(schema, GROWTH_TABLE)?;
+    Ok(GrowthCols {
+        entity_id: find_field(f, "entity_id", GROWTH_TABLE)?,
+        end_timestamp: find_field(f, "end_timestamp", GROWTH_TABLE)?,
+        growth_recipe_id: find_field(f, "growth_recipe_id", GROWTH_TABLE)?,
     })
 }
 
@@ -655,6 +704,27 @@ pub struct InventoryRow {
 pub struct LocationDimRow {
     pub entity_id: u64,
     pub dimension: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationRow {
+    pub entity_id: u64,
+    pub x: i32,
+    pub z: i32,
+    pub dimension: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRow {
+    pub entity_id: u64,
+    pub resource_id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrowthRow {
+    pub entity_id: u64,
+    pub end_timestamp_micros: i64,
+    pub growth_recipe_id: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -963,16 +1033,48 @@ pub fn decode_inventory_with_fields(
     })
 }
 
-pub fn decode_location_dim_with_fields(
+pub fn decode_location_with_fields(
     row: &[u8],
     fields: &[MirroredField],
     cols: LocationCols,
     schema: &MirroredSchema,
-) -> Result<LocationDimRow> {
+) -> Result<LocationRow> {
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
-    Ok(LocationDimRow {
+    Ok(LocationRow {
         entity_id: cell_u64(&cells[cols.entity_id], "location.entity_id")?,
+        x: cell_i32(&cells[cols.x], "location.x")?,
+        z: cell_i32(&cells[cols.z], "location.z")?,
         dimension: cell_u32(&cells[cols.dimension], "location.dimension")?,
+    })
+}
+
+pub fn decode_resource_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ResourceCols,
+    schema: &MirroredSchema,
+) -> Result<ResourceRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ResourceRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "resource.entity_id")?,
+        resource_id: cell_i32(&cells[cols.resource_id], "resource.resource_id")?,
+    })
+}
+
+pub fn decode_growth_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: GrowthCols,
+    schema: &MirroredSchema,
+) -> Result<GrowthRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(GrowthRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "growth.entity_id")?,
+        end_timestamp_micros: decode_timestamp_micros(
+            &cells[cols.end_timestamp],
+            "growth.end_timestamp",
+        )?,
+        growth_recipe_id: cell_i32(&cells[cols.growth_recipe_id], "growth.growth_recipe_id")?,
     })
 }
 

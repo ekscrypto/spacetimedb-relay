@@ -74,6 +74,7 @@ pub async fn serve(
         .route("/player/:entity_id/housing", get(player_housing))
         .route("/player/:entity_id/skills", get(player_skills))
         .route("/player/:entity_id/crafts", get(player_crafts))
+        .route("/deposits", get(hexite_deposits))
         .with_state(fleet);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -893,6 +894,171 @@ fn respond_player_crafts(headers: &HeaderMap, body: pb::PlayerCrafts) -> Respons
         }))
         .into_response()
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct DepositsQuery {
+    /// Optional region id filter (BitCraft region 1–25).
+    region: Option<u32>,
+}
+
+fn respond_hexite_deposits(headers: &HeaderMap, body: pb::HexiteDepositList) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(body.encode_to_vec())
+    } else {
+        let deposits: Vec<Value> = body
+            .deposits
+            .iter()
+            .map(|d| {
+                let mut map = serde_json::Map::new();
+                map.insert("north".into(), json!(d.north));
+                map.insert("east".into(), json!(d.east));
+                if let Some(id) = d.entity_id {
+                    map.insert("entity_id".into(), json!(id.to_string()));
+                }
+                if let Some(ref name) = d.name {
+                    map.insert("name".into(), json!(name));
+                }
+                if let Some(ref ts) = d.respawn_at {
+                    map.insert("respawn_at".into(), json!(ts));
+                }
+                if let Some(ref status) = d.status {
+                    map.insert("status".into(), json!(status));
+                }
+                if let Some(region) = d.region {
+                    map.insert("region".into(), json!(region));
+                }
+                Value::Object(map)
+            })
+            .collect();
+        no_store_json(json!({
+            "deposits": deposits,
+            "count": body.count,
+        }))
+        .into_response()
+    }
+}
+
+/// Map game coords to BitCraft region id (1–25) on the 5×5 grid.
+/// `region = floor(N / 2560) * 5 + floor(E / 2560) + 1`.
+fn region_of_coords(north: i32, east: i32) -> Option<u32> {
+    if north < 0 || east < 0 {
+        return None;
+    }
+    let row = (north as i64 / 2560).min(4);
+    let col = (east as i64 / 2560).min(4);
+    let region = row * 5 + col + 1;
+    u32::try_from(region).ok()
+}
+
+fn deposit_from_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDeposit> {
+    let i = slot as usize;
+    if !s.resource.has_location[i] {
+        return None;
+    }
+    // Wire convention (matches claim_local / BitJita): x = east, z = north.
+    let east = s.resource.location_x[i];
+    let north = s.resource.location_z[i];
+    let entity_id = s.resource.entity_id[i];
+    let active = s.resource.is_active(slot);
+    let name = format!("Hexite Deposit (N: {north}, E: {east})");
+
+    // Depleted Hexite grows back via public growth_state.end_timestamp
+    // (recipe Depleted → Hexite, 6–8 days). Active deposits have no row.
+    let (respawn_at, status) = if active {
+        (None, None)
+    } else if let Some(end_micros) = s.growth.end_timestamp_micros(entity_id) {
+        (
+            Some(format_rfc3339_millis(end_micros)),
+            None, // timer present ⇒ respawning (client contract)
+        )
+    } else {
+        // Depleted but growth row not yet visible (rare race).
+        (None, Some("respawning".into()))
+    };
+
+    Some(pb::HexiteDeposit {
+        north,
+        east,
+        entity_id: Some(entity_id),
+        name: Some(name),
+        respawn_at,
+        status,
+        region: region_of_coords(north, east).or(Some(s.region)),
+    })
+}
+
+/// Format unix microseconds as `YYYY-MM-DDTHH:MM:SS.mmmZ` (BitJita-compatible).
+fn format_rfc3339_millis(micros: i64) -> String {
+    let millis_total = micros.div_euclid(1000);
+    let secs = millis_total.div_euclid(1000);
+    let millis = (millis_total.rem_euclid(1000)) as u32;
+    let (year, month, day, hour, min, sec) = civil_from_unix_secs(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+/// Civil UTC date/time from unix seconds (proleptic Gregorian).
+fn civil_from_unix_secs(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400) as u32;
+    let hour = tod / 3600;
+    let min = (tod % 3600) / 60;
+    let sec = tod % 60;
+
+    // Howard Hinnant's civil_from_days
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d, hour, min, sec)
+}
+
+async fn hexite_deposits(
+    State(fleet): State<Fleet>,
+    headers: HeaderMap,
+    Query(q): Query<DepositsQuery>,
+) -> Response {
+    let mut deposits = Vec::new();
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready {
+            continue;
+        }
+        if let Some(want) = q.region {
+            if s.region != want {
+                continue;
+            }
+        }
+        for slot in s.resource.iter_slots() {
+            let Some(mut dep) = deposit_from_slot(&s, slot) else {
+                continue;
+            };
+            // Prefer the shard's configured region when coord→region is ambiguous.
+            if dep.region.is_none() {
+                dep.region = Some(s.region);
+            }
+            if let Some(want) = q.region {
+                if dep.region != Some(want) {
+                    continue;
+                }
+            }
+            deposits.push(dep);
+        }
+    }
+    deposits.sort_by(|a, b| {
+        a.north
+            .cmp(&b.north)
+            .then(a.east.cmp(&b.east))
+            .then(a.entity_id.cmp(&b.entity_id))
+    });
+    let count = deposits.len() as i32;
+    respond_hexite_deposits(&headers, pb::HexiteDepositList { deposits, count })
 }
 
 async fn claim_members(
@@ -1957,6 +2123,13 @@ mod tests {
     };
     use crate::store::RegionStore;
     use prost::Message;
+
+    #[test]
+    fn rfc3339_millis_known_instant() {
+        // 2026-07-19T15:35:13.483Z
+        let micros = 1_784_475_313_483_000_i64;
+        assert_eq!(format_rfc3339_millis(micros), "2026-07-19T15:35:13.483Z");
+    }
 
     fn seed_concordia_like(s: &mut RegionStore) {
         // Outdoor chest in overworld (no location row).
