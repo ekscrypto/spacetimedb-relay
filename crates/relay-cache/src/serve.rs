@@ -1207,18 +1207,6 @@ fn respond_hexite_deposits(headers: &HeaderMap, body: pb::HexiteDepositList) -> 
     }
 }
 
-/// Map game coords to BitCraft region id (1–25) on the 5×5 grid.
-/// `region = floor(N / 2560) * 5 + floor(E / 2560) + 1`.
-fn region_of_coords(north: i32, east: i32) -> Option<u32> {
-    if north < 0 || east < 0 {
-        return None;
-    }
-    let row = (north as i64 / 2560).min(4);
-    let col = (east as i64 / 2560).min(4);
-    let region = row * 5 + col + 1;
-    u32::try_from(region).ok()
-}
-
 fn deposit_from_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDeposit> {
     let i = slot as usize;
     if !s.resource.has_location[i] {
@@ -1245,6 +1233,9 @@ fn deposit_from_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDeposit> {
         (None, Some("respawning".into()))
     };
 
+    // Region comes from the shard (one DB per region). World coords are not
+    // on a simple 5×5×2560 grid relative to a shared origin, so deriving
+    // region from N/E mis-tags deposits and breaks `?region=` filtering.
     Some(pb::HexiteDeposit {
         north,
         east,
@@ -1252,7 +1243,7 @@ fn deposit_from_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDeposit> {
         name: Some(name),
         respawn_at,
         status,
-        region: region_of_coords(north, east).or(Some(s.region)),
+        region: Some(s.region),
     })
 }
 
@@ -1304,18 +1295,9 @@ async fn hexite_deposits(
             }
         }
         for slot in s.resource.iter_slots() {
-            let Some(mut dep) = deposit_from_slot(&s, slot) else {
+            let Some(dep) = deposit_from_slot(&s, slot) else {
                 continue;
             };
-            // Prefer the shard's configured region when coord→region is ambiguous.
-            if dep.region.is_none() {
-                dep.region = Some(s.region);
-            }
-            if let Some(want) = q.region {
-                if dep.region != Some(want) {
-                    continue;
-                }
-            }
             deposits.push(dep);
         }
     }
