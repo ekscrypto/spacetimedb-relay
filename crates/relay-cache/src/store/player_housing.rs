@@ -128,6 +128,7 @@ impl PlayerHousingDescStore {
         self.by_rank.len()
     }
 
+    #[allow(dead_code)] // rank catalog still ingested; display uses building_desc
     pub fn name_for_rank(&self, rank: i32) -> Option<&str> {
         self.by_rank.get(&rank).map(|s| s.as_ref())
     }

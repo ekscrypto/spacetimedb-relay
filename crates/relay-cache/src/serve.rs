@@ -2285,6 +2285,40 @@ fn collect_housing_buildings(
     buildings
 }
 
+/// Human-readable house label: prefer a player nickname on the entrance,
+/// otherwise "{username}'s House", always annotated with the catalog type.
+fn house_display_name(username: &str, catalog: &str, nickname: Option<&str>) -> String {
+    let catalog = if catalog.is_empty() {
+        "Player Housing"
+    } else {
+        catalog
+    };
+    match nickname.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(nick) => format!("{nick} ({catalog})"),
+        None if username.is_empty() => catalog.to_owned(),
+        None => format!("{username}'s House ({catalog})"),
+    }
+}
+
+fn entrance_catalog_and_nickname(
+    s: &RegionStore,
+    entrance_building_id: u64,
+) -> (String, Option<String>) {
+    let catalog = s
+        .building
+        .find(entrance_building_id)
+        .map(|slot| s.building.building_description_id[slot as usize])
+        .and_then(|desc_id| s.building_desc.get(desc_id))
+        .unwrap_or("Player Housing")
+        .to_owned();
+    let nickname = s
+        .building_nickname
+        .get(entrance_building_id)
+        .map(str::to_owned)
+        .filter(|n| !n.is_empty());
+    (catalog, nickname)
+}
+
 async fn player_housing(
     State(fleet): State<Fleet>,
     headers: HeaderMap,
@@ -2307,7 +2341,7 @@ async fn player_housing(
     // (mirrored into every region); region_index selects the shard that
     // holds the house's interior buildings. rent_state is empty on the
     // public subscription today, so we must not require it.
-    let mut housing: Option<(u8, u64, u64, i32)> = None;
+    let mut housing: Option<(u8, u64, u64)> = None;
     for shard in &fleet.shards {
         let s = shard.store.read();
         if !s.ready {
@@ -2319,13 +2353,12 @@ async fn player_housing(
                 s.player_housing.region_index[hi],
                 s.player_housing.entrance_building_entity_id[hi],
                 s.player_housing.network_entity_id[hi],
-                s.player_housing.rank[hi],
             ));
             break;
         }
     }
 
-    let Some((region_index, entrance_building_id, network_id, rank)) = housing else {
+    let Some((region_index, entrance_building_id, network_id)) = housing else {
         return respond_player_housing(
             &headers,
             pb::PlayerHousing {
@@ -2347,11 +2380,12 @@ async fn player_housing(
             .dimension_network
             .by_entity_id(network_id)
             .map(|n| n.entrance_dimension_id);
-        let house_name = s
-            .player_housing_desc
-            .name_for_rank(rank)
-            .unwrap_or("Player Housing")
-            .to_owned();
+        let (catalog, nickname) = entrance_catalog_and_nickname(&s, entrance_building_id);
+        let house_name = house_display_name(
+            &player.username,
+            &catalog,
+            nickname.as_deref(),
+        );
         let buildings = match entrance_dimension_id {
             Some(dim) if dim != 0 => collect_housing_buildings(&s, dim),
             _ => Vec::new(),
@@ -2376,10 +2410,10 @@ async fn player_housing(
         &headers,
         pb::PlayerHousing {
             status: "ok".into(),
-            player: Some(player),
+            player: Some(player.clone()),
             house: Some(pb::HouseSummary {
                 entity_id: entrance_building_id,
-                name: "Player Housing".into(),
+                name: house_display_name(&player.username, "Player Housing", None),
                 region: house_region,
             }),
             buildings: Vec::new(),
@@ -2722,6 +2756,22 @@ mod tests {
         assert_eq!(bank.category, "bank");
         assert_eq!(bank.claim_name.as_deref(), Some("Concordia"));
         assert_eq!(bank.items[0].quantity, 3);
+    }
+
+    #[test]
+    fn house_display_name_formats() {
+        assert_eq!(
+            house_display_name("Molly", "Fine Residential House", None),
+            "Molly's House (Fine Residential House)"
+        );
+        assert_eq!(
+            house_display_name("Molly", "Fine Residential House", Some("Lakeside")),
+            "Lakeside (Fine Residential House)"
+        );
+        assert_eq!(
+            house_display_name("", "Fine Residential House", None),
+            "Fine Residential House"
+        );
     }
 
     #[test]
