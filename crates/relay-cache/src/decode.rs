@@ -27,6 +27,11 @@ use serde_json::Value;
 use crate::store::Pocket;
 
 pub const CLAIM_TABLE: &str = "claim_state";
+pub const CLAIM_LOCAL_TABLE: &str = "claim_local_state";
+pub const CLAIM_MEMBER_TABLE: &str = "claim_member_state";
+pub const CLAIM_TECH_STATE_TABLE: &str = "claim_tech_state";
+pub const CLAIM_TECH_DESC_TABLE: &str = "claim_tech_desc";
+pub const CLAIM_TILE_COST_TABLE: &str = "claim_tile_cost";
 pub const BUILDING_TABLE: &str = "building_state";
 pub const INVENTORY_TABLE: &str = "inventory_state";
 pub const BUILDING_DESC_TABLE: &str = "building_desc";
@@ -39,6 +44,8 @@ pub const DEPLOYABLE_DESC_TABLE: &str = "deployable_desc";
 pub const PLAYER_HOUSING_TABLE: &str = "player_housing_state";
 pub const PLAYER_HOUSING_DESC_TABLE: &str = "player_housing_desc";
 pub const RENT_TABLE: &str = "rent_state";
+pub const EXPERIENCE_TABLE: &str = "experience_state";
+pub const SKILL_DESC_TABLE: &str = "skill_desc";
 
 /// Overworld dimension id used when a building has no interior location row.
 pub const OVERWORLD_DIMENSION: u32 = 1;
@@ -51,6 +58,73 @@ pub struct ClaimCols {
     pub owner_building_entity_id: usize,
     pub name: usize,
     pub neutral: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ClaimLocalCols {
+    pub entity_id: usize,
+    pub supplies: usize,
+    pub building_maintenance: usize,
+    pub num_tiles: usize,
+    pub location: usize,
+    pub treasury: usize,
+    pub supplies_purchase_threshold: usize,
+    pub supplies_purchase_price: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ClaimMemberCols {
+    pub entity_id: usize,
+    pub claim_entity_id: usize,
+    pub player_entity_id: usize,
+    pub user_name: usize,
+    pub inventory_permission: usize,
+    pub build_permission: usize,
+    pub officer_permission: usize,
+    pub co_owner_permission: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ClaimTechStateCols {
+    pub entity_id: usize,
+    pub learned: usize,
+    pub researching: usize,
+    pub start_timestamp: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ClaimTechDescCols {
+    pub id: usize,
+    pub name: usize,
+    pub description: usize,
+    pub tier: usize,
+    pub tech_type: usize,
+    pub supplies_cost: usize,
+    pub research_time: usize,
+    pub requirements: usize,
+    pub members: usize,
+    pub area: usize,
+    pub unlocks_techs: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ClaimTileCostCols {
+    pub tile_count: usize,
+    pub cost_per_tile: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExperienceCols {
+    pub entity_id: usize,
+    pub experience_stacks: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct SkillDescCols {
+    pub id: usize,
+    pub name: usize,
+    pub title: usize,
+    pub max_level: usize,
 }
 
 /// Resolved column indices for `building_state`.
@@ -156,6 +230,11 @@ pub struct RentCols {
 /// shared schema.
 pub struct ColMaps {
     pub claim: ClaimCols,
+    pub claim_local: ClaimLocalCols,
+    pub claim_member: ClaimMemberCols,
+    pub claim_tech_state: ClaimTechStateCols,
+    pub claim_tech_desc: ClaimTechDescCols,
+    pub claim_tile_cost: ClaimTileCostCols,
     pub building: BuildingCols,
     pub inventory: InventoryCols,
     pub building_desc: BuildingDescCols,
@@ -168,6 +247,8 @@ pub struct ColMaps {
     pub player_housing: PlayerHousingCols,
     pub player_housing_desc: PlayerHousingDescCols,
     pub rent: RentCols,
+    pub experience: ExperienceCols,
+    pub skill_desc: SkillDescCols,
 }
 
 /// Resolve column indices for the tables we hold. Errors if any expected
@@ -175,6 +256,11 @@ pub struct ColMaps {
 pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
     Ok(ColMaps {
         claim: resolve_claim_cols(schema)?,
+        claim_local: resolve_claim_local_cols(schema)?,
+        claim_member: resolve_claim_member_cols(schema)?,
+        claim_tech_state: resolve_claim_tech_state_cols(schema)?,
+        claim_tech_desc: resolve_claim_tech_desc_cols(schema)?,
+        claim_tile_cost: resolve_claim_tile_cost_cols(schema)?,
         building: resolve_building_cols(schema)?,
         inventory: resolve_inventory_cols(schema)?,
         building_desc: resolve_building_desc_cols(schema)?,
@@ -187,6 +273,8 @@ pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
         player_housing: resolve_player_housing_cols(schema)?,
         player_housing_desc: resolve_player_housing_desc_cols(schema)?,
         rent: resolve_rent_cols(schema)?,
+        experience: resolve_experience_cols(schema)?,
+        skill_desc: resolve_skill_desc_cols(schema)?,
     })
 }
 
@@ -222,6 +310,91 @@ fn resolve_claim_cols(schema: &MirroredSchema) -> Result<ClaimCols> {
         owner_building_entity_id: find_field(f, "owner_building_entity_id", CLAIM_TABLE)?,
         name: find_field(f, "name", CLAIM_TABLE)?,
         neutral: find_field(f, "neutral", CLAIM_TABLE)?,
+    })
+}
+
+fn resolve_claim_local_cols(schema: &MirroredSchema) -> Result<ClaimLocalCols> {
+    let f = fields_of(schema, CLAIM_LOCAL_TABLE)?;
+    Ok(ClaimLocalCols {
+        entity_id: find_field(f, "entity_id", CLAIM_LOCAL_TABLE)?,
+        supplies: find_field(f, "supplies", CLAIM_LOCAL_TABLE)?,
+        building_maintenance: find_field(f, "building_maintenance", CLAIM_LOCAL_TABLE)?,
+        num_tiles: find_field(f, "num_tiles", CLAIM_LOCAL_TABLE)?,
+        location: find_field(f, "location", CLAIM_LOCAL_TABLE)?,
+        treasury: find_field(f, "treasury", CLAIM_LOCAL_TABLE)?,
+        supplies_purchase_threshold: find_field(
+            f,
+            "supplies_purchase_threshold",
+            CLAIM_LOCAL_TABLE,
+        )?,
+        supplies_purchase_price: find_field(f, "supplies_purchase_price", CLAIM_LOCAL_TABLE)?,
+    })
+}
+
+fn resolve_claim_member_cols(schema: &MirroredSchema) -> Result<ClaimMemberCols> {
+    let f = fields_of(schema, CLAIM_MEMBER_TABLE)?;
+    Ok(ClaimMemberCols {
+        entity_id: find_field(f, "entity_id", CLAIM_MEMBER_TABLE)?,
+        claim_entity_id: find_field(f, "claim_entity_id", CLAIM_MEMBER_TABLE)?,
+        player_entity_id: find_field(f, "player_entity_id", CLAIM_MEMBER_TABLE)?,
+        user_name: find_field(f, "user_name", CLAIM_MEMBER_TABLE)?,
+        inventory_permission: find_field(f, "inventory_permission", CLAIM_MEMBER_TABLE)?,
+        build_permission: find_field(f, "build_permission", CLAIM_MEMBER_TABLE)?,
+        officer_permission: find_field(f, "officer_permission", CLAIM_MEMBER_TABLE)?,
+        co_owner_permission: find_field(f, "co_owner_permission", CLAIM_MEMBER_TABLE)?,
+    })
+}
+
+fn resolve_claim_tech_state_cols(schema: &MirroredSchema) -> Result<ClaimTechStateCols> {
+    let f = fields_of(schema, CLAIM_TECH_STATE_TABLE)?;
+    Ok(ClaimTechStateCols {
+        entity_id: find_field(f, "entity_id", CLAIM_TECH_STATE_TABLE)?,
+        learned: find_field(f, "learned", CLAIM_TECH_STATE_TABLE)?,
+        researching: find_field(f, "researching", CLAIM_TECH_STATE_TABLE)?,
+        start_timestamp: find_field(f, "start_timestamp", CLAIM_TECH_STATE_TABLE)?,
+    })
+}
+
+fn resolve_claim_tech_desc_cols(schema: &MirroredSchema) -> Result<ClaimTechDescCols> {
+    let f = fields_of(schema, CLAIM_TECH_DESC_TABLE)?;
+    Ok(ClaimTechDescCols {
+        id: find_field(f, "id", CLAIM_TECH_DESC_TABLE)?,
+        name: find_field(f, "name", CLAIM_TECH_DESC_TABLE)?,
+        description: find_field(f, "description", CLAIM_TECH_DESC_TABLE)?,
+        tier: find_field(f, "tier", CLAIM_TECH_DESC_TABLE)?,
+        tech_type: find_field(f, "tech_type", CLAIM_TECH_DESC_TABLE)?,
+        supplies_cost: find_field(f, "supplies_cost", CLAIM_TECH_DESC_TABLE)?,
+        research_time: find_field(f, "research_time", CLAIM_TECH_DESC_TABLE)?,
+        requirements: find_field(f, "requirements", CLAIM_TECH_DESC_TABLE)?,
+        members: find_field(f, "members", CLAIM_TECH_DESC_TABLE)?,
+        area: find_field(f, "area", CLAIM_TECH_DESC_TABLE)?,
+        unlocks_techs: find_field(f, "unlocks_techs", CLAIM_TECH_DESC_TABLE)?,
+    })
+}
+
+fn resolve_claim_tile_cost_cols(schema: &MirroredSchema) -> Result<ClaimTileCostCols> {
+    let f = fields_of(schema, CLAIM_TILE_COST_TABLE)?;
+    Ok(ClaimTileCostCols {
+        tile_count: find_field(f, "tile_count", CLAIM_TILE_COST_TABLE)?,
+        cost_per_tile: find_field(f, "cost_per_tile", CLAIM_TILE_COST_TABLE)?,
+    })
+}
+
+fn resolve_experience_cols(schema: &MirroredSchema) -> Result<ExperienceCols> {
+    let f = fields_of(schema, EXPERIENCE_TABLE)?;
+    Ok(ExperienceCols {
+        entity_id: find_field(f, "entity_id", EXPERIENCE_TABLE)?,
+        experience_stacks: find_field(f, "experience_stacks", EXPERIENCE_TABLE)?,
+    })
+}
+
+fn resolve_skill_desc_cols(schema: &MirroredSchema) -> Result<SkillDescCols> {
+    let f = fields_of(schema, SKILL_DESC_TABLE)?;
+    Ok(SkillDescCols {
+        id: find_field(f, "id", SKILL_DESC_TABLE)?,
+        name: find_field(f, "name", SKILL_DESC_TABLE)?,
+        title: find_field(f, "title", SKILL_DESC_TABLE)?,
+        max_level: find_field(f, "max_level", SKILL_DESC_TABLE)?,
     })
 }
 
@@ -463,6 +636,77 @@ pub struct RentRow {
     pub claim_entity_id: u64,
     pub white_list: Box<[u64]>,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimLocalRow {
+    pub entity_id: u64,
+    pub supplies: i32,
+    pub building_maintenance: f32,
+    pub num_tiles: i32,
+    pub treasury: u32,
+    pub supplies_purchase_threshold: u32,
+    pub supplies_purchase_price: f32,
+    pub location_x: i32,
+    pub location_z: i32,
+    pub location_dimension: u32,
+    pub has_location: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimMemberRow {
+    pub entity_id: u64,
+    pub claim_entity_id: u64,
+    pub player_entity_id: u64,
+    pub user_name: String,
+    pub inventory_permission: bool,
+    pub build_permission: bool,
+    pub officer_permission: bool,
+    pub co_owner_permission: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimTechStateRow {
+    pub entity_id: u64,
+    pub learned: Box<[i32]>,
+    pub researching: i32,
+    pub start_timestamp_micros: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimTechDescRow {
+    pub id: i32,
+    pub name: String,
+    pub description: String,
+    pub tier: i32,
+    pub tech_type: String,
+    pub supplies_cost: i32,
+    pub research_time: i32,
+    pub requirements: Box<[i32]>,
+    pub members: i32,
+    pub area: i32,
+    pub unlocks_techs: Box<[i32]>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimTileCostRow {
+    pub tile_count: i32,
+    pub cost_per_tile: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperienceRow {
+    pub entity_id: u64,
+    /// `(skill_id, xp quantity)` stacks.
+    pub stacks: Box<[(i32, i32)]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDescRow {
+    pub id: i32,
+    pub name: String,
+    pub title: String,
+    pub max_level: i32,
 }
 
 // --- Decoders ---
@@ -739,6 +983,157 @@ pub fn decode_rent_with_fields(
     })
 }
 
+pub fn decode_claim_local_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ClaimLocalCols,
+    schema: &MirroredSchema,
+) -> Result<ClaimLocalRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    let (has_location, location_x, location_z, location_dimension) =
+        decode_optional_location(&cells[cols.location])?;
+    Ok(ClaimLocalRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "claim_local.entity_id")?,
+        supplies: cell_i32(&cells[cols.supplies], "claim_local.supplies")?,
+        building_maintenance: cell_f32(
+            &cells[cols.building_maintenance],
+            "claim_local.building_maintenance",
+        )?,
+        num_tiles: cell_i32(&cells[cols.num_tiles], "claim_local.num_tiles")?,
+        treasury: cell_u32(&cells[cols.treasury], "claim_local.treasury")?,
+        supplies_purchase_threshold: cell_u32(
+            &cells[cols.supplies_purchase_threshold],
+            "claim_local.supplies_purchase_threshold",
+        )?,
+        supplies_purchase_price: cell_f32(
+            &cells[cols.supplies_purchase_price],
+            "claim_local.supplies_purchase_price",
+        )?,
+        location_x,
+        location_z,
+        location_dimension,
+        has_location,
+    })
+}
+
+pub fn decode_claim_member_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ClaimMemberCols,
+    schema: &MirroredSchema,
+) -> Result<ClaimMemberRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ClaimMemberRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "claim_member.entity_id")?,
+        claim_entity_id: cell_u64(&cells[cols.claim_entity_id], "claim_member.claim_entity_id")?,
+        player_entity_id: cell_u64(
+            &cells[cols.player_entity_id],
+            "claim_member.player_entity_id",
+        )?,
+        user_name: cell_string(&cells[cols.user_name], "claim_member.user_name")?,
+        inventory_permission: cell_bool(
+            &cells[cols.inventory_permission],
+            "claim_member.inventory_permission",
+        )?,
+        build_permission: cell_bool(
+            &cells[cols.build_permission],
+            "claim_member.build_permission",
+        )?,
+        officer_permission: cell_bool(
+            &cells[cols.officer_permission],
+            "claim_member.officer_permission",
+        )?,
+        co_owner_permission: cell_bool(
+            &cells[cols.co_owner_permission],
+            "claim_member.co_owner_permission",
+        )?,
+    })
+}
+
+pub fn decode_claim_tech_state_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ClaimTechStateCols,
+    schema: &MirroredSchema,
+) -> Result<ClaimTechStateRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ClaimTechStateRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "claim_tech_state.entity_id")?,
+        learned: decode_i32_array(&cells[cols.learned], "claim_tech_state.learned")?,
+        researching: cell_i32(&cells[cols.researching], "claim_tech_state.researching")?,
+        start_timestamp_micros: decode_timestamp_micros(
+            &cells[cols.start_timestamp],
+            "claim_tech_state.start_timestamp",
+        )?,
+    })
+}
+
+pub fn decode_claim_tech_desc_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ClaimTechDescCols,
+    schema: &MirroredSchema,
+) -> Result<ClaimTechDescRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ClaimTechDescRow {
+        id: cell_i32(&cells[cols.id], "claim_tech_desc.id")?,
+        name: cell_string(&cells[cols.name], "claim_tech_desc.name")?,
+        description: cell_string(&cells[cols.description], "claim_tech_desc.description")?,
+        tier: cell_i32(&cells[cols.tier], "claim_tech_desc.tier")?,
+        tech_type: sum_variant_snake(&cells[cols.tech_type], "claim_tech_desc.tech_type")?,
+        supplies_cost: cell_i32(&cells[cols.supplies_cost], "claim_tech_desc.supplies_cost")?,
+        research_time: cell_i32(&cells[cols.research_time], "claim_tech_desc.research_time")?,
+        requirements: decode_i32_array(&cells[cols.requirements], "claim_tech_desc.requirements")?,
+        members: cell_i32(&cells[cols.members], "claim_tech_desc.members")?,
+        area: cell_i32(&cells[cols.area], "claim_tech_desc.area")?,
+        unlocks_techs: decode_i32_array(
+            &cells[cols.unlocks_techs],
+            "claim_tech_desc.unlocks_techs",
+        )?,
+    })
+}
+
+pub fn decode_claim_tile_cost_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ClaimTileCostCols,
+    schema: &MirroredSchema,
+) -> Result<ClaimTileCostRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ClaimTileCostRow {
+        tile_count: cell_i32(&cells[cols.tile_count], "claim_tile_cost.tile_count")?,
+        cost_per_tile: cell_f32(&cells[cols.cost_per_tile], "claim_tile_cost.cost_per_tile")?,
+    })
+}
+
+pub fn decode_experience_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ExperienceCols,
+    schema: &MirroredSchema,
+) -> Result<ExperienceRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ExperienceRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "experience.entity_id")?,
+        stacks: decode_experience_stacks(&cells[cols.experience_stacks])?,
+    })
+}
+
+pub fn decode_skill_desc_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: SkillDescCols,
+    schema: &MirroredSchema,
+) -> Result<SkillDescRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(SkillDescRow {
+        id: cell_i32(&cells[cols.id], "skill_desc.id")?,
+        name: cell_string(&cells[cols.name], "skill_desc.name")?,
+        title: cell_string(&cells[cols.title], "skill_desc.title")?,
+        max_level: cell_i32(&cells[cols.max_level], "skill_desc.max_level")?,
+    })
+}
+
 /// `Array<U64>` is rendered as JSON array of hex-encoded LE byte strings.
 fn decode_u64_array(cell: &Cell, ctx: &str) -> Result<Box<[u64]>> {
     let json = cell_json(cell)?;
@@ -850,6 +1245,112 @@ fn cell_json(cell: &Cell) -> Result<&Value> {
         Cell::Jsonb(v) => Ok(v),
         _ => bail!("expected Jsonb, got {cell:?}"),
     }
+}
+
+fn cell_f32(cell: &Cell, ctx: &str) -> Result<f32> {
+    match cell {
+        Cell::Real(Some(n)) => Ok(*n),
+        Cell::Real(None) => bail!("{ctx}: Real is NULL"),
+        Cell::DoublePrecision(Some(n)) => Ok(*n as f32),
+        other => bail!("{ctx}: expected Real, got {other:?}"),
+    }
+}
+
+/// `Option<{x,z,dimension}>` rendered as `{"some":{...}}` / `{"none":{}}`.
+fn decode_optional_location(cell: &Cell) -> Result<(bool, i32, i32, u32)> {
+    let json = cell_json(cell)?;
+    let Value::Object(obj) = json else {
+        bail!("claim_local.location is not an object: {json}");
+    };
+    if let Some(inner) = obj.get("some") {
+        let Value::Object(loc) = inner else {
+            bail!("claim_local.location.some is not an object: {inner}");
+        };
+        let x = json_i32(loc.get("x"), "location.x")?;
+        let z = json_i32(loc.get("z"), "location.z")?;
+        let dimension = loc
+            .get("dimension")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("location.dimension missing"))?;
+        let dimension = u32::try_from(dimension).map_err(|_| anyhow!("location.dimension overflow"))?;
+        return Ok((true, x, z, dimension));
+    }
+    Ok((false, 0, 0, 0))
+}
+
+fn decode_i32_array(cell: &Cell, ctx: &str) -> Result<Box<[i32]>> {
+    let json = cell_json(cell)?;
+    let Value::Array(arr) = json else {
+        bail!("{ctx}: expected JSON array, got {json}");
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let n = v
+            .as_i64()
+            .ok_or_else(|| anyhow!("{ctx}[{i}]: expected i64, got {v}"))?;
+        out.push(i32::try_from(n).map_err(|_| anyhow!("{ctx}[{i}]: i32 overflow"))?);
+    }
+    Ok(out.into())
+}
+
+fn decode_timestamp_micros(cell: &Cell, ctx: &str) -> Result<i64> {
+    match cell {
+        Cell::Bigint(Some(n)) => Ok(*n),
+        Cell::Jsonb(Value::Object(obj)) => {
+            if let Some(v) = obj.get("__timestamp_micros_since_unix_epoch__") {
+                return v
+                    .as_i64()
+                    .ok_or_else(|| anyhow!("{ctx}: timestamp not i64"));
+            }
+            bail!("{ctx}: unexpected timestamp object {obj:?}")
+        }
+        other => bail!("{ctx}: expected timestamp, got {other:?}"),
+    }
+}
+
+/// Sum unit variants decode as `{"VariantName":{}}` → snake_case label.
+fn sum_variant_snake(cell: &Cell, ctx: &str) -> Result<String> {
+    let json = cell_json(cell)?;
+    let Value::Object(obj) = json else {
+        bail!("{ctx}: expected object, got {json}");
+    };
+    let key = obj
+        .keys()
+        .next()
+        .ok_or_else(|| anyhow!("{ctx}: empty sum object"))?;
+    Ok(pascal_to_snake(key))
+}
+
+fn pascal_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn decode_experience_stacks(cell: &Cell) -> Result<Box<[(i32, i32)]>> {
+    let json = cell_json(cell)?;
+    let Value::Array(arr) = json else {
+        bail!("experience_stacks is not a JSON array: {json}");
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let Value::Object(obj) = entry else {
+            bail!("experience stack is not an object: {entry}");
+        };
+        let skill_id = json_i32(obj.get("skill_id"), "stack.skill_id")?;
+        let quantity = json_i32(obj.get("quantity"), "stack.quantity")?;
+        out.push((skill_id, quantity));
+    }
+    Ok(out.into())
 }
 
 /// Read a `Cell::Bytea(8 bytes LE)` as `u64`. The relay-protocol decoder

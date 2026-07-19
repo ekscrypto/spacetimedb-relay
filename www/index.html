@@ -397,12 +397,16 @@
           </td>
           <td>
             Claim cache (<code>relay-cache</code>): readiness plus
-            claim lookup by PK or name substring, and per-claim inventory
-            grouped by dimension (overworld + building interiors).
-            Town Banks are omitted.
+            claim lookup by PK or name substring (PK includes supplies,
+            upkeep, tier, researched techs, owner username), per-claim
+            inventory, members, citizens (skill levels), and hexcoin
+            totals. Town Banks are omitted from inventory.
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/cache-health</div>
             <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/claim?name=concordia'</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/inventory</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/members</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/citizens</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/hexcoins</div>
           </td>
           <td>
             <code>name</code> (substring, for <code>/claim</code>)
@@ -416,13 +420,14 @@
             Player cache (<code>relay-cache</code>): username search,
             personal inventories (pockets / bank / wagon / cache /
             recovery / deployable &mdash; Toolbelt and Wallet omitted),
-            and first-house contents resolved server-side from the
+            first-house contents resolved server-side from the
             player id (<code>status</code> is <code>ok</code> or
-            <code>noHouse</code>).
+            <code>noHouse</code>), and skill levels.
             <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/player?name=maple'</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;/inventory</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;/housing</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/player/&lt;id&gt;/skills</div>
           </td>
           <td>
             <code>name</code> (substring, for <code>/player</code>;

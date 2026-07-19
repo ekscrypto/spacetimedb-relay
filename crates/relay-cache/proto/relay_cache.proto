@@ -10,6 +10,39 @@ message Claim {
   uint64 owner_building_entity_id = 4;
   bool neutral = 5;
   uint32 region = 6;
+  // Enrichment fields (populated on PK lookup; search may set tier + owner username).
+  optional string owner_player_username = 7;
+  optional int32 supplies = 8;
+  optional uint32 treasury = 9;
+  optional float building_maintenance = 10;
+  optional int32 num_tiles = 11;
+  optional float tile_cost = 12;
+  optional double upkeep_cost = 13;
+  // Unix milliseconds.
+  optional int64 supplies_run_out = 14;
+  optional uint32 supplies_purchase_threshold = 15;
+  optional float supplies_purchase_price = 16;
+  optional int32 location_x = 17;
+  optional int32 location_z = 18;
+  optional uint32 location_dimension = 19;
+  optional int32 tier = 20;
+  optional int32 tech_researching = 21;
+  optional int64 tech_start_timestamp = 22;
+  repeated ResearchedTech researched_techs = 23;
+}
+
+message ResearchedTech {
+  int32 id = 1;
+  string name = 2;
+  string description = 3;
+  int32 tier = 4;
+  string tech_type = 5;
+  int32 supplies_cost = 6;
+  int32 research_time = 7;
+  repeated int32 requirements = 8;
+  int32 members = 9;
+  int32 area = 10;
+  repeated int32 unlocks_techs = 11;
 }
 
 // Wrapper for GET /claim?name=… (JSON returns a bare array).
@@ -54,6 +87,70 @@ message DimensionGroup {
 message ClaimInventory {
   ClaimSummary claim = 1;
   repeated DimensionGroup dimensions = 2;
+}
+
+message ClaimMember {
+  uint64 entity_id = 1;
+  uint64 claim_entity_id = 2;
+  uint64 player_entity_id = 3;
+  string user_name = 4;
+  bool inventory_permission = 5;
+  bool build_permission = 6;
+  bool officer_permission = 7;
+  bool co_owner_permission = 8;
+}
+
+message ClaimMemberList {
+  ClaimSummary claim = 1;
+  repeated ClaimMember members = 2;
+  int32 count = 3;
+}
+
+message CitizenSkill {
+  int32 skill_id = 1;
+  int64 level = 2;
+  int64 xp = 3;
+}
+
+message ClaimCitizen {
+  uint64 entity_id = 1;
+  string user_name = 2;
+  repeated CitizenSkill skills = 3;
+}
+
+message SkillNameEntry {
+  int32 skill_id = 1;
+  string name = 2;
+}
+
+message ClaimCitizens {
+  ClaimSummary claim = 1;
+  repeated ClaimCitizen citizens = 2;
+  repeated SkillNameEntry skill_names = 3;
+}
+
+message PlayerSkill {
+  int32 skill_id = 1;
+  string name = 2;
+  int64 level = 3;
+  int64 xp = 4;
+}
+
+message PlayerSkills {
+  Player player = 1;
+  repeated PlayerSkill skills = 2;
+}
+
+message MemberHexcoins {
+  uint64 player_entity_id = 1;
+  string user_name = 2;
+  int64 hexcoins = 3;
+  bool has_storage_access = 4;
+}
+
+message ClaimHexcoins {
+  ClaimSummary claim = 1;
+  repeated MemberHexcoins members = 2;
 }
 
 // Mirrors GET /player/:entity_id and name-search hits.

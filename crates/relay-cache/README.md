@@ -30,10 +30,10 @@ On the relay host, defaults discover regions from
 Loopback (on the relay host):
 
 ```sh
-# Claim by PK
+# Claim by PK (enriched: supplies, upkeep, tier, researched_techs, …)
 curl -s http://127.0.0.1:8089/claim/1234567890
 
-# Claim by name substring (case-insensitive)
+# Claim by name substring (case-insensitive; includes tier + owner username)
 curl -s 'http://127.0.0.1:8089/claim?name=concordia'
 
 # Per-building inventory rollup, grouped by dimension (overworld +
@@ -45,6 +45,15 @@ curl -s http://127.0.0.1:8089/claim/1234567890/inventory
 #      { "dimension_id": 1649, "kind": "building_interior",
 #        "entrance": { "entity_id", "name", "nickname" }, "buildings": [...] }
 #    ] }
+
+# Claim member roster (permissions + usernames)
+curl -s http://127.0.0.1:8089/claim/1234567890/members
+
+# Claim citizens: members joined to skill levels + skill_names map
+curl -s http://127.0.0.1:8089/claim/1234567890/citizens
+
+# Per-member Hex Coin totals (item_id == 1 across personal bags)
+curl -s http://127.0.0.1:8089/claim/1234567890/hexcoins
 
 # Player by name substring (case-insensitive; clients should send ≥2 chars)
 curl -s 'http://127.0.0.1:8089/player?name=maple'
@@ -66,6 +75,9 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/housing
 # → { "status": "ok"|"noHouse", "player": {...},
 #     "house": { "entity_id", "name", "region" } | null,
 #     "buildings": [ { "entity_id", "name", "nickname", "items": [...] } ] }
+
+# Player skill levels (from experience_state + vendored XP thresholds)
+curl -s http://127.0.0.1:8089/player/1297036692699996362/skills
 
 # Health / readiness (always JSON)
 curl -s http://127.0.0.1:8089/cache-health
@@ -89,6 +101,8 @@ curl -sH 'Accept: application/x-protobuf' \
   http://127.0.0.1:8089/player/1297036692699996362/inventory -o player-inv.pb
 curl -sH 'Accept: application/x-protobuf' \
   http://127.0.0.1:8089/player/1297036692699996362/housing -o player-housing.pb
+curl -sH 'Accept: application/x-protobuf' \
+  http://127.0.0.1:8089/player/1297036692699996362/skills -o player-skills.pb
 ```
 
 Public (nginx on `relay.bitcraftsync.app` → loopback `:8089`; see
@@ -100,9 +114,13 @@ curl -s https://relay.bitcraftsync.app/proto
 curl -sO https://relay.bitcraftsync.app/proto/relay_cache.proto
 curl -s 'https://relay.bitcraftsync.app/claim?name=concordia'
 curl -s https://relay.bitcraftsync.app/claim/1234567890/inventory
+curl -s https://relay.bitcraftsync.app/claim/1234567890/members
+curl -s https://relay.bitcraftsync.app/claim/1234567890/citizens
+curl -s https://relay.bitcraftsync.app/claim/1234567890/hexcoins
 curl -s 'https://relay.bitcraftsync.app/player?name=maple'
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/inventory
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/housing
+curl -s https://relay.bitcraftsync.app/player/1297036692699996362/skills
 curl -sH 'Accept: application/x-protobuf' \
   https://relay.bitcraftsync.app/claim/1234567890/inventory -o inventory.pb
 ```
@@ -111,5 +129,5 @@ curl -sH 'Accept: application/x-protobuf' \
 
 The ceiling is an alarm, not a load shedder. Approaching it logs a warning
 and flips `/cache-health` `ready=false`, but queries keep serving with whatever
-data is loaded. Projected resident grows with player/deployable/rent
-tables on top of the prior claim/inventory set.
+data is loaded. Projected resident grows with player/deployable/rent/
+`experience_state` tables on top of the prior claim/inventory set.

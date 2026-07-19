@@ -16,10 +16,11 @@ use spacetimedb_client_api_messages::websocket::v2::{
 use url::Url;
 
 use crate::decode::{
-    self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_TABLE,
-    DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE, INVENTORY_TABLE,
-    LOCATION_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_USERNAME_TABLE,
-    RENT_TABLE,
+    self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_LOCAL_TABLE,
+    CLAIM_MEMBER_TABLE, CLAIM_TABLE, CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE,
+    CLAIM_TILE_COST_TABLE, DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE,
+    EXPERIENCE_TABLE, INVENTORY_TABLE, LOCATION_TABLE, PLAYER_HOUSING_DESC_TABLE,
+    PLAYER_HOUSING_TABLE, PLAYER_USERNAME_TABLE, RENT_TABLE, SKILL_DESC_TABLE,
 };
 use crate::store::RegionStore;
 use crate::wire;
@@ -40,6 +41,11 @@ pub struct ShardHandle {
 struct TableMeta {
     cols: ColMaps,
     claim_fields: Vec<MirroredField>,
+    claim_local_fields: Vec<MirroredField>,
+    claim_member_fields: Vec<MirroredField>,
+    claim_tech_state_fields: Vec<MirroredField>,
+    claim_tech_desc_fields: Vec<MirroredField>,
+    claim_tile_cost_fields: Vec<MirroredField>,
     building_fields: Vec<MirroredField>,
     inventory_fields: Vec<MirroredField>,
     building_desc_fields: Vec<MirroredField>,
@@ -52,6 +58,8 @@ struct TableMeta {
     player_housing_fields: Vec<MirroredField>,
     player_housing_desc_fields: Vec<MirroredField>,
     rent_fields: Vec<MirroredField>,
+    experience_fields: Vec<MirroredField>,
+    skill_desc_fields: Vec<MirroredField>,
 }
 
 impl TableMeta {
@@ -60,6 +68,11 @@ impl TableMeta {
         Ok(Self {
             cols,
             claim_fields: fields_owned(schema, CLAIM_TABLE)?,
+            claim_local_fields: fields_owned(schema, CLAIM_LOCAL_TABLE)?,
+            claim_member_fields: fields_owned(schema, CLAIM_MEMBER_TABLE)?,
+            claim_tech_state_fields: fields_owned(schema, CLAIM_TECH_STATE_TABLE)?,
+            claim_tech_desc_fields: fields_owned(schema, CLAIM_TECH_DESC_TABLE)?,
+            claim_tile_cost_fields: fields_owned(schema, CLAIM_TILE_COST_TABLE)?,
             building_fields: fields_owned(schema, BUILDING_TABLE)?,
             inventory_fields: fields_owned(schema, INVENTORY_TABLE)?,
             building_desc_fields: fields_owned(schema, BUILDING_DESC_TABLE)?,
@@ -72,6 +85,8 @@ impl TableMeta {
             player_housing_fields: fields_owned(schema, PLAYER_HOUSING_TABLE)?,
             player_housing_desc_fields: fields_owned(schema, PLAYER_HOUSING_DESC_TABLE)?,
             rent_fields: fields_owned(schema, RENT_TABLE)?,
+            experience_fields: fields_owned(schema, EXPERIENCE_TABLE)?,
+            skill_desc_fields: fields_owned(schema, SKILL_DESC_TABLE)?,
         })
     }
 }
@@ -201,6 +216,11 @@ async fn session(
 
     let queries = vec![
         format!("SELECT * FROM {CLAIM_TABLE}"),
+        format!("SELECT * FROM {CLAIM_LOCAL_TABLE}"),
+        format!("SELECT * FROM {CLAIM_MEMBER_TABLE}"),
+        format!("SELECT * FROM {CLAIM_TECH_STATE_TABLE}"),
+        format!("SELECT * FROM {CLAIM_TECH_DESC_TABLE}"),
+        format!("SELECT * FROM {CLAIM_TILE_COST_TABLE}"),
         format!("SELECT * FROM {BUILDING_TABLE}"),
         format!("SELECT * FROM {INVENTORY_TABLE}"),
         format!("SELECT * FROM {BUILDING_DESC_TABLE}"),
@@ -215,6 +235,8 @@ async fn session(
         format!("SELECT * FROM {PLAYER_HOUSING_TABLE}"),
         format!("SELECT * FROM {PLAYER_HOUSING_DESC_TABLE}"),
         format!("SELECT * FROM {RENT_TABLE}"),
+        format!("SELECT * FROM {EXPERIENCE_TABLE}"),
+        format!("SELECT * FROM {SKILL_DESC_TABLE}"),
     ];
     wire::send_subscribe(&mut conn, 1, 1, queries).await?;
 
@@ -222,6 +244,11 @@ async fn session(
     match bulk_load(region, schema, meta, &sa) {
         Ok(fresh) => {
             let n_claim = fresh.claim.len();
+            let n_claim_local = fresh.claim_local.len();
+            let n_claim_member = fresh.claim_member.len();
+            let n_claim_tech_state = fresh.claim_tech_state.len();
+            let n_claim_tech_desc = fresh.claim_tech_desc.len();
+            let n_claim_tile_cost = fresh.claim_tile_cost.len();
             let n_building = fresh.building.len();
             let n_inventory = fresh.inventory.len();
             let n_building_desc = fresh.building_desc.len();
@@ -234,6 +261,8 @@ async fn session(
             let n_player_housing = fresh.player_housing.len();
             let n_player_housing_desc = fresh.player_housing_desc.len();
             let n_rent = fresh.rent.len();
+            let n_experience = fresh.experience.len();
+            let n_skill_desc = fresh.skill_desc.len();
             {
                 let mut guard = store.write();
                 *guard = fresh;
@@ -242,6 +271,11 @@ async fn session(
                 target: "relay_cache::shard",
                 region,
                 n_claim,
+                n_claim_local,
+                n_claim_member,
+                n_claim_tech_state,
+                n_claim_tech_desc,
+                n_claim_tile_cost,
                 n_building,
                 n_inventory,
                 n_building_desc,
@@ -254,6 +288,8 @@ async fn session(
                 n_player_housing,
                 n_player_housing_desc,
                 n_rent,
+                n_experience,
+                n_skill_desc,
                 "SubscribeApplied loaded"
             );
         }
@@ -645,6 +681,146 @@ fn apply_rows(
                     schema,
                 )?;
                 store.rent.upsert(decoded);
+            }
+        }
+        CLAIM_LOCAL_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_claim_local_with_fields(
+                    row,
+                    &meta.claim_local_fields,
+                    meta.cols.claim_local,
+                    schema,
+                )?;
+                store.claim_local.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_claim_local_with_fields(
+                    row,
+                    &meta.claim_local_fields,
+                    meta.cols.claim_local,
+                    schema,
+                )?;
+                store.claim_local.upsert(decoded);
+            }
+        }
+        CLAIM_MEMBER_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_claim_member_with_fields(
+                    row,
+                    &meta.claim_member_fields,
+                    meta.cols.claim_member,
+                    schema,
+                )?;
+                store.claim_member.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_claim_member_with_fields(
+                    row,
+                    &meta.claim_member_fields,
+                    meta.cols.claim_member,
+                    schema,
+                )?;
+                store.claim_member.upsert(decoded);
+            }
+        }
+        CLAIM_TECH_STATE_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_claim_tech_state_with_fields(
+                    row,
+                    &meta.claim_tech_state_fields,
+                    meta.cols.claim_tech_state,
+                    schema,
+                )?;
+                store.claim_tech_state.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_claim_tech_state_with_fields(
+                    row,
+                    &meta.claim_tech_state_fields,
+                    meta.cols.claim_tech_state,
+                    schema,
+                )?;
+                store.claim_tech_state.upsert(decoded);
+            }
+        }
+        CLAIM_TECH_DESC_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_claim_tech_desc_with_fields(
+                    row,
+                    &meta.claim_tech_desc_fields,
+                    meta.cols.claim_tech_desc,
+                    schema,
+                )?;
+                store.claim_tech_desc.delete(decoded.id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_claim_tech_desc_with_fields(
+                    row,
+                    &meta.claim_tech_desc_fields,
+                    meta.cols.claim_tech_desc,
+                    schema,
+                )?;
+                store.claim_tech_desc.upsert(decoded);
+            }
+        }
+        CLAIM_TILE_COST_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_claim_tile_cost_with_fields(
+                    row,
+                    &meta.claim_tile_cost_fields,
+                    meta.cols.claim_tile_cost,
+                    schema,
+                )?;
+                store.claim_tile_cost.delete(decoded.tile_count);
+            }
+            for row in inserts {
+                let decoded = decode::decode_claim_tile_cost_with_fields(
+                    row,
+                    &meta.claim_tile_cost_fields,
+                    meta.cols.claim_tile_cost,
+                    schema,
+                )?;
+                store.claim_tile_cost.upsert(decoded);
+            }
+        }
+        EXPERIENCE_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_experience_with_fields(
+                    row,
+                    &meta.experience_fields,
+                    meta.cols.experience,
+                    schema,
+                )?;
+                store.experience.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_experience_with_fields(
+                    row,
+                    &meta.experience_fields,
+                    meta.cols.experience,
+                    schema,
+                )?;
+                store.experience.upsert(decoded);
+            }
+        }
+        SKILL_DESC_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_skill_desc_with_fields(
+                    row,
+                    &meta.skill_desc_fields,
+                    meta.cols.skill_desc,
+                    schema,
+                )?;
+                store.skill_desc.delete(decoded.id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_skill_desc_with_fields(
+                    row,
+                    &meta.skill_desc_fields,
+                    meta.cols.skill_desc,
+                    schema,
+                )?;
+                store.skill_desc.upsert(decoded);
             }
         }
         other => {

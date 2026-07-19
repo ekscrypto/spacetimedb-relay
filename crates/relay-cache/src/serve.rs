@@ -2,7 +2,7 @@
 
 //! Loopback HTTP read API over the in-memory fleet stores.
 //!
-//! Success bodies on the three data routes negotiate JSON (default) vs
+//! Success bodies on the data routes negotiate JSON (default) vs
 //! protobuf via `Accept: application/x-protobuf`. `/cache-health` and all
 //! error envelopes stay JSON.
 
@@ -64,10 +64,14 @@ pub async fn serve(
         .route("/claim", get(claim_by_name))
         .route("/claim/:entity_id", get(claim_by_pk))
         .route("/claim/:entity_id/inventory", get(claim_inventory))
+        .route("/claim/:entity_id/members", get(claim_members))
+        .route("/claim/:entity_id/citizens", get(claim_citizens))
+        .route("/claim/:entity_id/hexcoins", get(claim_hexcoins))
         .route("/player", get(player_by_name))
         .route("/player/:entity_id", get(player_by_pk))
         .route("/player/:entity_id/inventory", get(player_inventory))
         .route("/player/:entity_id/housing", get(player_housing))
+        .route("/player/:entity_id/skills", get(player_skills))
         .with_state(fleet);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -145,14 +149,86 @@ fn respond_claim_inventory(headers: &HeaderMap, inv: pb::ClaimInventory) -> Resp
 }
 
 fn claim_to_json(c: &pb::Claim) -> Value {
-    json!({
+    let mut obj = json!({
         "entity_id": c.entity_id.to_string(),
         "name": c.name,
         "owner_player_entity_id": c.owner_player_entity_id.to_string(),
         "owner_building_entity_id": c.owner_building_entity_id.to_string(),
         "neutral": c.neutral,
         "region": c.region,
-    })
+    });
+    let map = obj.as_object_mut().unwrap();
+    if let Some(ref u) = c.owner_player_username {
+        map.insert("owner_player_username".into(), json!(u));
+    }
+    if let Some(v) = c.supplies {
+        map.insert("supplies".into(), json!(v));
+    }
+    if let Some(v) = c.treasury {
+        map.insert("treasury".into(), json!(v));
+    }
+    if let Some(v) = c.building_maintenance {
+        map.insert("building_maintenance".into(), json!(v));
+    }
+    if let Some(v) = c.num_tiles {
+        map.insert("num_tiles".into(), json!(v));
+    }
+    if let Some(v) = c.tile_cost {
+        map.insert("tile_cost".into(), json!(v));
+    }
+    if let Some(v) = c.upkeep_cost {
+        map.insert("upkeep_cost".into(), json!(v));
+    }
+    if let Some(v) = c.supplies_run_out {
+        map.insert("supplies_run_out".into(), json!(v));
+    }
+    if let Some(v) = c.supplies_purchase_threshold {
+        map.insert("supplies_purchase_threshold".into(), json!(v));
+    }
+    if let Some(v) = c.supplies_purchase_price {
+        map.insert("supplies_purchase_price".into(), json!(v));
+    }
+    if let Some(v) = c.location_x {
+        map.insert("location_x".into(), json!(v));
+    }
+    if let Some(v) = c.location_z {
+        map.insert("location_z".into(), json!(v));
+    }
+    if let Some(v) = c.location_dimension {
+        map.insert("location_dimension".into(), json!(v));
+    }
+    if let Some(v) = c.tier {
+        map.insert("tier".into(), json!(v));
+    }
+    if let Some(v) = c.tech_researching {
+        map.insert("tech_researching".into(), json!(v));
+    }
+    if let Some(v) = c.tech_start_timestamp {
+        map.insert("tech_start_timestamp".into(), json!(v));
+    }
+    if !c.researched_techs.is_empty() {
+        let techs: Vec<Value> = c
+            .researched_techs
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "name": t.name,
+                    "description": t.description,
+                    "tier": t.tier,
+                    "tech_type": t.tech_type,
+                    "supplies_cost": t.supplies_cost,
+                    "research_time": t.research_time,
+                    "requirements": t.requirements,
+                    "members": t.members,
+                    "area": t.area,
+                    "unlocks_techs": t.unlocks_techs,
+                })
+            })
+            .collect();
+        map.insert("researched_techs".into(), Value::Array(techs));
+    }
+    obj
 }
 
 fn claim_inventory_to_json(inv: &pb::ClaimInventory) -> Value {
@@ -213,14 +289,113 @@ fn claim_inventory_to_json(inv: &pb::ClaimInventory) -> Value {
 }
 
 fn claim_from_store(s: &RegionStore, slot: usize) -> pb::Claim {
+    let entity_id = s.claim.entity_id[slot];
+    let owner_player = s.claim.owner_player_entity_id[slot];
+    let owner_username = s
+        .player_username
+        .find(owner_player)
+        .map(|us| s.player_username.username[us as usize].to_string());
+    let tier = s.claim_tech_state.get(entity_id).and_then(|tech| {
+        crate::store::claim_tech::claim_tier_from_descs(&tech.learned, |id| {
+            s.claim_tech_desc.get(id)
+        })
+    });
     pb::Claim {
-        entity_id: s.claim.entity_id[slot],
+        entity_id,
         name: s.claim.name[slot].to_string(),
-        owner_player_entity_id: s.claim.owner_player_entity_id[slot],
+        owner_player_entity_id: owner_player,
         owner_building_entity_id: s.claim.owner_building_entity_id[slot],
         neutral: s.claim.neutral[slot],
         region: s.region,
+        owner_player_username: owner_username,
+        supplies: None,
+        treasury: None,
+        building_maintenance: None,
+        num_tiles: None,
+        tile_cost: None,
+        upkeep_cost: None,
+        supplies_run_out: None,
+        supplies_purchase_threshold: None,
+        supplies_purchase_price: None,
+        location_x: None,
+        location_z: None,
+        location_dimension: None,
+        tier,
+        tech_researching: None,
+        tech_start_timestamp: None,
+        researched_techs: Vec::new(),
     }
+}
+
+/// Full claim PK enrichment (local + tech + derived upkeep).
+fn claim_detail_from_store(s: &RegionStore, slot: usize) -> pb::Claim {
+    let mut claim = claim_from_store(s, slot);
+    let entity_id = claim.entity_id;
+
+    if let Some(local_slot) = s.claim_local.find(entity_id) {
+        let li = local_slot as usize;
+        let supplies = s.claim_local.supplies[li];
+        let building_maintenance = s.claim_local.building_maintenance[li];
+        let num_tiles = s.claim_local.num_tiles[li];
+        claim.supplies = Some(supplies);
+        claim.treasury = Some(s.claim_local.treasury[li]);
+        claim.building_maintenance = Some(building_maintenance);
+        claim.num_tiles = Some(num_tiles);
+        claim.supplies_purchase_threshold = Some(s.claim_local.supplies_purchase_threshold[li]);
+        claim.supplies_purchase_price = Some(s.claim_local.supplies_purchase_price[li]);
+        if s.claim_local.has_location[li] {
+            claim.location_x = Some(s.claim_local.location_x[li]);
+            claim.location_z = Some(s.claim_local.location_z[li]);
+            claim.location_dimension = Some(s.claim_local.location_dimension[li]);
+        }
+        if let Some(tile_cost) = s.claim_tile_cost.cost_per_tile(num_tiles) {
+            claim.tile_cost = Some(tile_cost);
+            let upkeep = crate::store::claim_tile_cost::upkeep_cost(
+                num_tiles,
+                tile_cost,
+                building_maintenance,
+            );
+            claim.upkeep_cost = Some(upkeep);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            claim.supplies_run_out =
+                crate::store::claim_tile_cost::supplies_run_out_ms(now_ms, supplies, upkeep);
+        }
+    }
+
+    if let Some(tech) = s.claim_tech_state.get(entity_id) {
+        claim.tech_researching = Some(tech.researching);
+        claim.tech_start_timestamp = Some(tech.start_timestamp_micros);
+        claim.researched_techs = tech
+            .learned
+            .iter()
+            .filter_map(|&id| {
+                let d = s.claim_tech_desc.get(id)?;
+                Some(pb::ResearchedTech {
+                    id: d.id,
+                    name: d.name.to_string(),
+                    description: d.description.to_string(),
+                    tier: d.tier,
+                    tech_type: d.tech_type.to_string(),
+                    supplies_cost: d.supplies_cost,
+                    research_time: d.research_time,
+                    requirements: d.requirements.to_vec(),
+                    members: d.members,
+                    area: d.area,
+                    unlocks_techs: d.unlocks_techs.to_vec(),
+                })
+            })
+            .collect();
+        if claim.tier.is_none() {
+            claim.tier = crate::store::claim_tech::claim_tier_from_descs(&tech.learned, |id| {
+                s.claim_tech_desc.get(id)
+            });
+        }
+    }
+
+    claim
 }
 
 async fn list_protos() -> impl IntoResponse {
@@ -272,6 +447,11 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
             "ready": s.ready,
             "rows": {
                 "claim": s.claim.len(),
+                "claim_local": s.claim_local.len(),
+                "claim_member": s.claim_member.len(),
+                "claim_tech_state": s.claim_tech_state.len(),
+                "claim_tech_desc": s.claim_tech_desc.len(),
+                "claim_tile_cost": s.claim_tile_cost.len(),
                 "building": s.building.len(),
                 "inventory": s.inventory.len(),
                 "building_desc": s.building_desc.len(),
@@ -284,6 +464,8 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
                 "player_housing": s.player_housing.len(),
                 "player_housing_desc": s.player_housing_desc.len(),
                 "rent": s.rent.len(),
+                "experience": s.experience.len(),
+                "skill_desc": s.skill_desc.len(),
             }
         }));
     }
@@ -344,7 +526,7 @@ async fn claim_by_pk(
             continue;
         }
         if let Some(slot) = s.claim.find(pk) {
-            return respond_claim(&headers, claim_from_store(&s, slot as usize));
+            return respond_claim(&headers, claim_detail_from_store(&s, slot as usize));
         }
     }
     no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
@@ -483,6 +665,407 @@ async fn claim_inventory(
     }
 
     no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+}
+
+const HEXCOIN_ITEM_ID: i32 = 1;
+
+fn respond_claim_members(headers: &HeaderMap, body: pb::ClaimMemberList) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(body.encode_to_vec())
+    } else {
+        let members: Vec<Value> = body
+            .members
+            .iter()
+            .map(|m| {
+                json!({
+                    "entity_id": m.entity_id.to_string(),
+                    "claim_entity_id": m.claim_entity_id.to_string(),
+                    "player_entity_id": m.player_entity_id.to_string(),
+                    "user_name": m.user_name,
+                    "inventory_permission": m.inventory_permission,
+                    "build_permission": m.build_permission,
+                    "officer_permission": m.officer_permission,
+                    "co_owner_permission": m.co_owner_permission,
+                })
+            })
+            .collect();
+        let claim = body.claim.as_ref().map(|c| {
+            json!({
+                "entity_id": c.entity_id.to_string(),
+                "name": c.name,
+                "region": c.region,
+            })
+        });
+        no_store_json(json!({
+            "claim": claim,
+            "members": members,
+            "count": body.count,
+        }))
+        .into_response()
+    }
+}
+
+fn respond_claim_citizens(headers: &HeaderMap, body: pb::ClaimCitizens) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(body.encode_to_vec())
+    } else {
+        let mut skill_names = serde_json::Map::new();
+        for e in &body.skill_names {
+            skill_names.insert(e.skill_id.to_string(), json!(e.name));
+        }
+        let citizens: Vec<Value> = body
+            .citizens
+            .iter()
+            .map(|c| {
+                let mut skills = serde_json::Map::new();
+                for sk in &c.skills {
+                    skills.insert(sk.skill_id.to_string(), json!(sk.level));
+                }
+                json!({
+                    "entity_id": c.entity_id.to_string(),
+                    "user_name": c.user_name,
+                    "skills": skills,
+                })
+            })
+            .collect();
+        let claim = body.claim.as_ref().map(|c| {
+            json!({
+                "entity_id": c.entity_id.to_string(),
+                "name": c.name,
+                "region": c.region,
+            })
+        });
+        no_store_json(json!({
+            "claim": claim,
+            "citizens": citizens,
+            "skill_names": skill_names,
+        }))
+        .into_response()
+    }
+}
+
+fn respond_claim_hexcoins(headers: &HeaderMap, body: pb::ClaimHexcoins) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(body.encode_to_vec())
+    } else {
+        let members: Vec<Value> = body
+            .members
+            .iter()
+            .map(|m| {
+                json!({
+                    "player_entity_id": m.player_entity_id.to_string(),
+                    "user_name": m.user_name,
+                    "hexcoins": m.hexcoins,
+                    "has_storage_access": m.has_storage_access,
+                })
+            })
+            .collect();
+        let claim = body.claim.as_ref().map(|c| {
+            json!({
+                "entity_id": c.entity_id.to_string(),
+                "name": c.name,
+                "region": c.region,
+            })
+        });
+        no_store_json(json!({
+            "claim": claim,
+            "members": members,
+        }))
+        .into_response()
+    }
+}
+
+fn respond_player_skills(headers: &HeaderMap, body: pb::PlayerSkills) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(body.encode_to_vec())
+    } else {
+        let player = body.player.as_ref().map(|p| {
+            json!({
+                "entity_id": p.entity_id.to_string(),
+                "username": p.username,
+                "region": p.region,
+            })
+        });
+        let skills: Vec<Value> = body
+            .skills
+            .iter()
+            .map(|sk| {
+                json!({
+                    "skill_id": sk.skill_id,
+                    "name": sk.name,
+                    "level": sk.level,
+                    "xp": sk.xp,
+                })
+            })
+            .collect();
+        no_store_json(json!({
+            "player": player,
+            "skills": skills,
+        }))
+        .into_response()
+    }
+}
+
+async fn claim_members(
+    State(fleet): State<Fleet>,
+    headers: HeaderMap,
+    Path(entity_id): Path<String>,
+) -> Response {
+    let Ok(pk) = entity_id.parse::<u64>() else {
+        return no_store_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "entity_id must be a u64"}),
+        )
+        .into_response();
+    };
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready {
+            continue;
+        }
+        let Some(claim_slot) = s.claim.find(pk) else {
+            continue;
+        };
+        let members: Vec<pb::ClaimMember> = s
+            .claim_member
+            .by_claim(pk)
+            .iter()
+            .map(|&slot| {
+                let i = slot as usize;
+                pb::ClaimMember {
+                    entity_id: s.claim_member.entity_id[i],
+                    claim_entity_id: s.claim_member.claim_entity_id[i],
+                    player_entity_id: s.claim_member.player_entity_id[i],
+                    user_name: s.claim_member.user_name[i].to_string(),
+                    inventory_permission: s.claim_member.inventory_permission[i],
+                    build_permission: s.claim_member.build_permission[i],
+                    officer_permission: s.claim_member.officer_permission[i],
+                    co_owner_permission: s.claim_member.co_owner_permission[i],
+                }
+            })
+            .collect();
+        let count = members.len() as i32;
+        return respond_claim_members(
+            &headers,
+            pb::ClaimMemberList {
+                claim: Some(pb::ClaimSummary {
+                    entity_id: pk,
+                    name: s.claim.name[claim_slot as usize].to_string(),
+                    region: s.region,
+                }),
+                members,
+                count,
+            },
+        );
+    }
+    no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+}
+
+async fn claim_citizens(
+    State(fleet): State<Fleet>,
+    headers: HeaderMap,
+    Path(entity_id): Path<String>,
+) -> Response {
+    let Ok(pk) = entity_id.parse::<u64>() else {
+        return no_store_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "entity_id must be a u64"}),
+        )
+        .into_response();
+    };
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready {
+            continue;
+        }
+        let Some(claim_slot) = s.claim.find(pk) else {
+            continue;
+        };
+        let mut skill_name_map: HashMap<i32, String> = HashMap::new();
+        let mut citizens = Vec::new();
+        for &slot in s.claim_member.by_claim(pk) {
+            let i = slot as usize;
+            let player_id = s.claim_member.player_entity_id[i];
+            let mut skills = Vec::new();
+            if let Some(stacks) = s.experience.get(player_id) {
+                for &(skill_id, xp) in stacks {
+                    let level = crate::xp::xp_to_level(i64::from(xp));
+                    if level <= 0 {
+                        continue;
+                    }
+                    if let Some(name) = s.skill_desc.name(skill_id) {
+                        skill_name_map
+                            .entry(skill_id)
+                            .or_insert_with(|| name.to_owned());
+                    }
+                    skills.push(pb::CitizenSkill {
+                        skill_id,
+                        level,
+                        xp: i64::from(xp),
+                    });
+                }
+            }
+            citizens.push(pb::ClaimCitizen {
+                entity_id: player_id,
+                user_name: s.claim_member.user_name[i].to_string(),
+                skills,
+            });
+        }
+        let skill_names: Vec<pb::SkillNameEntry> = skill_name_map
+            .into_iter()
+            .map(|(skill_id, name)| pb::SkillNameEntry { skill_id, name })
+            .collect();
+        return respond_claim_citizens(
+            &headers,
+            pb::ClaimCitizens {
+                claim: Some(pb::ClaimSummary {
+                    entity_id: pk,
+                    name: s.claim.name[claim_slot as usize].to_string(),
+                    region: s.region,
+                }),
+                citizens,
+                skill_names,
+            },
+        );
+    }
+    no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+}
+
+async fn claim_hexcoins(
+    State(fleet): State<Fleet>,
+    headers: HeaderMap,
+    Path(entity_id): Path<String>,
+) -> Response {
+    let Ok(pk) = entity_id.parse::<u64>() else {
+        return no_store_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "entity_id must be a u64"}),
+        )
+        .into_response();
+    };
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready {
+            continue;
+        }
+        let Some(claim_slot) = s.claim.find(pk) else {
+            continue;
+        };
+        let mut members = Vec::new();
+        for &slot in s.claim_member.by_claim(pk) {
+            let i = slot as usize;
+            let player_id = s.claim_member.player_entity_id[i];
+            let hexcoins = sum_player_hexcoins(&s, player_id);
+            members.push(pb::MemberHexcoins {
+                player_entity_id: player_id,
+                user_name: s.claim_member.user_name[i].to_string(),
+                hexcoins,
+                has_storage_access: s.claim_member.inventory_permission[i],
+            });
+        }
+        members.sort_by(|a, b| b.hexcoins.cmp(&a.hexcoins));
+        return respond_claim_hexcoins(
+            &headers,
+            pb::ClaimHexcoins {
+                claim: Some(pb::ClaimSummary {
+                    entity_id: pk,
+                    name: s.claim.name[claim_slot as usize].to_string(),
+                    region: s.region,
+                }),
+                members,
+            },
+        );
+    }
+    no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+}
+
+fn sum_player_hexcoins(s: &RegionStore, player_id: u64) -> i64 {
+    let mut total = 0i64;
+    let mut seen = std::collections::HashSet::new();
+    for &inv_slot in s.inventory.by_player_owner(player_id) {
+        seen.insert(inv_slot);
+        if classify_player_bag(s, inv_slot, player_id).is_none() {
+            continue;
+        }
+        total += hexcoins_in_inventory(s, inv_slot);
+    }
+    // Body pockets: inventories owned by the player themselves.
+    for &inv_slot in s.inventory.by_owner(player_id) {
+        if !seen.insert(inv_slot) {
+            continue;
+        }
+        if classify_player_bag(s, inv_slot, player_id).is_none() {
+            continue;
+        }
+        total += hexcoins_in_inventory(s, inv_slot);
+    }
+    total
+}
+
+fn hexcoins_in_inventory(s: &RegionStore, inv_slot: u32) -> i64 {
+    let mut n = 0i64;
+    for p in s.inventory.pockets[inv_slot as usize].iter() {
+        if p.has_contents && p.item_id == HEXCOIN_ITEM_ID && p.item_type == Pocket::ITEM {
+            n += i64::from(p.quantity);
+        }
+    }
+    n
+}
+
+async fn player_skills(
+    State(fleet): State<Fleet>,
+    headers: HeaderMap,
+    Path(entity_id): Path<String>,
+) -> Response {
+    let Ok(pk) = entity_id.parse::<u64>() else {
+        return no_store_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "entity_id must be a u64"}),
+        )
+        .into_response();
+    };
+    let Some(player) = find_player(&fleet, pk) else {
+        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
+            .into_response();
+    };
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready || s.region != player.region {
+            continue;
+        }
+        let mut skills = Vec::new();
+        if let Some(stacks) = s.experience.get(pk) {
+            for &(skill_id, xp) in stacks {
+                let level = crate::xp::xp_to_level(i64::from(xp));
+                let name = s
+                    .skill_desc
+                    .name(skill_id)
+                    .unwrap_or("")
+                    .to_owned();
+                skills.push(pb::PlayerSkill {
+                    skill_id,
+                    name,
+                    level,
+                    xp: i64::from(xp),
+                });
+            }
+        }
+        skills.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
+        return respond_player_skills(
+            &headers,
+            pb::PlayerSkills {
+                player: Some(player),
+                skills,
+            },
+        );
+    }
+    respond_player_skills(
+        &headers,
+        pb::PlayerSkills {
+            player: Some(player),
+            skills: Vec::new(),
+        },
+    )
 }
 
 fn dimension_meta(s: &RegionStore, dimension_id: u32) -> (&'static str, Option<pb::Entrance>) {
@@ -1131,6 +1714,35 @@ mod tests {
             owner_building_entity_id: 2,
             neutral: false,
             region: 14,
+            owner_player_username: Some("Maple".into()),
+            supplies: Some(1000),
+            treasury: Some(50),
+            building_maintenance: Some(0.0),
+            num_tiles: Some(100),
+            tile_cost: Some(0.01),
+            upkeep_cost: Some(1.0),
+            supplies_run_out: Some(1_700_000_000_000),
+            supplies_purchase_threshold: Some(500),
+            supplies_purchase_price: Some(0.0),
+            location_x: Some(1),
+            location_z: Some(2),
+            location_dimension: Some(1),
+            tier: Some(3),
+            tech_researching: Some(0),
+            tech_start_timestamp: Some(0),
+            researched_techs: vec![pb::ResearchedTech {
+                id: 300,
+                name: "Tier 3".into(),
+                description: "Unlocks…".into(),
+                tier: 3,
+                tech_type: "tier_upgrade".into(),
+                supplies_cost: 0,
+                research_time: 0,
+                requirements: vec![],
+                members: 0,
+                area: 0,
+                unlocks_techs: vec![],
+            }],
         };
         let bytes = claim.encode_to_vec();
         let decoded = pb::Claim::decode(bytes.as_slice()).unwrap();
@@ -1140,6 +1752,9 @@ mod tests {
         assert_eq!(json["entity_id"], "99");
         assert_eq!(json["name"], "Concordia");
         assert_eq!(json["region"], 14);
+        assert_eq!(json["owner_player_username"], "Maple");
+        assert_eq!(json["tier"], 3);
+        assert_eq!(json["researched_techs"][0]["id"], 300);
     }
 
     #[test]
@@ -1190,6 +1805,7 @@ mod tests {
             owner_building_entity_id: 0,
             neutral: true,
             region: 3,
+            ..Default::default()
         }];
         let list = pb::ClaimList {
             claims: claims.clone(),

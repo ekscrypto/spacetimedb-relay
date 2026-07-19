@@ -6,11 +6,13 @@
 //! decodes BSATN rows into columnar in-memory storage (no JSON hop on the
 //! read path), and serves HTTP queries on loopback (JSON default;
 //! protobuf via `Accept: application/x-protobuf`):
-//!   1. claim by PK / name substring
+//!   1. claim by PK / name substring (PK includes supplies/upkeep/tier)
 //!   2. claim inventory rollup by building + dimension
-//!   3. player by PK / name substring
-//!   4. player personal inventories (categorized bags)
-//!   5. player housing (first house + interior buildings)
+//!   3. claim members / citizens / hexcoins
+//!   4. player by PK / name substring
+//!   5. player personal inventories (categorized bags)
+//!   6. player housing (first house + interior buildings)
+//!   7. player skills (XP → level)
 
 mod config;
 mod decode;
@@ -19,6 +21,7 @@ mod serve;
 mod shard;
 mod store;
 mod wire;
+mod xp;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
