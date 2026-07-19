@@ -358,14 +358,14 @@
     </table>
   </div>
 
-  <!-- Section 4: Health + claim/player cache endpoints -->
+  <!-- Section 4: Health + relay-cache HTTP endpoints -->
   <h2>HTTP endpoints</h2>
   <p class="section-note">
     Read-only JSON (protobuf available via
     <code>Accept: application/x-protobuf</code> on the cache routes;
     schemas at <a class="ep" href="/proto" target="_blank" rel="noopener">/proto</a>).
-    Fleet health refreshes every 30 seconds; the claim, player, and
-    storage-log cache is live in-memory state mirrored from each region.
+    Fleet health refreshes every 30 seconds; the claim, player, deposit,
+    and storage-log cache is live in-memory state mirrored from each region.
   </p>
   <div class="panel">
     <table class="endpoints">
@@ -393,17 +393,34 @@
         <tr>
           <td>
             <a class="ep" href="/cache-health" target="_blank" rel="noopener">/cache-health</a><br>
-            <a class="ep" href="/claim?name=concordia" target="_blank" rel="noopener">/claim</a>
+            <a class="ep" href="/proto" target="_blank" rel="noopener">/proto</a>
           </td>
           <td>
-            Claim cache (<code>relay-cache</code>): readiness plus
-            claim lookup by PK or name substring (PK includes supplies,
-            upkeep, tier, researched techs, owner username), per-claim
-            inventory, members (incl. last login), citizens (skill levels),
-            hexcoin totals, and crafts (progressive + passive, optional
-            <code>completed</code> filter). Town Banks are omitted from inventory.
+            Cache readiness (<code>relay-cache</code>): per-region
+            <code>ready</code> flag and row counts, plus
+            <code>memory_pressure</code>. Protobuf schema list and raw
+            <code>.proto</code> download for the cache DTOs.
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/cache-health</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/proto</div>
+            <div class="curl"><span class="prompt">$</span> curl -OJ https://relay.bitcraftsync.app/proto/relay_cache.proto</div>
+          </td>
+          <td>&mdash;</td>
+        </tr>
+        <tr>
+          <td>
+            <a class="ep" href="/claim?name=concordia" target="_blank" rel="noopener">/claim</a><br>
+            <span class="ep">/claim/&lt;id&gt;</span>
+          </td>
+          <td>
+            Claim cache (<code>relay-cache</code>): lookup by PK or name
+            substring (PK includes supplies, upkeep, tier, researched
+            techs, owner username), per-claim inventory (shared storage
+            only &mdash; no Town Banks; grouped by overworld / interior
+            dimension with entrance), members (incl. last login),
+            citizens (skill levels), hexcoin totals, and crafts
+            (progressive + passive, optional <code>completed</code> filter).
             <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/claim?name=concordia'</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/inventory</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/members</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/citizens</div>
@@ -417,7 +434,8 @@
         </tr>
         <tr>
           <td>
-            <a class="ep" href="/player?name=maple" target="_blank" rel="noopener">/player</a>
+            <a class="ep" href="/player?name=maple" target="_blank" rel="noopener">/player</a><br>
+            <span class="ep">/player/&lt;id&gt;</span>
           </td>
           <td>
             Player cache (<code>relay-cache</code>): username search
@@ -439,6 +457,23 @@
             <code>name</code> (substring, for <code>/player</code>;
             clients should send &ge;2 chars);
             <code>completed</code> (optional bool, for <code>/crafts</code>)
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a class="ep" href="/deposits?region=14" target="_blank" rel="noopener">/deposits</a>
+          </td>
+          <td>
+            Hexite deposits (<code>relay-cache</code>): global flat list
+            with game coords (<code>north</code>=z, <code>east</code>=x).
+            Active deposits omit <code>respawn_at</code>; depleted ones
+            set it from public <code>growth_state</code> (Depleted&rarr;Hexite,
+            ~6&ndash;8 days).
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/deposits</div>
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/deposits?region=14'</div>
+          </td>
+          <td>
+            <code>region</code> (optional BitCraft region id)
           </td>
         </tr>
         <tr>

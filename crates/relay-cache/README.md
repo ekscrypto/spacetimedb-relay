@@ -188,18 +188,21 @@ curl -s https://relay.bitcraftsync.app/cache-health
 curl -s https://relay.bitcraftsync.app/proto
 curl -sO https://relay.bitcraftsync.app/proto/relay_cache.proto
 curl -s 'https://relay.bitcraftsync.app/claim?name=concordia'
+curl -s https://relay.bitcraftsync.app/claim/1234567890
 curl -s https://relay.bitcraftsync.app/claim/1234567890/inventory
 curl -s https://relay.bitcraftsync.app/claim/1234567890/members
 curl -s https://relay.bitcraftsync.app/claim/1234567890/citizens
 curl -s https://relay.bitcraftsync.app/claim/1234567890/hexcoins
+curl -s 'https://relay.bitcraftsync.app/claim/1234567890/crafts?completed=false'
 curl -s 'https://relay.bitcraftsync.app/player?name=maple'
+curl -s https://relay.bitcraftsync.app/player/1297036692699996362
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/inventory
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/housing
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/skills
+curl -s 'https://relay.bitcraftsync.app/player/1297036692699996362/crafts?completed=true'
 curl -s 'https://relay.bitcraftsync.app/deposits'
 curl -s 'https://relay.bitcraftsync.app/deposits?region=14'
-curl -s 'https://relay.bitcraftsync.app/storage-logs?storageId=1008806316593474517'
-curl -s 'https://relay.bitcraftsync.app/storage-logs?playerId=1297036692699996362'
+curl -s 'https://relay.bitcraftsync.app/storage-logs?storageId=1008806316593474517&limit=50'
 curl -sH 'Accept: application/x-protobuf' \
   https://relay.bitcraftsync.app/claim/1234567890/inventory -o inventory.pb
 ```
