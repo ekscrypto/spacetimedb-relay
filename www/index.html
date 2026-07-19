@@ -364,8 +364,8 @@
     Read-only JSON (protobuf available via
     <code>Accept: application/x-protobuf</code> on the cache routes;
     schemas at <a class="ep" href="/proto" target="_blank" rel="noopener">/proto</a>).
-    Fleet health refreshes every 30 seconds; the claim and player cache is
-    live in-memory state mirrored from each region.
+    Fleet health refreshes every 30 seconds; the claim, player, and
+    storage-log cache is live in-memory state mirrored from each region.
   </p>
   <div class="panel">
     <table class="endpoints">
@@ -439,6 +439,31 @@
             <code>name</code> (substring, for <code>/player</code>;
             clients should send &ge;2 chars);
             <code>completed</code> (optional bool, for <code>/crafts</code>)
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a class="ep" href="/storage-logs?storageId=1008806316593474517&amp;region=14&amp;limit=20" target="_blank" rel="noopener">/storage-logs</a>
+          </td>
+          <td>
+            Storage deposit/withdraw history (<code>relay-cache</code>),
+            retained for the upstream ~15&ndash;16 day window. Exactly one
+            mode per request: by chest, by player, or by item scoped to a
+            claim or player. Each entry includes building
+            <code>entity_id</code> / <code>name</code> / <code>nickname</code>,
+            claim, player, action, and item stack.
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/storage-logs?storageId=&lt;id&gt;'</div>
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/storage-logs?playerId=&lt;id&gt;&amp;limit=50'</div>
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/storage-logs?itemId=&lt;id&gt;&amp;claimId=&lt;id&gt;'</div>
+            <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/storage-logs?itemId=&lt;id&gt;&amp;playerId=&lt;id&gt;'</div>
+          </td>
+          <td>
+            One of: <code>storageId</code>;
+            <code>playerId</code>;
+            <code>itemId</code>+<code>claimId</code>;
+            <code>itemId</code>+<code>playerId</code>.
+            Optional: <code>itemType</code> (<code>Item</code>|<code>Cargo</code>),
+            <code>region</code>, <code>limit</code> (newest N)
           </td>
         </tr>
       </tbody>
