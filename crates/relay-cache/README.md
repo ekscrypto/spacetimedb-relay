@@ -68,7 +68,7 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/housing
 #     "buildings": [ { "entity_id", "name", "nickname", "items": [...] } ] }
 
 # Health / readiness (always JSON)
-curl -s http://127.0.0.1:8089/healthz
+curl -s http://127.0.0.1:8089/cache-health
 
 # Protobuf schemas (JSON list + raw `.proto` download)
 curl -s http://127.0.0.1:8089/proto
@@ -95,7 +95,7 @@ Public (nginx on `relay.bitcraftsync.app` → loopback `:8089`; see
 [`tools/nginx-relay-cache.snippet`](../../tools/nginx-relay-cache.snippet)):
 
 ```sh
-curl -s https://relay.bitcraftsync.app/healthz
+curl -s https://relay.bitcraftsync.app/cache-health
 curl -s https://relay.bitcraftsync.app/proto
 curl -sO https://relay.bitcraftsync.app/proto/relay_cache.proto
 curl -s 'https://relay.bitcraftsync.app/claim?name=concordia'
@@ -110,6 +110,6 @@ curl -sH 'Accept: application/x-protobuf' \
 ## Memory policy
 
 The ceiling is an alarm, not a load shedder. Approaching it logs a warning
-and flips `/healthz` `ready=false`, but queries keep serving with whatever
+and flips `/cache-health` `ready=false`, but queries keep serving with whatever
 data is loaded. Projected resident grows with player/deployable/rent
 tables on top of the prior claim/inventory set.

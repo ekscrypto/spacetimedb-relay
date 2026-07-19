@@ -392,7 +392,7 @@
         </tr>
         <tr>
           <td>
-            <a class="ep" href="/healthz" target="_blank" rel="noopener">/healthz</a><br>
+            <a class="ep" href="/cache-health" target="_blank" rel="noopener">/cache-health</a><br>
             <a class="ep" href="/claim?name=concordia" target="_blank" rel="noopener">/claim</a>
           </td>
           <td>
@@ -400,7 +400,7 @@
             claim lookup by PK or name substring, and per-claim inventory
             grouped by dimension (overworld + building interiors).
             Town Banks are omitted.
-            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/healthz</div>
+            <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/cache-health</div>
             <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/claim?name=concordia'</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/inventory</div>
           </td>

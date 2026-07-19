@@ -180,7 +180,7 @@ async fn run_memory_sampler(
                         target: "relay_cache",
                         rss_bytes = rss,
                         ceiling_bytes,
-                        "resident set at/above memory ceiling — /healthz ready=false"
+                        "resident set at/above memory ceiling — /cache-health ready=false"
                     );
                 } else if !over && was {
                     tracing::info!(

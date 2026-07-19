@@ -32,7 +32,7 @@ pub use rent::RentSoA;
 /// One region's worth of in-memory state. The `ready` flag is `false`
 /// during initial `SubscribeApplied` load and after a disconnect; the
 /// HTTP layer treats not-ready shards as contributing nothing to fan-out
-/// queries (and reports them in `/healthz`).
+/// queries (and reports them in `/cache-health`).
 pub struct RegionStore {
     pub region: u32,
     pub ready: bool,

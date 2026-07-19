@@ -53,7 +53,7 @@ pub struct Args {
     pub schema_db: String,
 
     /// Soft memory ceiling in bytes. On approach: log at `warn`, flip the
-    /// `/healthz` ready flag to false, keep serving with whatever data we
+    /// `/cache-health` ready flag to false, keep serving with whatever data we
     /// have. Never a load shedder — see the README "Memory policy" section.
     #[arg(
         long,

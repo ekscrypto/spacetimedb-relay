@@ -3,7 +3,7 @@
 //! Loopback HTTP read API over the in-memory fleet stores.
 //!
 //! Success bodies on the three data routes negotiate JSON (default) vs
-//! protobuf via `Accept: application/x-protobuf`. `/healthz` and all
+//! protobuf via `Accept: application/x-protobuf`. `/cache-health` and all
 //! error envelopes stay JSON.
 
 use std::collections::HashMap;
@@ -58,7 +58,7 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let app = Router::new()
-        .route("/healthz", get(healthz))
+        .route("/cache-health", get(cache_health))
         .route("/proto", get(list_protos))
         .route("/proto/:name", get(get_proto))
         .route("/claim", get(claim_by_name))
@@ -258,7 +258,7 @@ async fn get_proto(Path(name): Path<String>) -> Response {
     (headers, body).into_response()
 }
 
-async fn healthz(State(fleet): State<Fleet>) -> impl IntoResponse {
+async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
     let pressure = fleet.memory_pressure.load(Ordering::Relaxed);
     let mut regions = Vec::with_capacity(fleet.shards.len());
     let mut all_ready = !pressure;

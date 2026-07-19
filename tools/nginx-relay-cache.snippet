@@ -11,7 +11,7 @@
 #   3. sudo nginx -t && sudo nginx -s reload
 #
 # Public URLs (binary remains on 127.0.0.1:8089):
-#   https://relay.bitcraftsync.app/healthz
+#   https://relay.bitcraftsync.app/cache-health
 #   https://relay.bitcraftsync.app/proto
 #   https://relay.bitcraftsync.app/proto/relay_cache.proto
 #   https://relay.bitcraftsync.app/claim?name=...
@@ -23,7 +23,7 @@
 #   https://relay.bitcraftsync.app/player/<id>/housing
 
     # relay-cache (loopback read API)
-    location /healthz {
+    location /cache-health {
         proxy_pass http://127.0.0.1:8089;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
