@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package relay_cache;
+
+// Mirrors the JSON claim object from GET /claim/:entity_id and name-search hits.
+message Claim {
+  uint64 entity_id = 1;
+  string name = 2;
+  uint64 owner_player_entity_id = 3;
+  uint64 owner_building_entity_id = 4;
+  bool neutral = 5;
+  uint32 region = 6;
+}
+
+// Wrapper for GET /claim?name=… (JSON returns a bare array).
+message ClaimList {
+  repeated Claim claims = 1;
+}
+
+message ClaimSummary {
+  uint64 entity_id = 1;
+  string name = 2;
+  uint32 region = 3;
+}
+
+message InventoryItem {
+  int32 item_id = 1;
+  // "Item" | "Cargo"
+  string item_type = 2;
+  int64 quantity = 3;
+}
+
+message BuildingInventory {
+  uint64 entity_id = 1;
+  optional string name = 2;
+  optional string nickname = 3;
+  repeated InventoryItem items = 4;
+}
+
+message Entrance {
+  uint64 entity_id = 1;
+  optional string name = 2;
+  optional string nickname = 3;
+}
+
+message DimensionGroup {
+  uint32 dimension_id = 1;
+  // "overworld" | "building_interior" | "unknown"
+  string kind = 2;
+  optional Entrance entrance = 3;
+  repeated BuildingInventory buildings = 4;
+}
+
+message ClaimInventory {
+  ClaimSummary claim = 1;
+  repeated DimensionGroup dimensions = 2;
+}

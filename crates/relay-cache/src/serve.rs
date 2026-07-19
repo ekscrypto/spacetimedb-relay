@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! Loopback HTTP/JSON read API over the in-memory fleet stores.
+//! Loopback HTTP read API over the in-memory fleet stores.
+//!
+//! Success bodies on the three data routes negotiate JSON (default) vs
+//! protobuf via `Accept: application/x-protobuf`. `/healthz` and all
+//! error envelopes stay JSON.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -9,15 +13,36 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use prost::Message;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::decode::OVERWORLD_DIMENSION;
 use crate::shard::ShardHandle;
 use crate::store::{Pocket, RegionStore};
+
+mod pb {
+    include!(concat!(env!("OUT_DIR"), "/relay_cache.rs"));
+}
+
+const PROTOBUF_MIME: &str = "application/x-protobuf";
+const PROTO_SOURCE_MIME: &str = "text/plain; charset=utf-8";
+
+/// Checked-in `.proto` schemas embedded at compile time (whitelist only).
+const PROTO_FILES: &[(&str, &str)] = &[(
+    "relay_cache.proto",
+    include_str!("../proto/relay_cache.proto"),
+)];
+
+fn proto_body(name: &str) -> Option<&'static str> {
+    PROTO_FILES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, body)| *body)
+}
 
 /// Shared axum state: all region shards plus the memory-pressure flag.
 #[derive(Clone)]
@@ -34,6 +59,8 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/proto", get(list_protos))
+        .route("/proto/:name", get(get_proto))
         .route("/claim", get(claim_by_name))
         .route("/claim/:entity_id", get(claim_by_pk))
         .route("/claim/:entity_id/inventory", get(claim_inventory))
@@ -51,6 +78,21 @@ pub async fn serve(
     Ok(())
 }
 
+fn wants_protobuf(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(accept_wants_protobuf)
+}
+
+/// True when `Accept` lists `application/x-protobuf` (q-values ignored).
+fn accept_wants_protobuf(accept: &str) -> bool {
+    accept.split(',').map(str::trim).any(|part| {
+        let mime = part.split(';').next().unwrap_or(part).trim();
+        mime.eq_ignore_ascii_case(PROTOBUF_MIME)
+    })
+}
+
 fn no_store_json(body: Value) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -61,6 +103,155 @@ fn no_store_status(status: StatusCode, body: Value) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (status, headers, axum::Json(body))
+}
+
+fn no_store_protobuf(bytes: Vec<u8>) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(PROTOBUF_MIME),
+    );
+    (headers, bytes).into_response()
+}
+
+fn respond_claim(headers: &HeaderMap, claim: pb::Claim) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(claim.encode_to_vec())
+    } else {
+        no_store_json(claim_to_json(&claim)).into_response()
+    }
+}
+
+fn respond_claim_list(headers: &HeaderMap, claims: Vec<pb::Claim>) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(pb::ClaimList { claims }.encode_to_vec())
+    } else {
+        let arr: Vec<Value> = claims.iter().map(claim_to_json).collect();
+        no_store_json(json!(arr)).into_response()
+    }
+}
+
+fn respond_claim_inventory(headers: &HeaderMap, inv: pb::ClaimInventory) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(inv.encode_to_vec())
+    } else {
+        no_store_json(claim_inventory_to_json(&inv)).into_response()
+    }
+}
+
+fn claim_to_json(c: &pb::Claim) -> Value {
+    json!({
+        "entity_id": c.entity_id.to_string(),
+        "name": c.name,
+        "owner_player_entity_id": c.owner_player_entity_id.to_string(),
+        "owner_building_entity_id": c.owner_building_entity_id.to_string(),
+        "neutral": c.neutral,
+        "region": c.region,
+    })
+}
+
+fn claim_inventory_to_json(inv: &pb::ClaimInventory) -> Value {
+    let claim_json = inv.claim.as_ref().map_or(Value::Null, |claim| {
+        json!({
+            "entity_id": claim.entity_id.to_string(),
+            "name": claim.name,
+            "region": claim.region,
+        })
+    });
+    let dimensions: Vec<Value> = inv
+        .dimensions
+        .iter()
+        .map(|d| {
+            let entrance = match &d.entrance {
+                Some(e) => json!({
+                    "entity_id": e.entity_id.to_string(),
+                    "name": e.name,
+                    "nickname": e.nickname,
+                }),
+                None => Value::Null,
+            };
+            let buildings: Vec<Value> = d
+                .buildings
+                .iter()
+                .map(|b| {
+                    let items: Vec<Value> = b
+                        .items
+                        .iter()
+                        .map(|it| {
+                            json!({
+                                "item_id": it.item_id,
+                                "item_type": it.item_type,
+                                "quantity": it.quantity,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "entity_id": b.entity_id.to_string(),
+                        "name": b.name,
+                        "nickname": b.nickname,
+                        "items": items,
+                    })
+                })
+                .collect();
+            json!({
+                "dimension_id": d.dimension_id,
+                "kind": d.kind,
+                "entrance": entrance,
+                "buildings": buildings,
+            })
+        })
+        .collect();
+    json!({
+        "claim": claim_json,
+        "dimensions": dimensions,
+    })
+}
+
+fn claim_from_store(s: &RegionStore, slot: usize) -> pb::Claim {
+    pb::Claim {
+        entity_id: s.claim.entity_id[slot],
+        name: s.claim.name[slot].to_string(),
+        owner_player_entity_id: s.claim.owner_player_entity_id[slot],
+        owner_building_entity_id: s.claim.owner_building_entity_id[slot],
+        neutral: s.claim.neutral[slot],
+        region: s.region,
+    }
+}
+
+async fn list_protos() -> impl IntoResponse {
+    let files: Vec<Value> = PROTO_FILES
+        .iter()
+        .map(|(name, body)| {
+            json!({
+                "name": name,
+                "path": format!("/proto/{name}"),
+                "bytes": body.len(),
+            })
+        })
+        .collect();
+    no_store_json(json!({ "protos": files }))
+}
+
+async fn get_proto(Path(name): Path<String>) -> Response {
+    let Some(body) = proto_body(&name) else {
+        return no_store_status(
+            StatusCode::NOT_FOUND,
+            json!({"error": "proto not found", "name": name}),
+        )
+        .into_response();
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(PROTO_SOURCE_MIME),
+    );
+    if let Ok(cd) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, cd);
+    }
+    (headers, body).into_response()
 }
 
 async fn healthz(State(fleet): State<Fleet>) -> impl IntoResponse {
@@ -100,8 +291,9 @@ struct NameQuery {
 
 async fn claim_by_name(
     State(fleet): State<Fleet>,
+    headers: HeaderMap,
     Query(q): Query<NameQuery>,
-) -> impl IntoResponse {
+) -> Response {
     let Some(needle) = q.name.as_deref().filter(|s| !s.is_empty()) else {
         return no_store_status(
             StatusCode::BAD_REQUEST,
@@ -117,24 +309,17 @@ async fn claim_by_name(
             continue;
         }
         for slot in s.claim.search_name(needle) {
-            let i = slot as usize;
-            hits.push(json!({
-                "entity_id": s.claim.entity_id[i].to_string(),
-                "name": &*s.claim.name[i],
-                "owner_player_entity_id": s.claim.owner_player_entity_id[i].to_string(),
-                "owner_building_entity_id": s.claim.owner_building_entity_id[i].to_string(),
-                "neutral": s.claim.neutral[i],
-                "region": s.region,
-            }));
+            hits.push(claim_from_store(&s, slot as usize));
         }
     }
-    no_store_json(json!(hits)).into_response()
+    respond_claim_list(&headers, hits)
 }
 
 async fn claim_by_pk(
     State(fleet): State<Fleet>,
+    headers: HeaderMap,
     Path(entity_id): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
         return no_store_status(
             StatusCode::BAD_REQUEST,
@@ -149,16 +334,7 @@ async fn claim_by_pk(
             continue;
         }
         if let Some(slot) = s.claim.find(pk) {
-            let i = slot as usize;
-            return no_store_json(json!({
-                "entity_id": s.claim.entity_id[i].to_string(),
-                "name": &*s.claim.name[i],
-                "owner_player_entity_id": s.claim.owner_player_entity_id[i].to_string(),
-                "owner_building_entity_id": s.claim.owner_building_entity_id[i].to_string(),
-                "neutral": s.claim.neutral[i],
-                "region": s.region,
-            }))
-            .into_response();
+            return respond_claim(&headers, claim_from_store(&s, slot as usize));
         }
     }
     no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
@@ -166,8 +342,9 @@ async fn claim_by_pk(
 
 async fn claim_inventory(
     State(fleet): State<Fleet>,
+    headers: HeaderMap,
     Path(entity_id): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
         return no_store_status(
             StatusCode::BAD_REQUEST,
@@ -189,7 +366,7 @@ async fn claim_inventory(
         let region = s.region;
 
         // dimension_id → buildings in that dimension
-        let mut by_dim: HashMap<u32, Vec<Value>> = HashMap::new();
+        let mut by_dim: HashMap<u32, Vec<pb::BuildingInventory>> = HashMap::new();
 
         for &b_slot in s.building.by_claim(pk) {
             let bi = b_slot as usize;
@@ -203,8 +380,14 @@ async fn claim_inventory(
             {
                 continue;
             }
-            let name = s.building_desc.get(building_description_id);
-            let nickname = s.building_nickname.get(building_entity_id);
+            let name = s
+                .building_desc
+                .get(building_description_id)
+                .map(str::to_owned);
+            let nickname = s
+                .building_nickname
+                .get(building_entity_id)
+                .map(str::to_owned);
             let dimension_id = s.location_dim.get_or_overworld(building_entity_id);
 
             let mut agg: HashMap<(i32, u8), i64> = HashMap::new();
@@ -216,60 +399,51 @@ async fn claim_inventory(
                 }
             }
 
-            let mut items: Vec<Value> = agg
+            let mut items: Vec<pb::InventoryItem> = agg
                 .into_iter()
-                .map(|((item_id, item_type), quantity)| {
-                    json!({
-                        "item_id": item_id,
-                        "item_type": item_type_label(item_type),
-                        "quantity": quantity,
-                    })
+                .map(|((item_id, item_type), quantity)| pb::InventoryItem {
+                    item_id,
+                    item_type: item_type_label(item_type).to_owned(),
+                    quantity,
                 })
                 .collect();
             items.sort_by(|a, b| {
-                let aid = a.get("item_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                let bid = b.get("item_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                aid.cmp(&bid).then_with(|| {
-                    let at = a.get("item_type").and_then(|v| v.as_str()).unwrap_or("");
-                    let bt = b.get("item_type").and_then(|v| v.as_str()).unwrap_or("");
-                    at.cmp(bt)
-                })
+                a.item_id
+                    .cmp(&b.item_id)
+                    .then_with(|| a.item_type.cmp(&b.item_type))
             });
 
-            by_dim.entry(dimension_id).or_default().push(json!({
-                "entity_id": building_entity_id.to_string(),
-                "name": name,
-                "nickname": nickname,
-                "items": items,
-            }));
+            by_dim
+                .entry(dimension_id)
+                .or_default()
+                .push(pb::BuildingInventory {
+                    entity_id: building_entity_id,
+                    name,
+                    nickname,
+                    items,
+                });
         }
 
-        let mut dimensions_out = Vec::with_capacity(by_dim.len());
+        let mut dimensions_out: Vec<(u32, String, pb::DimensionGroup)> =
+            Vec::with_capacity(by_dim.len());
         for (dimension_id, mut buildings) in by_dim {
-            buildings.sort_by(|a, b| {
-                let aid = a
-                    .get("entity_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let bid = b
-                    .get("entity_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                aid.cmp(&bid)
-            });
+            buildings.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
 
             let (kind, entrance) = dimension_meta(&s, dimension_id);
+            let sort_key = entrance
+                .as_ref()
+                .and_then(|e| e.name.as_deref())
+                .unwrap_or("")
+                .to_ascii_lowercase();
             dimensions_out.push((
                 dimension_id,
-                entrance_sort_key(&entrance),
-                json!({
-                    "dimension_id": dimension_id,
-                    "kind": kind,
-                    "entrance": entrance,
-                    "buildings": buildings,
-                }),
+                sort_key,
+                pb::DimensionGroup {
+                    dimension_id,
+                    kind: kind.to_owned(),
+                    entrance,
+                    buildings,
+                },
             ));
         }
 
@@ -282,36 +456,39 @@ async fn claim_inventory(
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        let dimensions: Vec<Value> = dimensions_out.into_iter().map(|(_, _, v)| v).collect();
+        let dimensions: Vec<pb::DimensionGroup> =
+            dimensions_out.into_iter().map(|(_, _, v)| v).collect();
 
-        return no_store_json(json!({
-            "claim": {
-                "entity_id": pk.to_string(),
-                "name": claim_name,
-                "region": region,
+        return respond_claim_inventory(
+            &headers,
+            pb::ClaimInventory {
+                claim: Some(pb::ClaimSummary {
+                    entity_id: pk,
+                    name: claim_name.to_owned(),
+                    region,
+                }),
+                dimensions,
             },
-            "dimensions": dimensions,
-        }))
-        .into_response();
+        );
     }
 
     no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
 }
 
-fn dimension_meta(s: &RegionStore, dimension_id: u32) -> (&'static str, Value) {
+fn dimension_meta(s: &RegionStore, dimension_id: u32) -> (&'static str, Option<pb::Entrance>) {
     if dimension_id == OVERWORLD_DIMENSION {
-        return ("overworld", Value::Null);
+        return ("overworld", None);
     }
     let Some(net) = s.dimension_network.by_entrance_dim(dimension_id) else {
-        return ("unknown", Value::Null);
+        return ("unknown", None);
     };
     let (name, nickname) = entrance_labels(s, net.building_id);
     (
         "building_interior",
-        json!({
-            "entity_id": net.building_id.to_string(),
-            "name": name,
-            "nickname": nickname,
+        Some(pb::Entrance {
+            entity_id: net.building_id,
+            name: name.map(str::to_owned),
+            nickname: nickname.map(str::to_owned),
         }),
     )
 }
@@ -324,14 +501,6 @@ fn entrance_labels(s: &RegionStore, building_id: u64) -> (Option<&str>, Option<&
         .map(|slot| s.building.building_description_id[slot as usize])
         .and_then(|desc_id| s.building_desc.get(desc_id));
     (name, nickname)
-}
-
-fn entrance_sort_key(entrance: &Value) -> String {
-    entrance
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
 }
 
 fn item_type_label(t: u8) -> &'static str {
@@ -348,6 +517,7 @@ mod tests {
         BuildingDescRow, BuildingRow, DimensionNetworkRow, LocationDimRow, OVERWORLD_DIMENSION,
     };
     use crate::store::RegionStore;
+    use prost::Message;
 
     fn seed_concordia_like(s: &mut RegionStore) {
         // Outdoor chest in overworld (no location row).
@@ -407,5 +577,105 @@ mod tests {
         assert_eq!(net.building_id, 200);
         let (name, _) = entrance_labels(&s, net.building_id);
         assert_eq!(name, Some("Sturdy Storehouse"));
+    }
+
+    #[test]
+    fn proto_registry_includes_relay_cache() {
+        let body = proto_body("relay_cache.proto").expect("embedded");
+        assert!(body.contains("message Claim"));
+        assert!(body.contains("message ClaimInventory"));
+        assert!(proto_body("../etc/passwd").is_none());
+        assert!(proto_body("missing.proto").is_none());
+    }
+
+    #[test]
+    fn accept_selects_protobuf() {
+        assert!(accept_wants_protobuf("application/x-protobuf"));
+        assert!(accept_wants_protobuf(
+            "application/json, application/x-protobuf"
+        ));
+        assert!(accept_wants_protobuf("application/x-protobuf;q=0.9"));
+        assert!(accept_wants_protobuf("APPLICATION/X-PROTOBUF"));
+        assert!(!accept_wants_protobuf("*/*"));
+        assert!(!accept_wants_protobuf("application/json"));
+        assert!(!accept_wants_protobuf(""));
+        assert!(!accept_wants_protobuf("application/protobuf"));
+    }
+
+    #[test]
+    fn claim_protobuf_roundtrip() {
+        let claim = pb::Claim {
+            entity_id: 99,
+            name: "Concordia".into(),
+            owner_player_entity_id: 1,
+            owner_building_entity_id: 2,
+            neutral: false,
+            region: 14,
+        };
+        let bytes = claim.encode_to_vec();
+        let decoded = pb::Claim::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, claim);
+
+        let json = claim_to_json(&claim);
+        assert_eq!(json["entity_id"], "99");
+        assert_eq!(json["name"], "Concordia");
+        assert_eq!(json["region"], 14);
+    }
+
+    #[test]
+    fn claim_inventory_protobuf_roundtrip() {
+        let inv = pb::ClaimInventory {
+            claim: Some(pb::ClaimSummary {
+                entity_id: 99,
+                name: "Concordia".into(),
+                region: 14,
+            }),
+            dimensions: vec![pb::DimensionGroup {
+                dimension_id: OVERWORLD_DIMENSION,
+                kind: "overworld".into(),
+                entrance: None,
+                buildings: vec![pb::BuildingInventory {
+                    entity_id: 1,
+                    name: Some("Sturdy Large Chest".into()),
+                    nickname: None,
+                    items: vec![pb::InventoryItem {
+                        item_id: 42,
+                        item_type: "Item".into(),
+                        quantity: 3,
+                    }],
+                }],
+            }],
+        };
+        let bytes = inv.encode_to_vec();
+        let decoded = pb::ClaimInventory::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, inv);
+
+        let json = claim_inventory_to_json(&inv);
+        assert_eq!(json["claim"]["entity_id"], "99");
+        assert_eq!(json["dimensions"][0]["kind"], "overworld");
+        assert_eq!(json["dimensions"][0]["entrance"], Value::Null);
+        assert_eq!(json["dimensions"][0]["buildings"][0]["entity_id"], "1");
+        assert_eq!(
+            json["dimensions"][0]["buildings"][0]["items"][0]["item_id"],
+            42
+        );
+    }
+
+    #[test]
+    fn claim_list_wraps_for_protobuf() {
+        let claims = vec![pb::Claim {
+            entity_id: 1,
+            name: "A".into(),
+            owner_player_entity_id: 0,
+            owner_building_entity_id: 0,
+            neutral: true,
+            region: 3,
+        }];
+        let list = pb::ClaimList {
+            claims: claims.clone(),
+        };
+        let decoded = pb::ClaimList::decode(list.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.claims.len(), 1);
+        assert_eq!(decoded.claims[0].name, "A");
     }
 }

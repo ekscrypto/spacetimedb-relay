@@ -3,7 +3,8 @@
 Same-host in-memory read cache over the relay fleet. Subscribes to each
 regional frontend on loopback (`ws://127.0.0.1:<port>`, v2), holds
 `claim_state` / `building_state` / `inventory_state` in columnar memory,
-and serves three HTTP/JSON queries on `127.0.0.1:8089`.
+and serves three HTTP queries on `127.0.0.1:8089` (JSON by default;
+protobuf via `Accept: application/x-protobuf`).
 
 Replaces the cross-host polling model of `bitcraft-relay-sync` for
 hot-path reads — no 5-minute snapshot staleness, no Postgres round-trip.
@@ -45,8 +46,22 @@ curl -s http://127.0.0.1:8089/claim/1234567890/inventory
 #        "entrance": { "entity_id", "name", "nickname" }, "buildings": [...] }
 #    ] }
 
-# Health / readiness
+# Health / readiness (always JSON)
 curl -s http://127.0.0.1:8089/healthz
+
+# Protobuf schemas (JSON list + raw `.proto` download)
+curl -s http://127.0.0.1:8089/proto
+curl -sO http://127.0.0.1:8089/proto/relay_cache.proto
+
+# Same data routes as protobuf (`Accept: application/x-protobuf`).
+# Name-search wraps the array in ClaimList; entity IDs are uint64
+# (JSON keeps them as strings for JS safety).
+curl -sH 'Accept: application/x-protobuf' \
+  http://127.0.0.1:8089/claim/1234567890 -o claim.pb
+curl -sH 'Accept: application/x-protobuf' \
+  'http://127.0.0.1:8089/claim?name=concordia' -o claims.pb
+curl -sH 'Accept: application/x-protobuf' \
+  http://127.0.0.1:8089/claim/1234567890/inventory -o inventory.pb
 ```
 
 Public (nginx on `relay.bitcraftsync.app` → loopback `:8089`; see
@@ -54,8 +69,12 @@ Public (nginx on `relay.bitcraftsync.app` → loopback `:8089`; see
 
 ```sh
 curl -s https://relay.bitcraftsync.app/healthz
+curl -s https://relay.bitcraftsync.app/proto
+curl -sO https://relay.bitcraftsync.app/proto/relay_cache.proto
 curl -s 'https://relay.bitcraftsync.app/claim?name=concordia'
 curl -s https://relay.bitcraftsync.app/claim/1234567890/inventory
+curl -sH 'Accept: application/x-protobuf' \
+  https://relay.bitcraftsync.app/claim/1234567890/inventory -o inventory.pb
 ```
 
 ## Memory policy
