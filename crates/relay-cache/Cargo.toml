@@ -1,0 +1,42 @@
+[package]
+name = "relay-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "relay-cache"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+rustls = { workspace = true }
+
+axum = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+clap = { workspace = true }
+parking_lot = { workspace = true }
+sysinfo = { workspace = true }
+hashbrown = { workspace = true }
+reqwest = { workspace = true }
+
+spacetimedb-sats = { workspace = true }
+spacetimedb-client-api-messages = { workspace = true }
+
+relay-protocol = { workspace = true }
+relay-coordinator = { workspace = true }

@@ -1,0 +1,36 @@
+# Same-host in-memory read cache over the relay fleet.
+#
+# Subscribes to each regional frontend on loopback (v2), holds
+# claim_state / building_state / inventory_state in columnar memory,
+# and serves three HTTP/JSON queries on 127.0.0.1:8089.
+#
+# Depends on the regional relay frontends being up (discovered from
+# /etc/systemd/system/relay-bc*.service). Schema is fetched once at
+# startup via HTTPS to nginx on this host.
+[Unit]
+Description=spacetimedb-relay in-memory read cache
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+ExecStart=/srv/relay/spacetimedb-relay/target/release/relay-cache \
+    --bind 127.0.0.1:8089 \
+    --unit-dir /etc/systemd/system \
+    --schema-host 127.0.0.1:3014 \
+    --schema-db relay-mirror-bc14
+WorkingDirectory=/srv/relay/spacetimedb-relay
+Environment="PATH=/srv/relay/.local/bin:/srv/relay/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=relay_cache=info"
+Restart=on-failure
+RestartSec=5s
+# Initial SubscribeApplied for inventory-heavy regions can take minutes.
+TimeoutStartSec=0
+TimeoutStopSec=30s
+# Soft ceiling matching the binary default (4 GiB); OS OOM is the hard stop.
+MemoryHigh=4G
+
+[Install]
+WantedBy=multi-user.target
