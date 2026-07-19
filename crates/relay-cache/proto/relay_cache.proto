@@ -98,6 +98,8 @@ message ClaimMember {
   bool build_permission = 6;
   bool officer_permission = 7;
   bool co_owner_permission = 8;
+  // Unix seconds from player_state.sign_in_timestamp (BitJita lastLogin).
+  optional int64 last_login_timestamp = 9;
 }
 
 message ClaimMemberList {
@@ -116,6 +118,7 @@ message ClaimCitizen {
   uint64 entity_id = 1;
   string user_name = 2;
   repeated CitizenSkill skills = 3;
+  optional int64 last_login_timestamp = 4;
 }
 
 message SkillNameEntry {
@@ -158,6 +161,9 @@ message Player {
   uint64 entity_id = 1;
   string username = 2;
   uint32 region = 3;
+  // Unix seconds from player_state.sign_in_timestamp.
+  optional int64 last_login_timestamp = 4;
+  optional bool signed_in = 5;
 }
 
 message PlayerList {

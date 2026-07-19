@@ -20,7 +20,7 @@ use crate::decode::{
     CLAIM_MEMBER_TABLE, CLAIM_TABLE, CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE,
     CLAIM_TILE_COST_TABLE, DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE,
     EXPERIENCE_TABLE, INVENTORY_TABLE, LOCATION_TABLE, PLAYER_HOUSING_DESC_TABLE,
-    PLAYER_HOUSING_TABLE, PLAYER_USERNAME_TABLE, RENT_TABLE, SKILL_DESC_TABLE,
+    PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE, PLAYER_USERNAME_TABLE, RENT_TABLE, SKILL_DESC_TABLE,
 };
 use crate::store::RegionStore;
 use crate::wire;
@@ -53,6 +53,7 @@ struct TableMeta {
     location_fields: Vec<MirroredField>,
     dimension_network_fields: Vec<MirroredField>,
     player_username_fields: Vec<MirroredField>,
+    player_state_fields: Vec<MirroredField>,
     deployable_fields: Vec<MirroredField>,
     deployable_desc_fields: Vec<MirroredField>,
     player_housing_fields: Vec<MirroredField>,
@@ -80,6 +81,7 @@ impl TableMeta {
             location_fields: fields_owned(schema, LOCATION_TABLE)?,
             dimension_network_fields: fields_owned(schema, DIMENSION_NETWORK_TABLE)?,
             player_username_fields: fields_owned(schema, PLAYER_USERNAME_TABLE)?,
+            player_state_fields: fields_owned(schema, PLAYER_STATE_TABLE)?,
             deployable_fields: fields_owned(schema, DEPLOYABLE_TABLE)?,
             deployable_desc_fields: fields_owned(schema, DEPLOYABLE_DESC_TABLE)?,
             player_housing_fields: fields_owned(schema, PLAYER_HOUSING_TABLE)?,
@@ -230,6 +232,7 @@ async fn session(
         format!("SELECT * FROM {LOCATION_TABLE} WHERE dimension != 1"),
         format!("SELECT * FROM {DIMENSION_NETWORK_TABLE}"),
         format!("SELECT * FROM {PLAYER_USERNAME_TABLE}"),
+        format!("SELECT * FROM {PLAYER_STATE_TABLE}"),
         format!("SELECT * FROM {DEPLOYABLE_TABLE}"),
         format!("SELECT * FROM {DEPLOYABLE_DESC_TABLE}"),
         format!("SELECT * FROM {PLAYER_HOUSING_TABLE}"),
@@ -256,6 +259,7 @@ async fn session(
             let n_location_dim = fresh.location_dim.len();
             let n_dimension_network = fresh.dimension_network.len();
             let n_player_username = fresh.player_username.len();
+            let n_player_state = fresh.player_state.len();
             let n_deployable = fresh.deployable.len();
             let n_deployable_desc = fresh.deployable_desc.len();
             let n_player_housing = fresh.player_housing.len();
@@ -283,6 +287,7 @@ async fn session(
                 n_location_dim,
                 n_dimension_network,
                 n_player_username,
+                n_player_state,
                 n_deployable,
                 n_deployable_desc,
                 n_player_housing,
@@ -581,6 +586,26 @@ fn apply_rows(
                     schema,
                 )?;
                 store.player_username.upsert(decoded);
+            }
+        }
+        PLAYER_STATE_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_player_state_with_fields(
+                    row,
+                    &meta.player_state_fields,
+                    meta.cols.player_state,
+                    schema,
+                )?;
+                store.player_state.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_player_state_with_fields(
+                    row,
+                    &meta.player_state_fields,
+                    meta.cols.player_state,
+                    schema,
+                )?;
+                store.player_state.upsert(decoded);
             }
         }
         DEPLOYABLE_TABLE => {

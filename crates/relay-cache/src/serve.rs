@@ -459,6 +459,7 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
                 "location_dim": s.location_dim.len(),
                 "dimension_network": s.dimension_network.len(),
                 "player_username": s.player_username.len(),
+                "player_state": s.player_state.len(),
                 "deployable": s.deployable.len(),
                 "deployable_desc": s.deployable_desc.len(),
                 "player_housing": s.player_housing.len(),
@@ -677,7 +678,7 @@ fn respond_claim_members(headers: &HeaderMap, body: pb::ClaimMemberList) -> Resp
             .members
             .iter()
             .map(|m| {
-                json!({
+                let mut obj = json!({
                     "entity_id": m.entity_id.to_string(),
                     "claim_entity_id": m.claim_entity_id.to_string(),
                     "player_entity_id": m.player_entity_id.to_string(),
@@ -686,7 +687,13 @@ fn respond_claim_members(headers: &HeaderMap, body: pb::ClaimMemberList) -> Resp
                     "build_permission": m.build_permission,
                     "officer_permission": m.officer_permission,
                     "co_owner_permission": m.co_owner_permission,
-                })
+                });
+                if let Some(ts) = m.last_login_timestamp {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("last_login_timestamp".into(), json!(ts));
+                }
+                obj
             })
             .collect();
         let claim = body.claim.as_ref().map(|c| {
@@ -721,11 +728,17 @@ fn respond_claim_citizens(headers: &HeaderMap, body: pb::ClaimCitizens) -> Respo
                 for sk in &c.skills {
                     skills.insert(sk.skill_id.to_string(), json!(sk.level));
                 }
-                json!({
+                let mut obj = json!({
                     "entity_id": c.entity_id.to_string(),
                     "user_name": c.user_name,
                     "skills": skills,
-                })
+                });
+                if let Some(ts) = c.last_login_timestamp {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("last_login_timestamp".into(), json!(ts));
+                }
+                obj
             })
             .collect();
         let claim = body.claim.as_ref().map(|c| {
@@ -832,15 +845,17 @@ async fn claim_members(
             .iter()
             .map(|&slot| {
                 let i = slot as usize;
+                let player_entity_id = s.claim_member.player_entity_id[i];
                 pb::ClaimMember {
                     entity_id: s.claim_member.entity_id[i],
                     claim_entity_id: s.claim_member.claim_entity_id[i],
-                    player_entity_id: s.claim_member.player_entity_id[i],
+                    player_entity_id,
                     user_name: s.claim_member.user_name[i].to_string(),
                     inventory_permission: s.claim_member.inventory_permission[i],
                     build_permission: s.claim_member.build_permission[i],
                     officer_permission: s.claim_member.officer_permission[i],
                     co_owner_permission: s.claim_member.co_owner_permission[i],
+                    last_login_timestamp: s.player_state.last_login_timestamp(player_entity_id),
                 }
             })
             .collect();
@@ -909,6 +924,7 @@ async fn claim_citizens(
                 entity_id: player_id,
                 user_name: s.claim_member.user_name[i].to_string(),
                 skills,
+                last_login_timestamp: s.player_state.last_login_timestamp(player_id),
             });
         }
         let skill_names: Vec<pb::SkillNameEntry> = skill_name_map
@@ -1162,11 +1178,37 @@ fn respond_player_housing(headers: &HeaderMap, housing: pb::PlayerHousing) -> Re
 }
 
 fn player_to_json(p: &pb::Player) -> Value {
-    json!({
-        "entity_id": p.entity_id.to_string(),
-        "username": p.username,
-        "region": p.region,
-    })
+    let mut map = serde_json::Map::new();
+    map.insert("entity_id".into(), json!(p.entity_id.to_string()));
+    map.insert("username".into(), json!(p.username));
+    map.insert("region".into(), json!(p.region));
+    if let Some(ts) = p.last_login_timestamp {
+        map.insert("last_login_timestamp".into(), json!(ts));
+    }
+    if let Some(signed_in) = p.signed_in {
+        map.insert("signed_in".into(), json!(signed_in));
+    }
+    Value::Object(map)
+}
+
+fn player_from_store(s: &crate::store::RegionStore, entity_id: u64, username: String) -> pb::Player {
+    let (last_login_timestamp, signed_in) = match s.player_state.find(entity_id) {
+        Some(slot) => {
+            let i = slot as usize;
+            (
+                s.player_state.last_login_timestamp(entity_id),
+                Some(s.player_state.signed_in[i]),
+            )
+        }
+        None => (None, None),
+    };
+    pb::Player {
+        entity_id,
+        username,
+        region: s.region,
+        last_login_timestamp,
+        signed_in,
+    }
 }
 
 fn player_inventory_to_json(inv: &pb::PlayerInventory) -> Value {
@@ -1251,11 +1293,11 @@ fn find_player(fleet: &Fleet, pk: u64) -> Option<pb::Player> {
             continue;
         }
         if let Some(slot) = s.player_username.find(pk) {
-            return Some(pb::Player {
-                entity_id: pk,
-                username: s.player_username.username[slot as usize].to_string(),
-                region: s.region,
-            });
+            return Some(player_from_store(
+                &s,
+                pk,
+                s.player_username.username[slot as usize].to_string(),
+            ));
         }
     }
     None
@@ -1286,11 +1328,11 @@ async fn player_by_name(
             if seen.insert(entity_id, ()).is_some() {
                 continue;
             }
-            hits.push(pb::Player {
+            hits.push(player_from_store(
+                &s,
                 entity_id,
-                username: s.player_username.username[slot as usize].to_string(),
-                region: s.region,
-            });
+                s.player_username.username[slot as usize].to_string(),
+            ));
         }
     }
     respond_player_list(&headers, hits)
@@ -1473,6 +1515,8 @@ async fn player_inventory(
                 entity_id: pk,
                 username: String::new(),
                 region: 0,
+                last_login_timestamp: None,
+                signed_in: None,
             })
         }
     }) else {
@@ -1993,9 +2037,13 @@ mod tests {
             entity_id: 7,
             username: "Tester".into(),
             region: 14,
+            last_login_timestamp: Some(1_700_000_000),
+            signed_in: Some(true),
         };
         let decoded = pb::Player::decode(player.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, player);
         assert_eq!(player_to_json(&player)["entity_id"], "7");
+        assert_eq!(player_to_json(&player)["last_login_timestamp"], 1_700_000_000);
+        assert_eq!(player_to_json(&player)["signed_in"], true);
     }
 }

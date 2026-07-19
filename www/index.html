@@ -399,8 +399,8 @@
             Claim cache (<code>relay-cache</code>): readiness plus
             claim lookup by PK or name substring (PK includes supplies,
             upkeep, tier, researched techs, owner username), per-claim
-            inventory, members, citizens (skill levels), and hexcoin
-            totals. Town Banks are omitted from inventory.
+            inventory, members (incl. last login), citizens (skill levels),
+            and hexcoin totals. Town Banks are omitted from inventory.
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/cache-health</div>
             <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/claim?name=concordia'</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/claim/&lt;id&gt;/inventory</div>
@@ -417,7 +417,8 @@
             <a class="ep" href="/player?name=maple" target="_blank" rel="noopener">/player</a>
           </td>
           <td>
-            Player cache (<code>relay-cache</code>): username search,
+            Player cache (<code>relay-cache</code>): username search
+            (incl. <code>last_login_timestamp</code> / <code>signed_in</code>),
             personal inventories (pockets / bank / wagon / cache /
             recovery / deployable &mdash; Toolbelt and Wallet omitted),
             first-house contents resolved server-side from the

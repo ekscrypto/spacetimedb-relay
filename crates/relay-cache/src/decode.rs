@@ -39,6 +39,7 @@ pub const BUILDING_NICKNAME_TABLE: &str = "building_nickname_state";
 pub const LOCATION_TABLE: &str = "location_state";
 pub const DIMENSION_NETWORK_TABLE: &str = "dimension_network_state";
 pub const PLAYER_USERNAME_TABLE: &str = "player_username_state";
+pub const PLAYER_STATE_TABLE: &str = "player_state";
 pub const DEPLOYABLE_TABLE: &str = "deployable_state";
 pub const DEPLOYABLE_DESC_TABLE: &str = "deployable_desc";
 pub const PLAYER_HOUSING_TABLE: &str = "player_housing_state";
@@ -186,6 +187,14 @@ pub struct PlayerUsernameCols {
 }
 
 #[derive(Clone, Copy)]
+pub struct PlayerStateCols {
+    pub entity_id: usize,
+    pub sign_in_timestamp: usize,
+    pub session_start_timestamp: usize,
+    pub signed_in: usize,
+}
+
+#[derive(Clone, Copy)]
 pub struct DeployableCols {
     pub entity_id: usize,
     pub owner_id: usize,
@@ -242,6 +251,7 @@ pub struct ColMaps {
     pub location: LocationCols,
     pub dimension_network: DimensionNetworkCols,
     pub player_username: PlayerUsernameCols,
+    pub player_state: PlayerStateCols,
     pub deployable: DeployableCols,
     pub deployable_desc: DeployableDescCols,
     pub player_housing: PlayerHousingCols,
@@ -268,6 +278,7 @@ pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
         location: resolve_location_cols(schema)?,
         dimension_network: resolve_dimension_network_cols(schema)?,
         player_username: resolve_player_username_cols(schema)?,
+        player_state: resolve_player_state_cols(schema)?,
         deployable: resolve_deployable_cols(schema)?,
         deployable_desc: resolve_deployable_desc_cols(schema)?,
         player_housing: resolve_player_housing_cols(schema)?,
@@ -464,6 +475,16 @@ fn resolve_player_username_cols(schema: &MirroredSchema) -> Result<PlayerUsernam
     })
 }
 
+fn resolve_player_state_cols(schema: &MirroredSchema) -> Result<PlayerStateCols> {
+    let f = fields_of(schema, PLAYER_STATE_TABLE)?;
+    Ok(PlayerStateCols {
+        entity_id: find_field(f, "entity_id", PLAYER_STATE_TABLE)?,
+        sign_in_timestamp: find_field(f, "sign_in_timestamp", PLAYER_STATE_TABLE)?,
+        session_start_timestamp: find_field(f, "session_start_timestamp", PLAYER_STATE_TABLE)?,
+        signed_in: find_field(f, "signed_in", PLAYER_STATE_TABLE)?,
+    })
+}
+
 fn resolve_deployable_cols(schema: &MirroredSchema) -> Result<DeployableCols> {
     let f = fields_of(schema, DEPLOYABLE_TABLE)?;
     Ok(DeployableCols {
@@ -587,6 +608,14 @@ pub struct DimensionNetworkRow {
 pub struct PlayerUsernameRow {
     pub entity_id: u64,
     pub username: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerStateRow {
+    pub entity_id: u64,
+    pub sign_in_timestamp: i32,
+    pub session_start_timestamp: i32,
+    pub signed_in: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -873,6 +902,27 @@ pub fn decode_player_username_with_fields(
     Ok(PlayerUsernameRow {
         entity_id: cell_u64(&cells[cols.entity_id], "player_username.entity_id")?,
         username: cell_string(&cells[cols.username], "player_username.username")?,
+    })
+}
+
+pub fn decode_player_state_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: PlayerStateCols,
+    schema: &MirroredSchema,
+) -> Result<PlayerStateRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(PlayerStateRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "player_state.entity_id")?,
+        sign_in_timestamp: cell_i32(
+            &cells[cols.sign_in_timestamp],
+            "player_state.sign_in_timestamp",
+        )?,
+        session_start_timestamp: cell_i32(
+            &cells[cols.session_start_timestamp],
+            "player_state.session_start_timestamp",
+        )?,
+        signed_in: cell_bool(&cells[cols.signed_in], "player_state.signed_in")?,
     })
 }
 

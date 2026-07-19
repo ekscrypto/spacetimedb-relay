@@ -46,10 +46,11 @@ curl -s http://127.0.0.1:8089/claim/1234567890/inventory
 #        "entrance": { "entity_id", "name", "nickname" }, "buildings": [...] }
 #    ] }
 
-# Claim member roster (permissions + usernames)
+# Claim member roster (permissions + usernames + last_login_timestamp)
 curl -s http://127.0.0.1:8089/claim/1234567890/members
 
 # Claim citizens: members joined to skill levels + skill_names map
+# (includes last_login_timestamp when known)
 curl -s http://127.0.0.1:8089/claim/1234567890/citizens
 
 # Per-member Hex Coin totals (item_id == 1 across personal bags)
@@ -57,9 +58,14 @@ curl -s http://127.0.0.1:8089/claim/1234567890/hexcoins
 
 # Player by name substring (case-insensitive; clients should send ≥2 chars)
 curl -s 'http://127.0.0.1:8089/player?name=maple'
-# → [ { "entity_id", "username", "region" }, ... ]
+# → [ { "entity_id", "username", "region",
+#       "last_login_timestamp"?, "signed_in"? }, ... ]
 
 curl -s http://127.0.0.1:8089/player/1297036692699996362
+# → { "entity_id", "username", "region",
+#     "last_login_timestamp"?, "signed_in"? }
+# last_login_timestamp is unix seconds from player_state.sign_in_timestamp
+# (BitJita lastLogin); omitted when unknown / zero.
 
 # Personal inventories (pockets / bank / wagon / cache / recovery /
 # deployable). Toolbelt & Wallet omitted. Items aggregated per bag.
