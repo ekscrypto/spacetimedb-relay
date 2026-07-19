@@ -123,18 +123,34 @@ async fn handle_accept(
     let cb = SubprotocolNegotiator {
         chosen: &mut chosen,
     };
-    let ws = match tokio_tungstenite::accept_hdr_async(stream, cb).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            tracing::warn!(
-                target: "relay::frontend",
-                peer = %peer,
-                error = %e,
-                "ws handshake failed"
-            );
-            return;
-        }
+    // Disable tungstenite's 64 MiB default message/frame size cap. The
+    // downstream-facing server is the WS reader for frames the local stdb
+    // emits, and a single `SubscribeApplied` for a large public table
+    // (BitCraft's `location_state` snapshot is ~1 GB as one WS message) can
+    // exceed the default — observed downstream as `Connection reset without
+    // closing handshake` after 0 rows. Every WS *client* path in this repo
+    // already sets None/None (see relay-upstream client.rs and
+    // relay-mirror-driver lib.rs); the server acceptor was the one site that
+    // inherited the default, so downstream subscriptions to large tables died
+    // even though the upstream path receiving the same table was fine.
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: None,
+        max_frame_size: None,
+        ..Default::default()
     };
+    let ws =
+        match tokio_tungstenite::accept_hdr_async_with_config(stream, cb, Some(ws_config)).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                tracing::warn!(
+                    target: "relay::frontend",
+                    peer = %peer,
+                    error = %e,
+                    "ws handshake failed"
+                );
+                return;
+            }
+        };
     let Some(subprotocol) = chosen else {
         tracing::warn!(
             target: "relay::frontend",
