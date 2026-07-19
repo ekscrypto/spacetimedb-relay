@@ -982,7 +982,23 @@ async fn connect_local(
             req.headers_mut().insert(AUTHORIZATION, v);
         }
     }
-    let (ws, resp) = tokio_tungstenite::connect_async(req)
+    // Disable tungstenite's 64 MiB default message/frame size cap. The local
+    // stdb emits the full snapshot for a subscribed table as a single
+    // `InitialSubscription` / `SubscribeApplied` WS message, and for large
+    // public tables (BitCraft's `location_state` is ~1 GB) that one message
+    // exceeds the default — observed as `Connection reset without closing
+    // handshake` on the downstream client because this reader aborts first.
+    // The sibling path used by the upstream/mirror driver already sets
+    // None/None (relay-mirror-driver lib.rs); this site — the frontend's
+    // outbound fetch from its spawned stdb when serving a downstream
+    // subscribe — was the remaining cap, so downstream subscriptions to any
+    // large table died even with the listener acceptor fixed.
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: None,
+        max_frame_size: None,
+        ..Default::default()
+    };
+    let (ws, resp) = tokio_tungstenite::connect_async_with_config(req, Some(ws_config), false)
         .await
         .map_err(|e| ClientError::LocalConnect(e.to_string()))?;
     if let Some(got) = resp.headers().get(SEC_WEBSOCKET_PROTOCOL) {
