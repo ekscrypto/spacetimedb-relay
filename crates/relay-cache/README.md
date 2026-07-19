@@ -67,8 +67,8 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362
 # last_login_timestamp is unix seconds from player_state.sign_in_timestamp
 # (BitJita lastLogin); omitted when unknown / zero.
 
-# Personal inventories (pockets / bank / wagon / cache / recovery /
-# deployable). Toolbelt & Wallet omitted. Items aggregated per bag.
+# Personal inventories (pockets / toolbelt / wallet / bank / wagon /
+# cache / recovery / deployable). Items aggregated per bag.
 curl -s http://127.0.0.1:8089/player/1297036692699996362/inventory
 # → { "player": {...}, "inventories": [
 #      { "entity_id", "name", "nickname", "category",

@@ -174,7 +174,8 @@ message PlayerInventoryBag {
   uint64 entity_id = 1;
   string name = 2;
   optional string nickname = 3;
-  // "pockets" | "bank" | "wagon" | "cache" | "recovery" | "deployable"
+  // "pockets" | "toolbelt" | "wallet" | "bank" | "wagon" | "cache" |
+  // "recovery" | "deployable"
   string category = 4;
   optional uint64 claim_entity_id = 5;
   optional string claim_name = 6;

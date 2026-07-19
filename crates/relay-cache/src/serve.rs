@@ -1359,8 +1359,8 @@ async fn player_by_pk(
     }
 }
 
-/// Classify one inventory row for a player. Returns `None` for Toolbelt,
-/// Wallet, and unrecognized owners.
+/// Classify one inventory row for a player. Returns `None` for
+/// unrecognized owners / unknown body-bag indexes.
 fn classify_player_bag(
     s: &RegionStore,
     inv_slot: u32,
@@ -1374,9 +1374,15 @@ fn classify_player_bag(
 
     let (category, name, nickname, claim_entity_id, claim_name) = if owner == player_id {
         // Body bags: Inventory / Toolbelt / Wallet.
+        // inventory_index is the BitCraft body-bag discriminant
+        // (0=Inventory, 1=Toolbelt, 2=Wallet) — not a free-form slot.
+        // Wallet pockets typically hold Hex Coin (item_id=1) and
+        // Hexite Energy (item_id=828972621); surfaced as ordinary items.
         match inventory_index {
             0 => ("pockets", "Pockets".to_owned(), None, None, None),
-            _ => return None, // Toolbelt, Wallet, unknown
+            1 => ("toolbelt", "Toolbelt".to_owned(), None, None, None),
+            2 => ("wallet", "Wallet".to_owned(), None, None, None),
+            _ => return None,
         }
     } else if player_owner == player_id {
         if let Some(b_slot) = s.building.find(owner) {
@@ -1872,7 +1878,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_drops_toolbelt_keeps_pockets_and_bank() {
+    fn classify_keeps_all_body_bags_and_bank() {
         use crate::decode::InventoryRow;
         use crate::store::Pocket;
 
@@ -1909,6 +1915,24 @@ mod tests {
             has_durability: false,
             durability: 0,
         };
+        let hexcoin = Pocket {
+            volume: 100,
+            has_contents: true,
+            item_id: 1, // Hex Coin
+            quantity: 50,
+            item_type: Pocket::ITEM,
+            has_durability: false,
+            durability: 0,
+        };
+        let hexite = Pocket {
+            volume: 100,
+            has_contents: true,
+            item_id: 828972621, // Hexite Energy (not teleportation_energy_state)
+            quantity: 180,
+            item_type: Pocket::ITEM,
+            has_durability: false,
+            durability: 0,
+        };
         s.inventory.upsert(InventoryRow {
             entity_id: 1,
             pockets: Box::from([pocket]),
@@ -1926,6 +1950,14 @@ mod tests {
             player_owner_entity_id: 0,
         });
         s.inventory.upsert(InventoryRow {
+            entity_id: 4,
+            pockets: Box::from([hexcoin, hexite]),
+            inventory_index: 2,
+            cargo_index: 0,
+            owner_entity_id: 7,
+            player_owner_entity_id: 0,
+        });
+        s.inventory.upsert(InventoryRow {
             entity_id: 3,
             pockets: Box::from([pocket]),
             inventory_index: 0,
@@ -1936,7 +1968,19 @@ mod tests {
 
         let pockets = classify_player_bag(&s, s.inventory.find(1).unwrap(), 7).unwrap();
         assert_eq!(pockets.category, "pockets");
-        assert!(classify_player_bag(&s, s.inventory.find(2).unwrap(), 7).is_none());
+        let toolbelt = classify_player_bag(&s, s.inventory.find(2).unwrap(), 7).unwrap();
+        assert_eq!(toolbelt.category, "toolbelt");
+        assert_eq!(toolbelt.name, "Toolbelt");
+        let wallet = classify_player_bag(&s, s.inventory.find(4).unwrap(), 7).unwrap();
+        assert_eq!(wallet.category, "wallet");
+        assert_eq!(wallet.name, "Wallet");
+        assert_eq!(wallet.items.len(), 2);
+        assert!(wallet.items.iter().any(|i| i.item_id == 1 && i.quantity == 50));
+        // Checkpoint shape matches live Maplesugar wallet (27488 / 180).
+        assert!(wallet
+            .items
+            .iter()
+            .any(|i| i.item_id == 828972621 && i.quantity == 180));
         let bank = classify_player_bag(&s, s.inventory.find(3).unwrap(), 7).unwrap();
         assert_eq!(bank.category, "bank");
         assert_eq!(bank.claim_name.as_deref(), Some("Concordia"));
