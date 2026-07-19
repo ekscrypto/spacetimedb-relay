@@ -22,7 +22,7 @@ use crate::decode::{
     DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE, EXPERIENCE_TABLE,
     GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE, LOCATION_TABLE, PASSIVE_CRAFT_TABLE,
     PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE, PLAYER_USERNAME_TABLE,
-    PROGRESSIVE_ACTION_TABLE, RENT_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE,
+    PROGRESSIVE_ACTION_TABLE, RENT_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE, STORAGE_LOG_TABLE,
 };
 use crate::store::RegionStore;
 use crate::wire;
@@ -68,6 +68,7 @@ struct TableMeta {
     crafting_recipe_desc_fields: Vec<MirroredField>,
     resource_fields: Vec<MirroredField>,
     growth_fields: Vec<MirroredField>,
+    storage_log_fields: Vec<MirroredField>,
 }
 
 impl TableMeta {
@@ -101,6 +102,7 @@ impl TableMeta {
             crafting_recipe_desc_fields: fields_owned(schema, CRAFTING_RECIPE_DESC_TABLE)?,
             resource_fields: fields_owned(schema, RESOURCE_TABLE)?,
             growth_fields: fields_owned(schema, GROWTH_TABLE)?,
+            storage_log_fields: fields_owned(schema, STORAGE_LOG_TABLE)?,
         })
     }
 }
@@ -481,6 +483,9 @@ fn base_subscribe_queries() -> Vec<String> {
         // Public growth countdowns (Hexite depleted→grown, Maker's Tree, …).
         // Exact respawn_at for depleted Hexite is growth_state.end_timestamp.
         format!("SELECT * FROM {GROWTH_TABLE}"),
+        // Append-only deposit/withdraw history; upstream cleanup_loop deletes
+        // rows older than the retention window (~15–16 days).
+        format!("SELECT * FROM {STORAGE_LOG_TABLE}"),
     ]
 }
 
@@ -1113,6 +1118,38 @@ fn apply_rows(
                     schema,
                 )?;
                 store.growth.upsert(decoded);
+            }
+        }
+        STORAGE_LOG_TABLE => {
+            for row in deletes {
+                match decode::decode_storage_log_with_fields(
+                    row,
+                    &meta.storage_log_fields,
+                    meta.cols.storage_log,
+                    schema,
+                ) {
+                    Ok(decoded) => store.storage_log.delete(decoded.id),
+                    Err(e) => tracing::warn!(
+                        target: "relay_cache::shard",
+                        error = %e,
+                        "skip malformed storage_log_state delete"
+                    ),
+                }
+            }
+            for row in inserts {
+                match decode::decode_storage_log_with_fields(
+                    row,
+                    &meta.storage_log_fields,
+                    meta.cols.storage_log,
+                    schema,
+                ) {
+                    Ok(decoded) => store.storage_log.upsert(decoded),
+                    Err(e) => tracing::warn!(
+                        target: "relay_cache::shard",
+                        error = %e,
+                        "skip malformed storage_log_state insert"
+                    ),
+                }
             }
         }
         other => {

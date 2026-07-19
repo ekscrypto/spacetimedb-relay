@@ -75,6 +75,7 @@ pub async fn serve(
         .route("/player/:entity_id/skills", get(player_skills))
         .route("/player/:entity_id/crafts", get(player_crafts))
         .route("/deposits", get(hexite_deposits))
+        .route("/storage-logs", get(storage_logs))
         .with_state(fleet);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -475,6 +476,7 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
                 "crafting_recipe_desc": s.crafting_recipe_desc.len(),
                 "resource": s.resource.len(),
                 "growth": s.growth.len(),
+                "storage_log_state": s.storage_log.len(),
             }
         }));
     }
@@ -902,6 +904,268 @@ fn respond_player_crafts(headers: &HeaderMap, body: pb::PlayerCrafts) -> Respons
 struct DepositsQuery {
     /// Optional region id filter (BitCraft region 1–25).
     region: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageLogsQuery {
+    #[serde(rename = "storageId")]
+    storage_id: Option<String>,
+    #[serde(rename = "playerId")]
+    player_id: Option<String>,
+    #[serde(rename = "claimId")]
+    claim_id: Option<String>,
+    #[serde(rename = "itemId")]
+    item_id: Option<i32>,
+    #[serde(rename = "itemType")]
+    item_type: Option<String>,
+    region: Option<u32>,
+}
+
+enum StorageLogsMode {
+    Storage { storage_id: u64 },
+    Player { player_id: u64 },
+    ItemClaim { item_id: i32, claim_id: u64 },
+    ItemPlayer { item_id: i32, player_id: u64 },
+}
+
+fn parse_entity_id(raw: &str, label: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
+        .map_err(|_| format!("invalid `{label}`: expected unsigned integer"))
+}
+
+fn parse_storage_logs_mode(q: &StorageLogsQuery) -> Result<StorageLogsMode, String> {
+    let storage = q.storage_id.as_deref().filter(|s| !s.is_empty());
+    let player = q.player_id.as_deref().filter(|s| !s.is_empty());
+    let claim = q.claim_id.as_deref().filter(|s| !s.is_empty());
+    let item = q.item_id;
+
+    const HINT: &str = "use one of: storageId=… | playerId=… | itemId=…&claimId=… | itemId=…&playerId=…";
+
+    if storage.is_some() && (player.is_some() || claim.is_some() || item.is_some()) {
+        return Err(format!("`storageId` cannot be combined with other filters; {HINT}"));
+    }
+    if let Some(s) = storage {
+        return Ok(StorageLogsMode::Storage {
+            storage_id: parse_entity_id(s, "storageId")?,
+        });
+    }
+
+    match (item, player, claim) {
+        (None, Some(p), None) => Ok(StorageLogsMode::Player {
+            player_id: parse_entity_id(p, "playerId")?,
+        }),
+        (Some(item_id), None, Some(c)) => Ok(StorageLogsMode::ItemClaim {
+            item_id,
+            claim_id: parse_entity_id(c, "claimId")?,
+        }),
+        (Some(item_id), Some(p), None) => Ok(StorageLogsMode::ItemPlayer {
+            item_id,
+            player_id: parse_entity_id(p, "playerId")?,
+        }),
+        (Some(_), Some(_), Some(_)) => Err(format!(
+            "`itemId` with both `claimId` and `playerId` is not supported; {HINT}"
+        )),
+        (Some(_), None, None) => Err(format!("`itemId` requires `claimId` or `playerId`; {HINT}")),
+        (None, None, Some(_)) => Err(format!("`claimId` requires `itemId`; {HINT}")),
+        (None, Some(_), Some(_)) => Err(format!(
+            "`playerId` with `claimId` requires `itemId` (use itemId+claimId or playerId alone); {HINT}"
+        )),
+        (None, None, None) => Err(format!("missing query parameters; {HINT}")),
+    }
+}
+
+fn parse_item_type_filter(raw: Option<&str>) -> Result<Option<u8>, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some("Item") | Some("item") => Ok(Some(Pocket::ITEM)),
+        Some("Cargo") | Some("cargo") => Ok(Some(Pocket::CARGO)),
+        Some(other) => Err(format!(
+            "invalid `itemType`: expected Item or Cargo, got `{other}`"
+        )),
+    }
+}
+
+fn respond_storage_logs(headers: &HeaderMap, body: pb::StorageLogList) -> Response {
+    if wants_protobuf(headers) {
+        no_store_protobuf(body.encode_to_vec())
+    } else {
+        let logs: Vec<Value> = body
+            .logs
+            .iter()
+            .map(|e| {
+                let mut map = serde_json::Map::new();
+                map.insert("id".into(), json!(e.id.to_string()));
+                map.insert("region".into(), json!(e.region));
+                map.insert(
+                    "storage_entity_id".into(),
+                    json!(e.storage_entity_id.to_string()),
+                );
+                if let Some(ref n) = e.building_name {
+                    map.insert("building_name".into(), json!(n));
+                } else {
+                    map.insert("building_name".into(), Value::Null);
+                }
+                if let Some(ref n) = e.building_nickname {
+                    map.insert("building_nickname".into(), json!(n));
+                } else {
+                    map.insert("building_nickname".into(), Value::Null);
+                }
+                if let Some(cid) = e.claim_entity_id {
+                    map.insert("claim_entity_id".into(), json!(cid.to_string()));
+                } else {
+                    map.insert("claim_entity_id".into(), Value::Null);
+                }
+                if let Some(ref n) = e.claim_name {
+                    map.insert("claim_name".into(), json!(n));
+                } else {
+                    map.insert("claim_name".into(), Value::Null);
+                }
+                map.insert(
+                    "player_entity_id".into(),
+                    json!(e.player_entity_id.to_string()),
+                );
+                map.insert("player_username".into(), json!(e.player_username));
+                map.insert("action".into(), json!(e.action));
+                map.insert("item_id".into(), json!(e.item_id));
+                map.insert("item_type".into(), json!(e.item_type));
+                map.insert("quantity".into(), json!(e.quantity));
+                map.insert("timestamp".into(), json!(e.timestamp));
+                map.insert("days_since_epoch".into(), json!(e.days_since_epoch));
+                Value::Object(map)
+            })
+            .collect();
+        no_store_json(json!({ "logs": logs, "count": body.count })).into_response()
+    }
+}
+
+fn enrich_storage_log(s: &RegionStore, slot: u32) -> pb::StorageLogEntry {
+    use crate::store::storage_log::action_label;
+
+    let i = slot as usize;
+    let storage_id = s.storage_log.storage_entity_id[i];
+    let (building_name, building_nickname, claim_entity_id, claim_name) =
+        match s.building.find(storage_id) {
+            Some(b_slot) => {
+                let bi = b_slot as usize;
+                let desc_id = s.building.building_description_id[bi];
+                let claim_id = s.building.claim_entity_id[bi];
+                let building_name = s.building_desc.get(desc_id).map(str::to_owned);
+                let building_nickname = s.building_nickname.get(storage_id).map(str::to_owned);
+                let claim_name = s
+                    .claim
+                    .find(claim_id)
+                    .map(|c| s.claim.name[c as usize].as_ref().to_owned());
+                (
+                    building_name,
+                    building_nickname,
+                    Some(claim_id),
+                    claim_name,
+                )
+            }
+            None => (None, None, None, None),
+        };
+
+    pb::StorageLogEntry {
+        id: s.storage_log.id[i],
+        region: s.region,
+        storage_entity_id: storage_id,
+        building_name,
+        building_nickname,
+        claim_entity_id,
+        claim_name,
+        player_entity_id: s.storage_log.player_entity_id[i],
+        player_username: s.storage_log.player_username[i].as_ref().to_owned(),
+        action: action_label(s.storage_log.action[i]).to_owned(),
+        item_id: s.storage_log.item_id[i],
+        item_type: item_type_label(s.storage_log.item_type[i]).to_owned(),
+        quantity: s.storage_log.quantity[i],
+        timestamp: format_rfc3339_millis(s.storage_log.timestamp_micros[i]),
+        days_since_epoch: s.storage_log.days_since_epoch[i],
+    }
+}
+
+fn collect_storage_logs(
+    s: &RegionStore,
+    mode: &StorageLogsMode,
+    item_type: Option<u8>,
+) -> Vec<pb::StorageLogEntry> {
+    use hashbrown::HashSet;
+
+    let slots: Vec<u32> = match *mode {
+        StorageLogsMode::Storage { storage_id } => s.storage_log.by_storage(storage_id).to_vec(),
+        StorageLogsMode::Player { player_id } => s.storage_log.by_player(player_id).to_vec(),
+        StorageLogsMode::ItemClaim { item_id, claim_id } => {
+            let mut storage_ids = HashSet::new();
+            for b_slot in s.building.by_claim(claim_id) {
+                storage_ids.insert(s.building.entity_id[*b_slot as usize]);
+            }
+            s.storage_log
+                .by_item_in_storages(item_id, item_type, &storage_ids)
+        }
+        StorageLogsMode::ItemPlayer { item_id, player_id } => {
+            s.storage_log
+                .by_item_and_player(item_id, item_type, player_id)
+        }
+    };
+
+    let mut logs: Vec<pb::StorageLogEntry> = slots
+        .into_iter()
+        .map(|slot| enrich_storage_log(s, slot))
+        .collect();
+    // Newest first.
+    logs.sort_by(|a, b| {
+        // Compare via days then id as tiebreak; timestamp string is ISO so
+        // lexicographic works, but prefer the underlying micros via id order
+        // when equal — sort by timestamp string desc is fine for ISO8601.
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    logs
+}
+
+async fn storage_logs(
+    State(fleet): State<Fleet>,
+    headers: HeaderMap,
+    Query(q): Query<StorageLogsQuery>,
+) -> Response {
+    let mode = match parse_storage_logs_mode(&q) {
+        Ok(m) => m,
+        Err(e) => {
+            return no_store_status(StatusCode::BAD_REQUEST, json!({"error": e})).into_response();
+        }
+    };
+    let item_type = match parse_item_type_filter(q.item_type.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            return no_store_status(StatusCode::BAD_REQUEST, json!({"error": e})).into_response();
+        }
+    };
+    // itemType only applies to item-scoped modes.
+    let item_type = match &mode {
+        StorageLogsMode::ItemClaim { .. } | StorageLogsMode::ItemPlayer { .. } => item_type,
+        _ => None,
+    };
+
+    let mut logs = Vec::new();
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready {
+            continue;
+        }
+        if let Some(want) = q.region {
+            if s.region != want {
+                continue;
+            }
+        }
+        logs.extend(collect_storage_logs(&s, &mode, item_type));
+    }
+    logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
+    let count = logs.len() as i32;
+    respond_storage_logs(
+        &headers,
+        pb::StorageLogList { logs, count },
+    )
 }
 
 fn respond_hexite_deposits(headers: &HeaderMap, body: pb::HexiteDepositList) -> Response {

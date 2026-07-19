@@ -52,6 +52,7 @@ pub const PASSIVE_CRAFT_TABLE: &str = "passive_craft_state";
 pub const CRAFTING_RECIPE_DESC_TABLE: &str = "crafting_recipe_desc";
 pub const RESOURCE_TABLE: &str = "resource_state";
 pub const GROWTH_TABLE: &str = "growth_state";
+pub const STORAGE_LOG_TABLE: &str = "storage_log_state";
 
 /// Hexite Deposit (`resource_desc.id`). Live / harvestable form.
 pub const HEXITE_DEPOSIT_RESOURCE_ID: i32 = 348497955;
@@ -224,6 +225,17 @@ pub struct GrowthCols {
     pub growth_recipe_id: usize,
 }
 
+#[derive(Clone, Copy)]
+pub struct StorageLogCols {
+    pub id: usize,
+    pub object_entity_id: usize,
+    pub subject_entity_id: usize,
+    pub subject_name: usize,
+    pub data: usize,
+    pub timestamp: usize,
+    pub days_since_epoch: usize,
+}
+
 /// Resolved column indices for `dimension_network_state`.
 #[derive(Clone, Copy)]
 pub struct DimensionNetworkCols {
@@ -319,6 +331,7 @@ pub struct ColMaps {
     pub crafting_recipe_desc: CraftingRecipeDescCols,
     pub resource: ResourceCols,
     pub growth: GrowthCols,
+    pub storage_log: StorageLogCols,
 }
 
 /// Resolve column indices for the tables we hold. Errors if any expected
@@ -351,6 +364,7 @@ pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
         crafting_recipe_desc: resolve_crafting_recipe_desc_cols(schema)?,
         resource: resolve_resource_cols(schema)?,
         growth: resolve_growth_cols(schema)?,
+        storage_log: resolve_storage_log_cols(schema)?,
     })
 }
 
@@ -571,6 +585,19 @@ fn resolve_growth_cols(schema: &MirroredSchema) -> Result<GrowthCols> {
     })
 }
 
+fn resolve_storage_log_cols(schema: &MirroredSchema) -> Result<StorageLogCols> {
+    let f = fields_of(schema, STORAGE_LOG_TABLE)?;
+    Ok(StorageLogCols {
+        id: find_field(f, "id", STORAGE_LOG_TABLE)?,
+        object_entity_id: find_field(f, "object_entity_id", STORAGE_LOG_TABLE)?,
+        subject_entity_id: find_field(f, "subject_entity_id", STORAGE_LOG_TABLE)?,
+        subject_name: find_field(f, "subject_name", STORAGE_LOG_TABLE)?,
+        data: find_field(f, "data", STORAGE_LOG_TABLE)?,
+        timestamp: find_field(f, "timestamp", STORAGE_LOG_TABLE)?,
+        days_since_epoch: find_field(f, "days_since_epoch", STORAGE_LOG_TABLE)?,
+    })
+}
+
 fn resolve_dimension_network_cols(schema: &MirroredSchema) -> Result<DimensionNetworkCols> {
     let f = fields_of(schema, DIMENSION_NETWORK_TABLE)?;
     Ok(DimensionNetworkCols {
@@ -725,6 +752,21 @@ pub struct GrowthRow {
     pub entity_id: u64,
     pub end_timestamp_micros: i64,
     pub growth_recipe_id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageLogRow {
+    pub id: u64,
+    pub storage_entity_id: u64,
+    pub player_entity_id: u64,
+    pub player_username: String,
+    /// `ACTION_RESERVED` / `ACTION_WITHDRAW` / `ACTION_DEPOSIT`.
+    pub action: u8,
+    pub item_id: i32,
+    pub item_type: u8,
+    pub quantity: i32,
+    pub timestamp_micros: i64,
+    pub days_since_epoch: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1076,6 +1118,81 @@ pub fn decode_growth_with_fields(
         )?,
         growth_recipe_id: cell_i32(&cells[cols.growth_recipe_id], "growth.growth_recipe_id")?,
     })
+}
+
+pub fn decode_storage_log_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: StorageLogCols,
+    schema: &MirroredSchema,
+) -> Result<StorageLogRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    let (action, item_id, item_type, quantity) = decode_action_log_data(&cells[cols.data])?;
+    Ok(StorageLogRow {
+        id: cell_u64(&cells[cols.id], "storage_log.id")?,
+        storage_entity_id: cell_u64(&cells[cols.object_entity_id], "storage_log.object_entity_id")?,
+        player_entity_id: cell_u64(
+            &cells[cols.subject_entity_id],
+            "storage_log.subject_entity_id",
+        )?,
+        player_username: cell_string(&cells[cols.subject_name], "storage_log.subject_name")?,
+        action,
+        item_id,
+        item_type,
+        quantity,
+        timestamp_micros: decode_timestamp_micros(
+            &cells[cols.timestamp],
+            "storage_log.timestamp",
+        )?,
+        days_since_epoch: cell_i32(
+            &cells[cols.days_since_epoch],
+            "storage_log.days_since_epoch",
+        )?,
+    })
+}
+
+/// `ActionLogData` sum → (action, item_id, item_type, quantity).
+/// Reserved uses `item1`'s stack fields.
+fn decode_action_log_data(cell: &Cell) -> Result<(u8, i32, u8, i32)> {
+    use crate::store::storage_log::{ACTION_DEPOSIT, ACTION_RESERVED, ACTION_WITHDRAW};
+
+    let json = cell_json(cell)?;
+    let Value::Object(obj) = json else {
+        bail!("storage_log.data: expected object, got {json}");
+    };
+    if let Some(stack) = obj.get("DepositItem") {
+        let (item_id, item_type, quantity) = decode_item_stack(stack, "DepositItem")?;
+        return Ok((ACTION_DEPOSIT, item_id, item_type, quantity));
+    }
+    if let Some(stack) = obj.get("WithdrawItem") {
+        let (item_id, item_type, quantity) = decode_item_stack(stack, "WithdrawItem")?;
+        return Ok((ACTION_WITHDRAW, item_id, item_type, quantity));
+    }
+    if let Some(reserved) = obj.get("Reserved") {
+        let Value::Object(r) = reserved else {
+            bail!("storage_log.data.Reserved: expected object, got {reserved}");
+        };
+        let stack = r
+            .get("item1")
+            .ok_or_else(|| anyhow!("storage_log.data.Reserved: missing item1"))?;
+        let (item_id, item_type, quantity) = decode_item_stack(stack, "Reserved.item1")?;
+        return Ok((ACTION_RESERVED, item_id, item_type, quantity));
+    }
+    bail!("storage_log.data: unknown ActionLogData variant {obj:?}")
+}
+
+fn decode_item_stack(v: &Value, ctx: &str) -> Result<(i32, u8, i32)> {
+    let Value::Object(obj) = v else {
+        bail!("{ctx}: expected ItemStack object, got {v}");
+    };
+    let item_id = json_i32(obj.get("item_id"), &format!("{ctx}.item_id"))?;
+    let quantity = json_i32(obj.get("quantity"), &format!("{ctx}.quantity"))?;
+    let item_type = match obj.get("item_type") {
+        Some(Value::Object(t)) if t.contains_key("Item") => Pocket::ITEM,
+        Some(Value::Object(t)) if t.contains_key("Cargo") => Pocket::CARGO,
+        other => bail!("{ctx}.item_type unexpected: {other:?}"),
+    };
+    Ok((item_id, item_type, quantity))
 }
 
 pub fn decode_dimension_network_with_fields(

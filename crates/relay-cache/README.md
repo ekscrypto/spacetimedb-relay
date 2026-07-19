@@ -128,6 +128,24 @@ curl -s 'http://127.0.0.1:8089/deposits?region=14'
 #        "respawn_at": "2026-07-26T08:43:52.011Z", "region": 13 }, ...
 #    ], "count": N }
 
+# Storage logs (upstream retention ~15–16 days via storage_log_cleanup_loop).
+# Exactly one mode per request:
+#   storageId=…                         — full history for one chest
+#   playerId=…                          — all actions by that player
+#   itemId=…&claimId=…                  — that item across a claim's buildings
+#   itemId=…&playerId=…                 — that item in one player's actions
+# Optional: itemType=Item|Cargo (item modes only), region=N
+curl -s 'http://127.0.0.1:8089/storage-logs?storageId=1008806316593474517'
+curl -s 'http://127.0.0.1:8089/storage-logs?playerId=1297036692699996362'
+curl -s 'http://127.0.0.1:8089/storage-logs?itemId=1080001&claimId=1234567890'
+curl -s 'http://127.0.0.1:8089/storage-logs?itemId=1080001&playerId=1297036692699996362&itemType=Item&region=14'
+# → { "logs": [
+#      { "id", "region", "storage_entity_id", "building_name", "building_nickname",
+#        "claim_entity_id", "claim_name", "player_entity_id", "player_username",
+#        "action": "deposit"|"withdraw"|"reserved",
+#        "item_id", "item_type", "quantity", "timestamp", "days_since_epoch" }, ...
+#    ], "count": N }
+
 # Health / readiness (always JSON)
 curl -s http://127.0.0.1:8089/cache-health
 
@@ -156,6 +174,8 @@ curl -sH 'Accept: application/x-protobuf' \
   'http://127.0.0.1:8089/claim/1234567890/crafts' -o claim-crafts.pb
 curl -sH 'Accept: application/x-protobuf' \
   'http://127.0.0.1:8089/player/1297036692699996362/crafts' -o player-crafts.pb
+curl -sH 'Accept: application/x-protobuf' \
+  'http://127.0.0.1:8089/storage-logs?storageId=1008806316593474517' -o storage-logs.pb
 ```
 
 Public (nginx on `relay.bitcraftsync.app` → loopback `:8089`; see
@@ -176,6 +196,8 @@ curl -s https://relay.bitcraftsync.app/player/1297036692699996362/housing
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/skills
 curl -s 'https://relay.bitcraftsync.app/deposits'
 curl -s 'https://relay.bitcraftsync.app/deposits?region=14'
+curl -s 'https://relay.bitcraftsync.app/storage-logs?storageId=1008806316593474517'
+curl -s 'https://relay.bitcraftsync.app/storage-logs?playerId=1297036692699996362'
 curl -sH 'Accept: application/x-protobuf' \
   https://relay.bitcraftsync.app/claim/1234567890/inventory -o inventory.pb
 ```

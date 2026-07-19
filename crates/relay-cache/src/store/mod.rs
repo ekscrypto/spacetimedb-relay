@@ -28,6 +28,7 @@ pub mod progressive_action;
 pub mod rent;
 pub mod resource;
 pub mod skill_desc;
+pub mod storage_log;
 
 pub use building::BuildingSoA;
 pub use building_desc::BuildingDescStore;
@@ -52,6 +53,7 @@ pub use progressive_action::ProgressiveActionSoA;
 pub use rent::RentSoA;
 pub use resource::ResourceSoA;
 pub use skill_desc::SkillDescStore;
+pub use storage_log::StorageLogSoA;
 
 /// One region's worth of in-memory state. The `ready` flag is `false`
 /// during initial `SubscribeApplied` load and after a disconnect; the
@@ -86,6 +88,7 @@ pub struct RegionStore {
     pub crafting_recipe_desc: CraftingRecipeDescStore,
     pub resource: ResourceSoA,
     pub growth: GrowthStore,
+    pub storage_log: StorageLogSoA,
 }
 
 impl RegionStore {
@@ -119,6 +122,7 @@ impl RegionStore {
             crafting_recipe_desc: CraftingRecipeDescStore::new(),
             resource: ResourceSoA::with_capacity(0),
             growth: GrowthStore::new(),
+            storage_log: StorageLogSoA::with_capacity(0),
         }
     }
 }

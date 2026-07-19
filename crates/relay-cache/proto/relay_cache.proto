@@ -258,3 +258,30 @@ message HexiteDepositList {
   repeated HexiteDeposit deposits = 1;
   int32 count = 2;
 }
+
+// One storage_log_state row, enriched for forensics.
+message StorageLogEntry {
+  uint64 id = 1;
+  uint32 region = 2;
+  uint64 storage_entity_id = 3;
+  optional string building_name = 4;
+  optional string building_nickname = 5;
+  optional uint64 claim_entity_id = 6;
+  optional string claim_name = 7;
+  uint64 player_entity_id = 8;
+  string player_username = 9;
+  // "deposit" | "withdraw" | "reserved"
+  string action = 10;
+  int32 item_id = 11;
+  // "Item" | "Cargo"
+  string item_type = 12;
+  int32 quantity = 13;
+  // ISO-8601 UTC from timestamp micros.
+  string timestamp = 14;
+  int32 days_since_epoch = 15;
+}
+
+message StorageLogList {
+  repeated StorageLogEntry logs = 1;
+  int32 count = 2;
+}
