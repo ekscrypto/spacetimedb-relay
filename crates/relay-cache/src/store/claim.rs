@@ -77,13 +77,13 @@ impl ClaimSoA {
         self.free_slots.push(slot);
     }
 
-    /// Neutral Hexite Deposit claims from `claim_state.name`:
-    /// `{0} (N: {1}, E: {2})|~Hexite Deposit|~{north}|~{east}`.
+    /// Hexite Deposit claims: unowned (`owner_player_entity_id == 0`) with
+    /// name prefix `{0} (N: {1}, E: {2})|~Hexite Deposit|`.
     pub fn iter_hexite_deposit_slots(&self) -> impl Iterator<Item = u32> + '_ {
-        const MARKER: &str = "|~Hexite Deposit|~";
+        const PREFIX: &str = "{0} (N: {1}, E: {2})|~Hexite Deposit|";
         self.pk.values().copied().filter(move |&slot| {
             let i = slot as usize;
-            self.neutral[i] && self.name[i].contains(MARKER)
+            self.owner_player_entity_id[i] == 0 && self.name[i].starts_with(PREFIX)
         })
     }
 
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_hexite_deposit_slots_filters_neutral_marker() {
+    fn iter_hexite_deposit_slots_filters_unowned_prefix() {
         let mut s = ClaimSoA::with_capacity(4);
         s.upsert(ClaimRow {
             entity_id: 1,
@@ -249,10 +249,10 @@ mod tests {
         s.upsert(row(2, "UMB Concordia"));
         s.upsert(ClaimRow {
             entity_id: 3,
-            owner_player_entity_id: 0,
+            owner_player_entity_id: 99,
             owner_building_entity_id: 30,
             name: "{0} (N: {1}, E: {2})|~Hexite Deposit|~100|~200".into(),
-            neutral: false,
+            neutral: true,
         });
         let mut ids: Vec<u64> = s
             .iter_hexite_deposit_slots()

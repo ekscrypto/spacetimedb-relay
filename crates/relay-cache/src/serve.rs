@@ -1207,11 +1207,11 @@ fn respond_hexite_deposits(headers: &HeaderMap, body: pb::HexiteDepositList) -> 
     }
 }
 
-/// Parse N/E from a neutral Hexite Deposit claim name.
+/// Parse N/E from a Hexite Deposit claim name.
 /// Format: `{0} (N: {1}, E: {2})|~Hexite Deposit|~{north}|~{east}`.
 fn parse_hexite_deposit_coords(name: &str) -> Option<(i32, i32)> {
-    const MARKER: &str = "|~Hexite Deposit|~";
-    let rest = name.split_once(MARKER)?.1;
+    const PREFIX: &str = "{0} (N: {1}, E: {2})|~Hexite Deposit|~";
+    let rest = name.strip_prefix(PREFIX)?;
     let mut parts = rest.split("|~");
     let north: i32 = parts.next()?.parse().ok()?;
     let east: i32 = parts.next()?.parse().ok()?;

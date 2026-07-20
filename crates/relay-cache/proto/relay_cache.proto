@@ -238,8 +238,9 @@ message PlayerCrafts {
   int32 count = 3;
 }
 
-// Hexite Deposit from neutral claim_state rows (coords in claim.name) ⋈
-// growth_state on owner_building_entity_id for depleted countdowns.
+// Hexite Deposit from unowned claim_state rows (owner_player_entity_id=0,
+// name prefix "{0} (N: {1}, E: {2})|~Hexite Deposit|"; coords in claim.name)
+// ⋈ growth_state on owner_building_entity_id for depleted countdowns.
 // Active deposits omit respawn_at. Depleted deposits set respawn_at from
 // public growth_state.end_timestamp (Depleted → Hexite growth recipe).
 message HexiteDeposit {
