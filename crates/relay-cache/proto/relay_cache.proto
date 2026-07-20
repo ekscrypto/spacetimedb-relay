@@ -238,8 +238,8 @@ message PlayerCrafts {
   int32 count = 3;
 }
 
-// Hexite Deposit from resource_state ⋈ location_state ⋈ growth_state.
-// Game coords: north = location.z, east = location.x.
+// Hexite Deposit from neutral claim_state rows (coords in claim.name) ⋈
+// growth_state on owner_building_entity_id for depleted countdowns.
 // Active deposits omit respawn_at. Depleted deposits set respawn_at from
 // public growth_state.end_timestamp (Depleted → Hexite growth recipe).
 message HexiteDeposit {

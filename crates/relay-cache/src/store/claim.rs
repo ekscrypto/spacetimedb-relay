@@ -77,6 +77,16 @@ impl ClaimSoA {
         self.free_slots.push(slot);
     }
 
+    /// Neutral Hexite Deposit claims from `claim_state.name`:
+    /// `{0} (N: {1}, E: {2})|~Hexite Deposit|~{north}|~{east}`.
+    pub fn iter_hexite_deposit_slots(&self) -> impl Iterator<Item = u32> + '_ {
+        const MARKER: &str = "|~Hexite Deposit|~";
+        self.pk.values().copied().filter(move |&slot| {
+            let i = slot as usize;
+            self.neutral[i] && self.name[i].contains(MARKER)
+        })
+    }
+
     /// Case-insensitive substring search across the name column.
     /// Returns slots of matching rows. O(rows).
     pub fn search_name(&self, needle: &str) -> Vec<u32> {
@@ -224,6 +234,32 @@ mod tests {
         let mut s = ClaimSoA::with_capacity(4);
         s.upsert(row(1, "anything"));
         assert!(s.search_name("").is_empty());
+    }
+
+    #[test]
+    fn iter_hexite_deposit_slots_filters_neutral_marker() {
+        let mut s = ClaimSoA::with_capacity(4);
+        s.upsert(ClaimRow {
+            entity_id: 1,
+            owner_player_entity_id: 0,
+            owner_building_entity_id: 10,
+            name: "{0} (N: {1}, E: {2})|~Hexite Deposit|~6158|~8174".into(),
+            neutral: true,
+        });
+        s.upsert(row(2, "UMB Concordia"));
+        s.upsert(ClaimRow {
+            entity_id: 3,
+            owner_player_entity_id: 0,
+            owner_building_entity_id: 30,
+            name: "{0} (N: {1}, E: {2})|~Hexite Deposit|~100|~200".into(),
+            neutral: false,
+        });
+        let mut ids: Vec<u64> = s
+            .iter_hexite_deposit_slots()
+            .map(|slot| s.entity_id[slot as usize])
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [1]);
     }
 
     #[test]

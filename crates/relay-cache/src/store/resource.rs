@@ -37,8 +37,8 @@ impl ResourceSoA {
         self.pk.len()
     }
 
-    pub fn iter_slots(&self) -> impl Iterator<Item = u32> + '_ {
-        self.pk.values().copied()
+    pub fn find(&self, entity_id: u64) -> Option<u32> {
+        self.pk.get(&entity_id).copied()
     }
 
     pub fn is_active(&self, slot: u32) -> bool {
@@ -127,7 +127,7 @@ mod tests {
             resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
         });
         assert!(s.set_location(10, 8174, 6158));
-        let slot = s.iter_slots().next().unwrap();
+        let slot = s.find(10).unwrap();
         assert_eq!(s.entity_id[slot as usize], 10);
         assert!(s.has_location[slot as usize]);
         assert_eq!(s.location_x[slot as usize], 8174);

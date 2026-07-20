@@ -117,8 +117,8 @@ curl -s 'http://127.0.0.1:8089/player/1297036692699996362/crafts'
 curl -s 'http://127.0.0.1:8089/player/1297036692699996362/crafts?completed=true'
 
 # Hexite Deposits (global flat list). Optional `?region=N` filter.
-# `resource_state` (Hexite / Depleted Hexite) ⋈ `location_state` for coords
-# (north=z, east=x) ⋈ `growth_state` for depleted countdowns.
+# Neutral `claim_state` rows named "Hexite Deposit" (N/E in claim.name) ⋈
+# `growth_state` on `owner_building_entity_id` for depleted countdowns.
 # Active: omit `respawn_at`. Depleted: `respawn_at` from
 # `growth_state.end_timestamp` (public; Depleted→Hexite grows 6–8 days).
 curl -s 'http://127.0.0.1:8089/deposits'

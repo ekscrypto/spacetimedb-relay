@@ -1207,35 +1207,43 @@ fn respond_hexite_deposits(headers: &HeaderMap, body: pb::HexiteDepositList) -> 
     }
 }
 
-fn deposit_from_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDeposit> {
+/// Parse N/E from a neutral Hexite Deposit claim name.
+/// Format: `{0} (N: {1}, E: {2})|~Hexite Deposit|~{north}|~{east}`.
+fn parse_hexite_deposit_coords(name: &str) -> Option<(i32, i32)> {
+    const MARKER: &str = "|~Hexite Deposit|~";
+    let rest = name.split_once(MARKER)?.1;
+    let mut parts = rest.split("|~");
+    let north: i32 = parts.next()?.parse().ok()?;
+    let east: i32 = parts.next()?.parse().ok()?;
+    Some((north, east))
+}
+
+fn deposit_from_claim_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDeposit> {
     let i = slot as usize;
-    if !s.resource.has_location[i] {
-        return None;
-    }
-    // Wire convention (matches claim_local / BitJita): x = east, z = north.
-    let east = s.resource.location_x[i];
-    let north = s.resource.location_z[i];
-    let entity_id = s.resource.entity_id[i];
-    let active = s.resource.is_active(slot);
+    let (north, east) = parse_hexite_deposit_coords(&s.claim.name[i])?;
+    let entity_id = s.claim.entity_id[i];
+    let building_id = s.claim.owner_building_entity_id[i];
     let name = format!("Hexite Deposit (N: {north}, E: {east})");
 
-    // Depleted Hexite grows back via public growth_state.end_timestamp
-    // (recipe Depleted → Hexite, 6–8 days). Active deposits have no row.
-    let (respawn_at, status) = if active {
-        (None, None)
-    } else if let Some(end_micros) = s.growth.end_timestamp_micros(entity_id) {
+    // Depleted Hexite grows back via public growth_state.end_timestamp on the
+    // map building entity (recipe Depleted → Hexite, 6–8 days).
+    let depleted = s
+        .resource
+        .find(building_id)
+        .is_some_and(|slot| !s.resource.is_active(slot));
+    let (respawn_at, status) = if let Some(end_micros) = s.growth.end_timestamp_micros(building_id)
+    {
         (
             Some(format_rfc3339_millis(end_micros)),
             None, // timer present ⇒ respawning (client contract)
         )
-    } else {
+    } else if depleted {
         // Depleted but growth row not yet visible (rare race).
         (None, Some("respawning".into()))
+    } else {
+        (None, None)
     };
 
-    // Region comes from the shard (one DB per region). World coords are not
-    // on a simple 5×5×2560 grid relative to a shared origin, so deriving
-    // region from N/E mis-tags deposits and breaks `?region=` filtering.
     Some(pb::HexiteDeposit {
         north,
         east,
@@ -1294,8 +1302,8 @@ async fn hexite_deposits(
                 continue;
             }
         }
-        for slot in s.resource.iter_slots() {
-            let Some(dep) = deposit_from_slot(&s, slot) else {
+        for slot in s.claim.iter_hexite_deposit_slots() {
+            let Some(dep) = deposit_from_claim_slot(&s, slot) else {
                 continue;
             };
             deposits.push(dep);
@@ -2436,6 +2444,46 @@ mod tests {
         // 2026-07-19T15:35:13.483Z
         let micros = 1_784_475_313_483_000_i64;
         assert_eq!(format_rfc3339_millis(micros), "2026-07-19T15:35:13.483Z");
+    }
+
+    #[test]
+    fn parse_hexite_deposit_coords_from_claim_name() {
+        let name = "{0} (N: {1}, E: {2})|~Hexite Deposit|~6158|~8174";
+        assert_eq!(parse_hexite_deposit_coords(name), Some((6158, 8174)));
+        assert_eq!(parse_hexite_deposit_coords("UMB Concordia"), None);
+    }
+
+    #[test]
+    fn deposit_from_claim_slot_uses_claim_coords_and_growth() {
+        use crate::decode::{
+            ClaimRow, GrowthRow, ResourceRow, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+        };
+
+        let mut s = RegionStore::empty(14);
+        s.claim.upsert(ClaimRow {
+            entity_id: 100,
+            owner_player_entity_id: 0,
+            owner_building_entity_id: 97,
+            name: "{0} (N: {1}, E: {2})|~Hexite Deposit|~6158|~8174".into(),
+            neutral: true,
+        });
+        s.resource.upsert(ResourceRow {
+            entity_id: 97,
+            resource_id: DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+        });
+        s.growth.upsert(GrowthRow {
+            entity_id: 97,
+            end_timestamp_micros: 1_784_475_313_483_000,
+            growth_recipe_id: 1,
+        });
+        let slot = s.claim.find(100).unwrap();
+        let dep = deposit_from_claim_slot(&s, slot).unwrap();
+        assert_eq!(dep.north, 6158);
+        assert_eq!(dep.east, 8174);
+        assert_eq!(dep.entity_id, Some(100));
+        assert_eq!(dep.region, Some(14));
+        assert!(dep.respawn_at.is_some());
+        assert!(dep.status.is_none());
     }
 
     fn seed_concordia_like(s: &mut RegionStore) {
