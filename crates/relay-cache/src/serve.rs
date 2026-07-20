@@ -1510,19 +1510,7 @@ async fn claim_hexcoins(
 
 fn sum_player_hexcoins(s: &RegionStore, player_id: u64) -> i64 {
     let mut total = 0i64;
-    let mut seen = std::collections::HashSet::new();
-    for &inv_slot in s.inventory.by_player_owner(player_id) {
-        seen.insert(inv_slot);
-        if classify_player_bag(s, inv_slot, player_id).is_none() {
-            continue;
-        }
-        total += hexcoins_in_inventory(s, inv_slot);
-    }
-    // Body pockets: inventories owned by the player themselves.
-    for &inv_slot in s.inventory.by_owner(player_id) {
-        if !seen.insert(inv_slot) {
-            continue;
-        }
+    for inv_slot in player_inventory_slots(s, player_id) {
         if classify_player_bag(s, inv_slot, player_id).is_none() {
             continue;
         }
@@ -2086,6 +2074,67 @@ async fn player_by_pk(
     }
 }
 
+/// Inventory slots that may belong to a player's personal bags.
+///
+/// Sources:
+/// 1. `inventory.owner_entity_id == player` (body bags)
+/// 2. `inventory.player_owner_entity_id == player` (banks / recovery)
+/// 3. `deployable.owner_id == player` → `inventory.owner_entity_id ==
+///    deployable.entity_id` (Personal Cache, Cart, Mount, …). Live
+///    BitCraft often leaves `player_owner_entity_id = 0` on these rows,
+///    so (2) alone misses them.
+fn player_inventory_slots(s: &RegionStore, player_id: u64) -> Vec<u32> {
+    let mut slots: Vec<u32> = s.inventory.by_owner(player_id).to_vec();
+    slots.extend_from_slice(s.inventory.by_player_owner(player_id));
+    for &d_slot in s.deployable.by_owner(player_id) {
+        let dep_eid = s.deployable.entity_id[d_slot as usize];
+        slots.extend_from_slice(s.inventory.by_owner(dep_eid));
+        // Some entities share entity_id across deployable_state and
+        // inventory_state; include that row when present.
+        if let Some(inv_slot) = s.inventory.find(dep_eid) {
+            slots.push(inv_slot);
+        }
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+fn deployable_bag_fields(
+    s: &RegionStore,
+    d_slot: u32,
+) -> (&'static str, String, Option<String>, Option<u64>, Option<String>) {
+    let desc_id = s.deployable.deployable_description_id[d_slot as usize];
+    let (desc_name, kind) = s
+        .deployable_desc
+        .get(desc_id)
+        .unwrap_or(("Deployable", DeployableKind::Other));
+    let nick = s.deployable.nickname[d_slot as usize].as_ref();
+    let nickname = if nick.is_empty() {
+        None
+    } else {
+        Some(nick.to_owned())
+    };
+    let name = nickname.clone().unwrap_or_else(|| desc_name.to_owned());
+    let category = match kind {
+        DeployableKind::Cart => "wagon",
+        DeployableKind::Cache => "cache",
+        _ => "deployable",
+    };
+    let claim_id = s.deployable.claim_entity_id[d_slot as usize];
+    let claim_name = s
+        .claim
+        .find(claim_id)
+        .map(|cs| s.claim.name[cs as usize].to_string());
+    (
+        category,
+        name,
+        nickname,
+        Some(claim_id).filter(|&id| id != 0),
+        claim_name,
+    )
+}
+
 /// Classify one inventory row for a player. Returns `None` for
 /// unrecognized owners / unknown body-bag indexes.
 fn classify_player_bag(
@@ -2099,75 +2148,56 @@ fn classify_player_bag(
     let player_owner = s.inventory.player_owner_entity_id[i];
     let inventory_index = s.inventory.inventory_index[i];
 
-    let (category, name, nickname, claim_entity_id, claim_name) = if owner == player_id {
-        // Body bags: Inventory / Toolbelt / Wallet.
-        // inventory_index is the BitCraft body-bag discriminant
-        // (0=Inventory, 1=Toolbelt, 2=Wallet) — not a free-form slot.
-        // Wallet pockets typically hold Hex Coin (item_id=1) and
-        // Hexite Energy (item_id=828972621); surfaced as ordinary items.
+    // Body bags: Inventory / Toolbelt / Wallet.
+    // inventory_index is the BitCraft body-bag discriminant
+    // (0=Inventory, 1=Toolbelt, 2=Wallet) — not a free-form slot.
+    // Wallet pockets typically hold Hex Coin (item_id=1) and
+    // Hexite Energy (item_id=828972621); surfaced as ordinary items.
+    let body = if owner == player_id {
         match inventory_index {
-            0 => ("pockets", "Pockets".to_owned(), None, None, None),
-            1 => ("toolbelt", "Toolbelt".to_owned(), None, None, None),
-            2 => ("wallet", "Wallet".to_owned(), None, None, None),
-            _ => return None,
-        }
-    } else if player_owner == player_id {
-        if let Some(b_slot) = s.building.find(owner) {
-            let desc_id = s.building.building_description_id[b_slot as usize];
-            let building_name = s.building_desc.get(desc_id).unwrap_or("Storage").to_owned();
-            let claim_id = s.building.claim_entity_id[b_slot as usize];
-            let claim_name = s
-                .claim
-                .find(claim_id)
-                .map(|cs| s.claim.name[cs as usize].to_string());
-            let category = categorize_building_bag(&building_name)?;
-            (
-                category,
-                building_name,
-                None,
-                Some(claim_id).filter(|&id| id != 0),
-                claim_name,
-            )
-        } else if let Some(d_slot) = s
-            .deployable
-            .find(owner)
-            .or_else(|| s.deployable.find(entity_id))
-        {
-            let desc_id = s.deployable.deployable_description_id[d_slot as usize];
-            let (desc_name, kind) = s
-                .deployable_desc
-                .get(desc_id)
-                .unwrap_or(("Deployable", DeployableKind::Other));
-            let nick = s.deployable.nickname[d_slot as usize].as_ref();
-            let nickname = if nick.is_empty() {
-                None
-            } else {
-                Some(nick.to_owned())
-            };
-            let name = nickname.clone().unwrap_or_else(|| desc_name.to_owned());
-            let category = match kind {
-                DeployableKind::Cart => "wagon",
-                DeployableKind::Cache => "cache",
-                _ => "deployable",
-            };
-            let claim_id = s.deployable.claim_entity_id[d_slot as usize];
-            let claim_name = s
-                .claim
-                .find(claim_id)
-                .map(|cs| s.claim.name[cs as usize].to_string());
-            (
-                category,
-                name,
-                nickname,
-                Some(claim_id).filter(|&id| id != 0),
-                claim_name,
-            )
-        } else {
-            return None;
+            0 => Some(("pockets", "Pockets".to_owned(), None, None, None)),
+            1 => Some(("toolbelt", "Toolbelt".to_owned(), None, None, None)),
+            2 => Some(("wallet", "Wallet".to_owned(), None, None, None)),
+            _ => None,
         }
     } else {
-        return None;
+        None
     };
+
+    let building = body.or_else(|| {
+        if player_owner != player_id {
+            return None;
+        }
+        let b_slot = s.building.find(owner)?;
+        let desc_id = s.building.building_description_id[b_slot as usize];
+        let building_name = s.building_desc.get(desc_id).unwrap_or("Storage").to_owned();
+        let claim_id = s.building.claim_entity_id[b_slot as usize];
+        let claim_name = s
+            .claim
+            .find(claim_id)
+            .map(|cs| s.claim.name[cs as usize].to_string());
+        let category = categorize_building_bag(&building_name)?;
+        Some((
+            category,
+            building_name,
+            None,
+            Some(claim_id).filter(|&id| id != 0),
+            claim_name,
+        ))
+    });
+
+    // Deployable storage: inventory.owner_entity_id == deployable.entity_id
+    // (or shared entity_id). Does not require player_owner_entity_id.
+    let (category, name, nickname, claim_entity_id, claim_name) = building.or_else(|| {
+        let d_slot = s
+            .deployable
+            .find(owner)
+            .or_else(|| s.deployable.find(entity_id))?;
+        if s.deployable.owner_id[d_slot as usize] != player_id {
+            return None;
+        }
+        Some(deployable_bag_fields(s, d_slot))
+    })?;
 
     let items = aggregate_pockets(s, std::iter::once(inv_slot));
     Some(pb::PlayerInventoryBag {
@@ -2204,11 +2234,7 @@ fn collect_player_bags(fleet: &Fleet, player_id: u64) -> Vec<pb::PlayerInventory
         if !s.ready {
             continue;
         }
-        let mut slots: Vec<u32> = s.inventory.by_owner(player_id).to_vec();
-        slots.extend_from_slice(s.inventory.by_player_owner(player_id));
-        slots.sort_unstable();
-        slots.dedup();
-        for slot in slots {
+        for slot in player_inventory_slots(&s, player_id) {
             let Some(bag) = classify_player_bag(&s, slot, player_id) else {
                 continue;
             };
@@ -2446,8 +2472,8 @@ async fn player_housing(
 mod tests {
     use super::*;
     use crate::decode::{
-        BuildingDescRow, BuildingRow, DimensionNetworkRow, LocationDimRow, PlayerUsernameRow,
-        OVERWORLD_DIMENSION,
+        BuildingDescRow, BuildingRow, DeployableDescRow, DeployableKind, DeployableRow,
+        DimensionNetworkRow, LocationDimRow, PlayerUsernameRow, OVERWORLD_DIMENSION,
     };
     use crate::store::RegionStore;
     use prost::Message;
@@ -2831,6 +2857,100 @@ mod tests {
         assert_eq!(bank.category, "bank");
         assert_eq!(bank.claim_name.as_deref(), Some("Concordia"));
         assert_eq!(bank.items[0].quantity, 3);
+    }
+
+    /// Live BitCraft Personal Cache rows often have player_owner_entity_id=0;
+    /// pockets are reached via deployable.owner_id → inventory.owner_entity_id.
+    #[test]
+    fn personal_cache_deployable_without_player_owner() {
+        use crate::decode::InventoryRow;
+        use crate::store::Pocket;
+
+        let mut s = RegionStore::empty(14);
+        s.ready = true;
+        s.deployable_desc.upsert(DeployableDescRow {
+            id: 42,
+            name: "Personal Cache (II)".into(),
+            kind: DeployableKind::Cache,
+        });
+        s.deployable.upsert(DeployableRow {
+            entity_id: 9001,
+            owner_id: 7,
+            claim_entity_id: 0,
+            deployable_description_id: 42,
+            nickname: String::new(),
+        });
+        let berry = Pocket {
+            volume: 100,
+            has_contents: true,
+            item_id: 1010001,
+            quantity: 379,
+            item_type: Pocket::ITEM,
+            has_durability: false,
+            durability: 0,
+        };
+        s.inventory.upsert(InventoryRow {
+            entity_id: 8001,
+            pockets: Box::from([berry]),
+            inventory_index: 0,
+            cargo_index: 0,
+            owner_entity_id: 9001,
+            player_owner_entity_id: 0,
+        });
+
+        let slots = player_inventory_slots(&s, 7);
+        assert_eq!(slots.len(), 1);
+        let bag = classify_player_bag(&s, slots[0], 7).unwrap();
+        assert_eq!(bag.category, "cache");
+        assert_eq!(bag.name, "Personal Cache (II)");
+        assert_eq!(bag.entity_id, 8001);
+        assert_eq!(bag.items.len(), 1);
+        assert_eq!(bag.items[0].item_id, 1010001);
+        assert_eq!(bag.items[0].quantity, 379);
+
+        // Mount / cart with nickname.
+        s.deployable_desc.upsert(DeployableDescRow {
+            id: 43,
+            name: "Goat".into(),
+            kind: DeployableKind::Mount,
+        });
+        s.deployable.upsert(DeployableRow {
+            entity_id: 9002,
+            owner_id: 7,
+            claim_entity_id: 99,
+            deployable_description_id: 43,
+            nickname: "Biscuit".into(),
+        });
+        s.claim.upsert(crate::decode::ClaimRow {
+            entity_id: 99,
+            owner_player_entity_id: 0,
+            owner_building_entity_id: 0,
+            name: "Pasture".into(),
+            neutral: false,
+        });
+        s.inventory.upsert(InventoryRow {
+            entity_id: 8002,
+            pockets: Box::from([Pocket {
+                volume: 50,
+                has_contents: true,
+                item_id: 2,
+                quantity: 5,
+                item_type: Pocket::ITEM,
+                has_durability: false,
+                durability: 0,
+            }]),
+            inventory_index: 0,
+            cargo_index: 0,
+            owner_entity_id: 9002,
+            player_owner_entity_id: 0,
+        });
+        let slots = player_inventory_slots(&s, 7);
+        assert_eq!(slots.len(), 2);
+        let goat = classify_player_bag(&s, s.inventory.find(8002).unwrap(), 7).unwrap();
+        assert_eq!(goat.category, "deployable");
+        assert_eq!(goat.name, "Biscuit");
+        assert_eq!(goat.nickname.as_deref(), Some("Biscuit"));
+        assert_eq!(goat.claim_name.as_deref(), Some("Pasture"));
     }
 
     #[test]
