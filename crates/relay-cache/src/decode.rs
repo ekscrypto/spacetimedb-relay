@@ -1753,27 +1753,38 @@ fn cell_f32(cell: &Cell, ctx: &str) -> Result<f32> {
     }
 }
 
-/// `Option<{x,z,dimension}>` rendered as `{"some":{...}}` / `{"none":{}}`.
+/// `Option<{x,z,dimension}>`. relay-protocol unwraps Option to a nullable
+/// Cell, so `some` is bare `{"x","z","dimension"}` and `none` is `Jsonb(Null)`.
+/// Also accepts the wrapped `{"some":{...}}` form for tests / older dumps.
 fn decode_optional_location(cell: &Cell) -> Result<(bool, i32, i32, u32)> {
-    let json = cell_json(cell)?;
+    let json = match cell {
+        Cell::Jsonb(Value::Null) => return Ok((false, 0, 0, 0)),
+        Cell::Jsonb(v) => v,
+        other => bail!("claim_local.location: expected Jsonb, got {other:?}"),
+    };
     let Value::Object(obj) = json else {
         bail!("claim_local.location is not an object: {json}");
     };
-    if let Some(inner) = obj.get("some") {
+    let loc = if let Some(inner) = obj.get("some") {
         let Value::Object(loc) = inner else {
             bail!("claim_local.location.some is not an object: {inner}");
         };
-        let x = json_i32(loc.get("x"), "location.x")?;
-        let z = json_i32(loc.get("z"), "location.z")?;
-        let dimension = loc
-            .get("dimension")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("location.dimension missing"))?;
-        let dimension =
-            u32::try_from(dimension).map_err(|_| anyhow!("location.dimension overflow"))?;
-        return Ok((true, x, z, dimension));
-    }
-    Ok((false, 0, 0, 0))
+        loc
+    } else if obj.contains_key("x") && obj.contains_key("z") {
+        obj
+    } else {
+        // `{"none":{}}` or empty.
+        return Ok((false, 0, 0, 0));
+    };
+    let x = json_i32(loc.get("x"), "location.x")?;
+    let z = json_i32(loc.get("z"), "location.z")?;
+    let dimension = loc
+        .get("dimension")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("location.dimension missing"))?;
+    let dimension =
+        u32::try_from(dimension).map_err(|_| anyhow!("location.dimension overflow"))?;
+    Ok((true, x, z, dimension))
 }
 
 fn decode_i32_array(cell: &Cell, ctx: &str) -> Result<Box<[i32]>> {
@@ -1912,6 +1923,24 @@ fn cell_bool(cell: &Cell, ctx: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn decode_optional_location_accepts_bare_and_wrapped() {
+        let bare = Cell::Jsonb(json!({"x": 24521, "z": 18473, "dimension": 1}));
+        assert_eq!(
+            decode_optional_location(&bare).unwrap(),
+            (true, 24521, 18473, 1)
+        );
+        let wrapped = Cell::Jsonb(json!({"some": {"x": 1, "z": 2, "dimension": 1}}));
+        assert_eq!(
+            decode_optional_location(&wrapped).unwrap(),
+            (true, 1, 2, 1)
+        );
+        assert_eq!(
+            decode_optional_location(&Cell::Jsonb(Value::Null)).unwrap(),
+            (false, 0, 0, 0)
+        );
+    }
 
     #[test]
     fn decode_pockets_walks_mixed_array() {

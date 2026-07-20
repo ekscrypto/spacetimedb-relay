@@ -1222,26 +1222,39 @@ fn deposit_from_claim_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDepos
     let i = slot as usize;
     let (north, east) = parse_hexite_deposit_coords(&s.claim.name[i])?;
     let entity_id = s.claim.entity_id[i];
-    let building_id = s.claim.owner_building_entity_id[i];
     let name = format!("Hexite Deposit (N: {north}, E: {east})");
 
-    // Depleted Hexite grows back via public growth_state.end_timestamp on the
-    // map building entity (recipe Depleted → Hexite, 6–8 days).
-    let depleted = s
-        .resource
-        .find(building_id)
-        .is_some_and(|slot| !s.resource.is_active(slot));
-    let (respawn_at, status) = if let Some(end_micros) = s.growth.end_timestamp_micros(building_id)
-    {
-        (
-            Some(format_rfc3339_millis(end_micros)),
-            None, // timer present ⇒ respawning (client contract)
+    // Claim name N/E are player-facing. World coords live on claim_local and
+    // match location_state on the hexite resource_state row — join there for
+    // depleted / growth_state respawn timers.
+    let resource_slot = s.claim_local.find(entity_id).and_then(|li| {
+        let li = li as usize;
+        if !s.claim_local.has_location[li] {
+            return None;
+        }
+        s.resource.find_by_location(
+            s.claim_local.location_x[li],
+            s.claim_local.location_z[li],
         )
-    } else if depleted {
-        // Depleted but growth row not yet visible (rare race).
-        (None, Some("respawning".into()))
-    } else {
-        (None, None)
+    });
+
+    let (respawn_at, status) = match resource_slot {
+        Some(rs) => {
+            let resource_entity_id = s.resource.entity_id[rs as usize];
+            let depleted = !s.resource.is_active(rs);
+            if let Some(end_micros) = s.growth.end_timestamp_micros(resource_entity_id) {
+                (
+                    Some(format_rfc3339_millis(end_micros)),
+                    None, // timer present ⇒ respawning (client contract)
+                )
+            } else if depleted {
+                // Depleted but growth row not yet visible (rare race).
+                (None, Some("respawning".into()))
+            } else {
+                (None, None)
+            }
+        }
+        None => (None, None),
     };
 
     Some(pb::HexiteDeposit {
@@ -2456,7 +2469,7 @@ mod tests {
     #[test]
     fn deposit_from_claim_slot_uses_claim_coords_and_growth() {
         use crate::decode::{
-            ClaimRow, GrowthRow, ResourceRow, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+            ClaimLocalRow, ClaimRow, GrowthRow, ResourceRow, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
         };
 
         let mut s = RegionStore::empty(14);
@@ -2467,12 +2480,26 @@ mod tests {
             name: "{0} (N: {1}, E: {2})|~Hexite Deposit|~6158|~8174".into(),
             neutral: true,
         });
+        s.claim_local.upsert(ClaimLocalRow {
+            entity_id: 100,
+            supplies: 0,
+            building_maintenance: 0.0,
+            num_tiles: 1261,
+            treasury: 0,
+            supplies_purchase_threshold: 0,
+            supplies_purchase_price: 0.0,
+            location_x: 24521,
+            location_z: 18473,
+            location_dimension: 1,
+            has_location: true,
+        });
         s.resource.upsert(ResourceRow {
-            entity_id: 97,
+            entity_id: 999,
             resource_id: DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
         });
+        assert!(s.resource.set_location(999, 24521, 18473));
         s.growth.upsert(GrowthRow {
-            entity_id: 97,
+            entity_id: 999,
             end_timestamp_micros: 1_784_475_313_483_000,
             growth_recipe_id: 1,
         });

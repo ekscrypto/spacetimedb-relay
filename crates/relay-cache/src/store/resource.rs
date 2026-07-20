@@ -37,8 +37,15 @@ impl ResourceSoA {
         self.pk.len()
     }
 
-    pub fn find(&self, entity_id: u64) -> Option<u32> {
-        self.pk.get(&entity_id).copied()
+    /// Find a hexite resource whose `location_state` x/z match (world coords).
+    pub fn find_by_location(&self, x: i32, z: i32) -> Option<u32> {
+        for &slot in self.pk.values() {
+            let i = slot as usize;
+            if self.has_location[i] && self.location_x[i] == x && self.location_z[i] == z {
+                return Some(slot);
+            }
+        }
+        None
     }
 
     pub fn is_active(&self, slot: u32) -> bool {
@@ -127,7 +134,7 @@ mod tests {
             resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
         });
         assert!(s.set_location(10, 8174, 6158));
-        let slot = s.find(10).unwrap();
+        let slot = s.find_by_location(8174, 6158).unwrap();
         assert_eq!(s.entity_id[slot as usize], 10);
         assert!(s.has_location[slot as usize]);
         assert_eq!(s.location_x[slot as usize], 8174);
