@@ -12,12 +12,14 @@
     <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
     <h1>Tutorial</h1>
     <div class="nav-group">Guide</div>
-    <nav>
+        <nav>
       <a href="index.html" class="active">Overview</a>
       <a href="connect.html">1. Connect</a>
       <a href="subscribe.html">2. Subscribe</a>
       <a href="schema.html">3. Discover schema</a>
-      <a href="relay-cache.html">4. relay-cache joins</a>
+      <a href="players.html">4. Extract player data</a>
+      <a href="relay-cache.html">5. relay-cache joins</a>
+      <a href="troubleshoot.html">If it fails</a>
     </nav>
   </aside>
 
@@ -26,8 +28,9 @@
     <p class="lede">
       Step-by-step guide to connecting a SpacetimeDB client to the public
       BitCraft relays, subscribing to tables safely at BitCraft scale,
-      reading the schema, and understanding how <code>relay-cache</code>
-      joins mirrored tables into HTTP endpoints.
+      reading the schema, extracting real player column values (name, XP,
+      skills), and understanding how <code>relay-cache</code> joins mirrored
+      tables into HTTP endpoints.
     </p>
 
     <div class="banner warn">
@@ -41,21 +44,41 @@
     <div class="toc">
       <a href="connect.html">
         <span class="num">01</span> Connect over <code>wss://</code>
-        <span class="desc">Python and Rust &mdash; host, database, subprotocol, first handshake.</span>
+        <span class="desc">TypeScript, Python, Rust — host, database, <code>InitialConnection</code>.</span>
       </a>
       <a href="subscribe.html">
         <span class="num">02</span> Subscribe to tables
-        <span class="desc">One table, then multi-table with wait-for-Applied sequencing.</span>
+        <span class="desc">Runnable sequential examples, SQL <code>WHERE</code> notes.</span>
       </a>
       <a href="schema.html">
         <span class="num">03</span> Discover the schema
         <span class="desc">HTTP <code>/schema?version=9</code> on the same port as the WebSocket.</span>
       </a>
+      <a href="players.html">
+        <span class="num">04</span> Extract player data
+        <span class="desc">Concrete columns: username, entity_id, XP, skill names.</span>
+      </a>
       <a href="relay-cache.html">
-        <span class="num">04</span> How relay-cache joins tables
-        <span class="desc">Which mirrored tables feed each <code>/claim</code>, <code>/player</code>, <code>/deposits</code> response.</span>
+        <span class="num">05</span> How relay-cache joins tables
+        <span class="desc">Endpoint map + query params, protobuf, <code>/cache-health</code>.</span>
+      </a>
+      <a href="troubleshoot.html">
+        <span class="num">06</span> If it fails
+        <span class="desc"><code>/health</code> checks, 502, 90s resets, common mistakes.</span>
       </a>
     </div>
+
+    <h2>Global vs regional</h2>
+    <p>
+      <strong>Regional</strong> (<code>3000 + N</code>,
+      <code>relay-mirror-bcN</code>) holds live world state for that BitCraft
+      region — players, claims, inventories. <strong>Global</strong>
+      (<code>:3000</code>, <code>relay-mirror-bc-global</code>) is the
+      shared/reference mirror. Cross-region HTTP searches
+      (<code>/player?name=</code>, <code>/claim?name=</code>,
+      <code>/deposits</code>) already span every regional cache shard.
+      Details: <a href="connect.html#global-vs-regional">Connect</a>.
+    </p>
 
     <h2>What you are connecting to</h2>
     <p>

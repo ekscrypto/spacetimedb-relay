@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>If it fails — relay tutorial</title>
+<link rel="stylesheet" href="css/tutorial.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+    <h1>Tutorial</h1>
+    <div class="nav-group">Guide</div>
+        <nav>
+      <a href="index.html">Overview</a>
+      <a href="connect.html">1. Connect</a>
+      <a href="subscribe.html">2. Subscribe</a>
+      <a href="schema.html">3. Discover schema</a>
+      <a href="players.html">4. Extract player data</a>
+      <a href="relay-cache.html">5. relay-cache joins</a>
+      <a href="troubleshoot.html">If it fails</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <h1>If it fails</h1>
+    <p class="lede">
+      Quick checks before you dig into wire captures. Most cold-start
+      failures are empty ports, a region still syncing, or a subscribe
+      that is simply too large.
+    </p>
+
+    <h2>1. Is the region even up?</h2>
+    <div class="code-panel active">
+<pre><code>curl -sS https://relay.bitcraftsync.app/health | jq '
+  .sources | to_entries[]
+  | {name: .key,
+     port: .value.port,
+     database: .value.database,
+     schema_cached: .value.schema_cached,
+     upstream: .value.metrics.upstream.state,
+     stdb: .value.metrics.local_stdb.state}
+'</code></pre>
+    </div>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Signal</th><th>Meaning</th><th>What to do</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Port missing from <code>/health</code></td>
+            <td>That region is not running on this host.</td>
+            <td>Pick a listed source. Empty band ports return nginx <code>502</code>.</td>
+          </tr>
+          <tr>
+            <td><code>502 Bad Gateway</code> on <code>wss://…:30NN</code></td>
+            <td>nginx is listening; no relay behind the port.</td>
+            <td>Confirm region in <code>/health</code>; do not hard-code ports.</td>
+          </tr>
+          <tr>
+            <td><code>upstream.state != "up"</code></td>
+            <td>Mirror is reconnecting or stuck on initial sync.</td>
+            <td>Wait; watch <code>bytes</code> windows. Do not expect live TUs yet.</td>
+          </tr>
+          <tr>
+            <td><code>schema_cached: false</code></td>
+            <td>Schema/codegen/publish path not ready.</td>
+            <td>HTTP <code>/schema</code> and WS may fail or serve stale; retry later.</td>
+          </tr>
+          <tr>
+            <td><code>local_stdb.state != "up"</code></td>
+            <td>Sibling SpacetimeDB for that region is down.</td>
+            <td>Frontend cannot serve subscriptions until it recovers.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>2. Cache HTTP vs WebSocket</h2>
+    <div class="code-panel active">
+<pre><code>curl -sS https://relay.bitcraftsync.app/cache-health | jq '{ready, memory_pressure, regions: [.regions[] | {region, ready}]}'</code></pre>
+    </div>
+    <p>
+      If <code>ready</code> is false for a region, <code>/player</code> /
+      <code>/claim</code> may omit that shard. WebSocket to the region
+      frontend can still work while the cache is loading.
+    </p>
+
+    <h2>3. Subscribe never Applied / connection drops ~90s</h2>
+    <ol class="steps">
+      <li>
+        <strong>Shrink the query</strong>
+        Full <code>SELECT * FROM …</code> on a multi-hundred-MB table can
+        stall or get edge-reset. Add a <code>WHERE</code> (see
+        <a href="subscribe.html#sql">SQL notes</a>) or subscribe one table
+        at a time.
+      </li>
+      <li>
+        <strong>Raise client max message size</strong>
+        SDKs / <code>websockets</code> often default to tens of MiB.
+        Set unlimited / very high for BitCraft dumps.
+      </li>
+      <li>
+        <strong>Prefer HTTP for joined views</strong>
+        <code>/player/…/skills</code> already did the heavy subscribe on
+        the host — no giant Applied on your laptop.
+      </li>
+      <li>
+        <strong>Confirm greeting first</strong>
+        If you never saw <code>InitialConnection</code> /
+        <code>IdentityToken</code>, you are not ready to Subscribe
+        (<a href="connect.html#initial-connection">Connect</a>).
+      </li>
+    </ol>
+
+    <h2>4. Common client mistakes</h2>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Symptom</th><th>Likely cause</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Immediate error on query</td>
+            <td>Sent <code>OneOffQuery</code> — unsupported. Use Subscribe.</td>
+          </tr>
+          <tr>
+            <td>Unauthorized / reducer failures</td>
+            <td>Calling reducers on the mirror. Read-only; call upstream yourself if needed.</td>
+          </tr>
+          <tr>
+            <td>Wrong / empty tables</td>
+            <td>Used <code>bitcraft-live-N</code> instead of <code>relay-mirror-bcN</code>.</td>
+          </tr>
+          <tr>
+            <td>Brotli/Gzip decode errors</td>
+            <td>Forgot <code>?compression=None</code>.</td>
+          </tr>
+          <tr>
+            <td>Skills named <code>?</code></td>
+            <td>Subscribed <code>experience_state</code> without <code>skill_desc</code>.</td>
+          </tr>
+          <tr>
+            <td>Global DB missing players</td>
+            <td>Global is reference/catalog data — use a regional port for world state.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="next">
+      <a href="relay-cache.html">← relay-cache</a>
+      <a href="index.html">Back to overview</a>
+    </div>
+  </main>
+</div>
+<script src="js/tutorial.js"></script>
+</body>
+</html>

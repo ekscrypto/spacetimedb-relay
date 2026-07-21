@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extract player data — relay tutorial</title>
+<link rel="stylesheet" href="css/tutorial.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+    <h1>Tutorial</h1>
+    <div class="nav-group">Guide</div>
+        <nav>
+      <a href="index.html">Overview</a>
+      <a href="connect.html">1. Connect</a>
+      <a href="subscribe.html">2. Subscribe</a>
+      <a href="schema.html">3. Discover schema</a>
+      <a href="players.html">4. Extract player data</a>
+      <a href="relay-cache.html">5. relay-cache joins</a>
+      <a href="troubleshoot.html">If it fails</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <h1>4. Extract player data (name, XP, skills)</h1>
+    <p class="lede">
+      This page turns the subscribe steps into <strong>actual column values</strong>:
+      player <code>entity_id</code>, <code>username</code>, login fields, and
+      per-skill XP / level. Two workable paths: the public HTTP cache
+      (<code>/player</code>), or a WebSocket subscription you decode yourself.
+    </p>
+
+    <div class="banner warn">
+      <b>Route name.</b> There is no <code>/players</code> collection.
+      Lookups are <code>GET /player?name=…</code> (search) and
+      <code>GET /player/&lt;entity_id&gt;</code> / <code>…/skills</code>
+      (detail). Same data the WebSocket tables below hold.
+    </div>
+
+    <h2>Which tables hold the columns</h2>
+    <p>
+      BitCraft spreads “a player” across several tables. You join them on
+      <code>entity_id</code> (the player PK).
+    </p>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Table</th>
+            <th>Columns you care about</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">player_username_state</td>
+            <td><code>entity_id</code> (u64 PK), <code>username</code> (string)</td>
+            <td>Display name. Search here for name substring.</td>
+          </tr>
+          <tr>
+            <td class="mono">player_state</td>
+            <td><code>entity_id</code>, <code>sign_in_timestamp</code> (i32 unix&nbsp;s),
+              <code>session_start_timestamp</code>, <code>signed_in</code> (bool)</td>
+            <td><code>sign_in_timestamp</code> is what tools call last login.
+              <code>0</code> means unknown.</td>
+          </tr>
+          <tr>
+            <td class="mono">experience_state</td>
+            <td><code>entity_id</code>, <code>experience_stacks</code></td>
+            <td><code>experience_stacks</code> is a list of
+              <code>(skill_id: i32, xp: i32)</code> pairs — one row per player.</td>
+          </tr>
+          <tr>
+            <td class="mono">skill_desc</td>
+            <td><code>id</code>, <code>name</code>, <code>title</code>, <code>max_level</code></td>
+            <td>Catalog: map <code>skill_id</code> → <code>"Forestry"</code>, etc.
+              Small; subscribe once.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="diagram"><span class="hi">player_username_state</span>.entity_id = P
+        │  username
+        ├─ <span class="hi">player_state</span>[P]           → signed_in, sign_in_timestamp
+        ├─ <span class="hi">experience_state</span>[P]       → [(skill_id, xp), …]
+        │       └─ <span class="hi">skill_desc</span>[skill_id] → name
+        └─ level = xp_to_level(xp)          (threshold table; relay-cache vendors it)
+
+<span class="ok">joined player view</span>
+  { entity_id, username, region?, signed_in?, last_login?, skills: [{name, level, xp}] }</div>
+
+    <!-- ========== PATH A ========== -->
+    <h2>Path A — HTTP cache (easiest)</h2>
+    <p>
+      <code>relay-cache</code> already subscribed to those tables on every
+      region and performs the join. Use this when you want column values
+      without speaking BSATN.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <strong>Search by name</strong>
+        <code>GET https://relay.bitcraftsync.app/player?name=maple</code>
+        returns an array of
+        <code>{ entity_id, username, region, signed_in?, last_login_timestamp? }</code>.
+        Prefer ≥2 characters.
+      </li>
+      <li>
+        <strong>Pick an <code>entity_id</code></strong>
+        IDs are JSON <em>strings</em> (JS-safe u64). Example:
+        Maplesugar → <code>1297036692699996362</code> on region 14.
+      </li>
+      <li>
+        <strong>Fetch skills</strong>
+        <code>GET …/player/&lt;id&gt;/skills</code> returns the joined skill list
+        with <code>skill_id</code>, <code>name</code>, <code>level</code>, <code>xp</code>.
+      </li>
+    </ol>
+
+    <h3>Example response shapes</h3>
+    <div class="code-panel active">
+<pre><code># GET /player?name=maple  (truncated)
+[
+  {
+    "entity_id": "1297036692699996362",
+    "username": "Maplesugar",
+    "region": 14,
+    "signed_in": false
+  }
+]
+
+# GET /player/1297036692699996362/skills  (truncated)
+{
+  "player": {
+    "entity_id": "1297036692699996362",
+    "username": "Maplesugar",
+    "region": 14
+  },
+  "skills": [
+    { "skill_id": 2, "name": "Forestry", "level": 58, "xp": 2313100 },
+    { "skill_id": 14, "name": "Foraging", "level": 88, "xp": 63954454 }
+  ]
+}</code></pre>
+    </div>
+
+    <h3>Runnable clients</h3>
+    <div class="code-switch">
+      <div class="lang-tabs">
+        <button type="button" class="active" data-lang="python">Python</button>
+        <button type="button" data-lang="rust">Rust</button>
+        <button type="button" data-lang="curl">curl</button>
+      </div>
+      <div class="code-panel active" data-lang="python">
+<pre><code>#!/usr/bin/env python3
+"""Print username + top skills for a name search via relay-cache HTTP."""
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+BASE = "https://relay.bitcraftsync.app"
+NEEDLE = sys.argv[1] if len(sys.argv) > 1 else "maple"
+
+
+def get(path: str):
+    with urllib.request.urlopen(BASE + path, timeout=60) as r:
+        return json.load(r)
+
+
+players = get("/player?name=" + urllib.parse.quote(NEEDLE))
+if not players:
+    sys.exit(f"no players matching {NEEDLE!r}")
+
+# Prefer an exact (case-insensitive) username match when present.
+pick = next(
+    (p for p in players if p["username"].lower() == NEEDLE.lower()),
+    players[0],
+)
+entity_id = pick["entity_id"]  # str — keep as str for the URL
+print(f"{pick['username']}  entity_id={entity_id}  region={pick['region']}")
+print(f"  signed_in={pick.get('signed_in')}  last_login={pick.get('last_login_timestamp')}")
+
+detail = get(f"/player/{entity_id}/skills")
+skills = sorted(detail["skills"], key=lambda s: s["xp"], reverse=True)
+print(f"  {len(skills)} skills — top 5 by XP:")
+for s in skills[:5]:
+    print(f"    {s['name']:<20} level={s['level']:<3} xp={s['xp']}")
+
+# Every column on the skills payload:
+#   skill_id: int   name: str   level: int   xp: int</code></pre>
+      </div>
+      <div class="code-panel" data-lang="rust">
+<pre><code>// cargo add reqwest serde serde_json tokio --features reqwest/json,tokio/rt-multi-thread,macros
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct Player {
+    entity_id: String,
+    username: String,
+    region: u32,
+    signed_in: Option&lt;bool&gt;,
+    last_login_timestamp: Option&lt;i64&gt;,
+}
+
+#[derive(Debug, Deserialize)]
+struct Skill {
+    skill_id: i32,
+    name: String,
+    level: i64,
+    xp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerSkills {
+    player: Player,
+    skills: Vec&lt;Skill&gt;,
+}
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let needle = std::env::args().nth(1).unwrap_or_else(|| "maple".into());
+    let url = format!("https://relay.bitcraftsync.app/player?name={needle}");
+    let players: Vec&lt;Player&gt; = reqwest::get(&amp;url).await?.error_for_status()?.json().await?;
+    let pick = players
+        .iter()
+        .find(|p| p.username.eq_ignore_ascii_case(&amp;needle))
+        .or_else(|| players.first())
+        .ok_or("no match")?;
+
+    println!(
+        "{}  entity_id={}  region={}  signed_in={:?}  last_login={:?}",
+        pick.username, pick.entity_id, pick.region, pick.signed_in, pick.last_login_timestamp
+    );
+
+    let skills_url = format!(
+        "https://relay.bitcraftsync.app/player/{}/skills",
+        pick.entity_id
+    );
+    let body: PlayerSkills = reqwest::get(&amp;skills_url)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut skills = body.skills;
+    skills.sort_by_key(|s| std::cmp::Reverse(s.xp));
+    for s in skills.iter().take(5) {
+        println!("  {:&lt;20} level={:&lt;3} xp={}", s.name, s.level, s.xp);
+    }
+    Ok(())
+}</code></pre>
+      </div>
+      <div class="code-panel" data-lang="curl">
+<pre><code>curl -sS 'https://relay.bitcraftsync.app/player?name=maple' | jq .
+curl -sS 'https://relay.bitcraftsync.app/player/1297036692699996362' | jq .
+curl -sS 'https://relay.bitcraftsync.app/player/1297036692699996362/skills' \
+  | jq '.skills | sort_by(-.xp) | .[0:5]'</code></pre>
+      </div>
+    </div>
+
+    <!-- ========== PATH B ========== -->
+    <h2>Path B — WebSocket: read the same columns yourself</h2>
+    <p>
+      Use this when you want a live local cache (or columns the HTTP API
+      does not expose). Flow: connect → sequential subscribe of the four
+      tables → on each Applied, copy row fields into dicts → join on
+      <code>entity_id</code> and print.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <strong>Generate bindings</strong> from the region schema (see
+        <a href="schema.html">Discover schema</a>) so each table is a typed
+        struct with named fields — not opaque bytes.
+      </li>
+      <li>
+        <strong>Subscribe in order</strong> (wait for Applied between sets):
+        <code>skill_desc</code> → <code>player_username_state</code> →
+        <code>player_state</code> → <code>experience_state</code>.
+        Catalog first so skill names resolve as XP arrives.
+      </li>
+      <li>
+        <strong>Read fields from the client cache</strong> after the last
+        Applied (examples below). Keep applying live updates the same way.
+      </li>
+    </ol>
+
+    <div class="banner good">
+      <b>SQL to use</b> (exact table names from the schema):
+      <code>SELECT * FROM skill_desc</code>,
+      <code>SELECT * FROM player_username_state</code>,
+      <code>SELECT * FROM player_state</code>,
+      <code>SELECT * FROM experience_state</code>.
+      On a single region frontend (e.g. <code>:3014</code> /
+      <code>relay-mirror-bc14</code>) you only see that region’s players.
+      The HTTP <code>/player?name=</code> API searches <em>all</em> regions.
+    </div>
+
+    <div class="code-switch">
+      <div class="lang-tabs">
+        <button type="button" class="active" data-lang="rust">Rust SDK</button>
+        <button type="button" data-lang="python">Python (after generate)</button>
+      </div>
+      <div class="code-panel active" data-lang="rust">
+<pre><code>// Assumes `spacetime generate --lang rust` produced module_bindings
+// with tables: skill_desc, player_username_state, player_state, experience_state.
+use module_bindings::*;
+use spacetimedb_sdk::DbContext;
+use std::collections::HashMap;
+
+/// Build skill_id → name from the catalog table.
+fn skill_names(ctx: &amp;impl DbContext) -&gt; HashMap&lt;i32, String&gt; {
+    ctx.db
+        .skill_desc()
+        .iter()
+        .map(|row| (row.id, row.name.clone()))
+        .collect()
+}
+
+/// Print one player’s columns after all four subscriptions have applied.
+fn dump_player(ctx: &amp;impl DbContext, want_name: &amp;str) {
+    let names = skill_names(ctx);
+
+    // 1) username column
+    let Some(user) = ctx
+        .db
+        .player_username_state()
+        .iter()
+        .find(|r| r.username.eq_ignore_ascii_case(want_name))
+    else {
+        println!("no player_username_state row for {want_name}");
+        return;
+    };
+    let id = user.entity_id;
+    println!("username={}  entity_id={}", user.username, id);
+
+    // 2) player_state columns
+    if let Some(ps) = ctx.db.player_state().entity_id().find(&amp;id) {
+        println!(
+            "  signed_in={}  sign_in_timestamp={}  session_start_timestamp={}",
+            ps.signed_in, ps.sign_in_timestamp, ps.session_start_timestamp
+        );
+    }
+
+    // 3) experience_state.experience_stacks — Vec of (skill_id, xp)
+    if let Some(xp_row) = ctx.db.experience_state().entity_id().find(&amp;id) {
+        let mut stacks: Vec&lt;_&gt; = xp_row.experience_stacks.iter().cloned().collect();
+        stacks.sort_by_key(|(_skill, xp)| std::cmp::Reverse(*xp));
+        println!("  skills (top 5 by xp):");
+        for (skill_id, xp) in stacks.into_iter().take(5) {
+            let name = names.get(&amp;skill_id).map(|s| s.as_str()).unwrap_or("?");
+            // Level: use your own XP threshold table, or call the HTTP
+            // /player/&lt;id&gt;/skills endpoint which already computes level.
+            println!("    {name}  skill_id={skill_id}  xp={xp}");
+        }
+    }
+}
+
+// Wire-up sketch (inside on_connect), sequential Applied → next table:
+//
+// let tables = [
+//     "SELECT * FROM skill_desc",
+//     "SELECT * FROM player_username_state",
+//     "SELECT * FROM player_state",
+//     "SELECT * FROM experience_state",
+// ];
+// subscribe_one_then_next(ctx, &amp;tables, 0, || dump_player(ctx, "Maplesugar"));
+//
+// fn subscribe_one_then_next(...) {
+//   ctx.subscription_builder()
+//     .on_applied(move |ctx| {
+//       if idx + 1 == tables.len() { done(&amp;ctx); }
+//       else { subscribe_one_then_next(&amp;ctx, tables, idx + 1, done); }
+//     })
+//     .subscribe([tables[idx]]);
+// }</code></pre>
+      </div>
+      <div class="code-panel" data-lang="python">
+<pre><code>"""
+After `spacetime generate --lang python`, the generated table classes
+expose each column as an attribute on row objects in the client cache.
+
+Exact API names vary slightly by SDK version — the *column names* below
+match the BitCraft schema and are what you print.
+"""
+
+# Pseudocode aligned with SpacetimeDBAsyncClient + generated bindings:
+
+usernames = {}          # entity_id -> str
+player_state = {}       # entity_id -> dict of columns
+experience = {}         # entity_id -> list[(skill_id, xp)]
+skill_names = {}        # skill_id -> str
+
+def on_skill_desc_insert(row):
+    # columns: id, name, title, max_level
+    skill_names[row.id] = row.name
+
+def on_username_insert(row):
+    # columns: entity_id, username
+    usernames[row.entity_id] = row.username
+
+def on_player_state_insert(row):
+    # columns: entity_id, sign_in_timestamp, session_start_timestamp, signed_in
+    player_state[row.entity_id] = {
+        "sign_in_timestamp": row.sign_in_timestamp,
+        "session_start_timestamp": row.session_start_timestamp,
+        "signed_in": row.signed_in,
+    }
+
+def on_experience_insert(row):
+    # columns: entity_id, experience_stacks
+    # experience_stacks is a sequence of (skill_id, xp) pairs
+    experience[row.entity_id] = list(row.experience_stacks)
+
+def print_player(username_query: str):
+    matches = [
+        (eid, name)
+        for eid, name in usernames.items()
+        if name.lower() == username_query.lower()
+    ]
+    if not matches:
+        # fallback: substring
+        matches = [
+            (eid, name)
+            for eid, name in usernames.items()
+            if username_query.lower() in name.lower()
+        ]
+    for eid, name in matches[:5]:
+        ps = player_state.get(eid, {})
+        print(f"{name}  entity_id={eid}")
+        print(
+            f"  signed_in={ps.get('signed_in')}  "
+            f"sign_in_timestamp={ps.get('sign_in_timestamp')}"
+        )
+        stacks = sorted(
+            experience.get(eid, []),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )
+        for skill_id, xp in stacks[:5]:
+            print(
+                f"    {skill_names.get(skill_id, '?'):&lt;20} "
+                f"skill_id={skill_id}  xp={xp}"
+            )
+
+# Subscribe order (wait for each Applied — see subscribe.html):
+#   1. SELECT * FROM skill_desc
+#   2. SELECT * FROM player_username_state
+#   3. SELECT * FROM player_state
+#   4. SELECT * FROM experience_state
+# Then: print_player("Maplesugar")</code></pre>
+      </div>
+    </div>
+
+    <h3>What you should see</h3>
+    <p>
+      For a known character on region 14, after the four Applied callbacks,
+      printing columns should look like:
+    </p>
+    <div class="code-panel active">
+<pre><code>Maplesugar  entity_id=1297036692699996362
+  signed_in=False  sign_in_timestamp=…
+  Forestry             skill_id=2   xp=2313100
+  Foraging             skill_id=14  xp=63954454
+  …</code></pre>
+    </div>
+    <p>
+      If <code>username</code> prints but skills are empty, your
+      <code>experience_state</code> subscribe has not Applied yet (or you
+      joined the wrong <code>entity_id</code>). If skills have XP but names
+      are <code>?</code>, <code>skill_desc</code> is missing — subscribe it
+      first.
+    </p>
+
+    <h2>Level from XP</h2>
+    <p>
+      Raw rows only store <code>xp</code>. Skill <em>level</em> is derived
+      from a static threshold table (same one BitJita / relay-cache use).
+      The HTTP <code>/player/&lt;id&gt;/skills</code> response already includes
+      <code>level</code>. If you decode WebSocket rows yourself, either
+      call that endpoint for levels or vendor the same thresholds.
+    </p>
+
+    <div class="next">
+      <a href="schema.html">← Schema</a>
+      <a href="relay-cache.html">Next: relay-cache joins <span class="muted">how /player is built</span></a>
+    </div>
+  </main>
+</div>
+<script src="js/tutorial.js"></script>
+</body>
+</html>

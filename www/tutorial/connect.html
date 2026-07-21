@@ -12,12 +12,14 @@
     <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
     <h1>Tutorial</h1>
     <div class="nav-group">Guide</div>
-    <nav>
+        <nav>
       <a href="index.html">Overview</a>
       <a href="connect.html">1. Connect</a>
       <a href="subscribe.html">2. Subscribe</a>
       <a href="schema.html">3. Discover schema</a>
-      <a href="relay-cache.html">4. relay-cache joins</a>
+      <a href="players.html">4. Extract player data</a>
+      <a href="relay-cache.html">5. relay-cache joins</a>
+      <a href="troubleshoot.html">If it fails</a>
     </nav>
   </aside>
 
@@ -50,10 +52,10 @@
         does not decompress inbound Brotli/Gzip payloads for you.
       </li>
       <li>
-        <strong>Wait for InitialConnection</strong>
-        After the WebSocket opens, the first binary server message is
-        <code>InitialConnection</code> (identity + token). Persist the token
-        if your SDK supports reconnect-as-same-identity.
+        <strong>Wait for the first server message</strong>
+        The WebSocket upgrade alone is not enough. SpacetimeDB then
+        sends a handshake payload that carries your connection identity
+        (details below). Only after that should you subscribe.
       </li>
     </ol>
 
@@ -80,11 +82,75 @@
       </table>
     </div>
 
+    <h2 id="initial-connection">What <code>InitialConnection</code> is</h2>
+    <p>
+      After the TCP/TLS WebSocket handshake succeeds, the <em>first</em>
+      application message from the server is the connection greeting.
+      On the <strong>v2</strong> wire (<code>v2.bsatn.spacetimedb</code>) that
+      message is named <code>InitialConnection</code>. On <strong>v1</strong>
+      (<code>v1.bsatn.spacetimedb</code> / <code>v1.json.spacetimedb</code>) the
+      same step is called <code>IdentityToken</code> — same role, different
+      enum tag.
+    </p>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Field</th><th>Meaning</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>identity</code></td>
+            <td>The Identity this connection was issued. Used for auth on
+              reducer calls (not needed for read-only subscribe).</td>
+          </tr>
+          <tr>
+            <td><code>token</code></td>
+            <td>Opaque bearer string. Pass it on later connects if you want
+              the <em>same</em> identity back (SDK <code>with_token</code> /
+              saved auth token).</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Frame shape (v2): one WebSocket <strong>binary</strong> message =
+      <code>0x00</code> compression tag (<code>None</code>) + BSATN-encoded
+      <code>ServerMessage::InitialConnection { identity, token }</code>.
+      Do not send <code>Subscribe</code> until you have received (and, if
+      raw, decoded) this message. Official SDKs wait for you: their
+      <code>on_connect</code> / connected callback fires only after the
+      greeting is processed — that callback <em>is</em> “after
+      <code>InitialConnection</code>.”
+    </p>
+    <div class="diagram"><span class="hi">Client</span>                    <span class="ok">Relay frontend</span>
+   │  HTTP Upgrade + Sec-WebSocket-Protocol
+   │ ─────────────────────────────────────►
+   │  101 Switching Protocols
+   │ ◄─────────────────────────────────────
+   │
+   │  Binary: InitialConnection { identity, token }   ← wait for this
+   │ ◄─────────────────────────────────────
+   │
+   │  Binary: Subscribe { … }                         ← only then
+   │ ─────────────────────────────────────►
+   │  Binary: SubscribeApplied { … }
+   │ ◄─────────────────────────────────────</div>
+    <div class="banner good">
+      <b>SDK users:</b> you rarely touch the BSATN bytes. Build the
+      connection, register <code>on_connect</code>, and start subscriptions
+      <em>inside</em> that callback (or after it signals). That is the
+      <code>InitialConnection</code> barrier. Raw clients: read one server
+      frame first, assert it is the greeting, then subscribe — see the
+      wire sketch below.
+    </div>
+
     <div class="banner warn">
       <b>No auth token required</b> for public read subscriptions on these
       mirrors. Do not send your BitCraft upstream bearer token to the relay
       &mdash; that token is only for the relay process itself talking to
-      BitCraft.
+      BitCraft. The <code>token</code> inside <code>InitialConnection</code>
+      is a <em>different</em> credential: it identifies <em>your</em>
+      downstream connection to the local mirror, not BitCraft.
     </div>
 
     <h2>Python</h2>
@@ -119,7 +185,10 @@ SSL = True
 client = SpacetimeDBAsyncClient(module_bindings)
 
 def on_connect(_client, identity, token):
+    # Fires after InitialConnection has been received and decoded by the SDK.
+    # Safe place to start Subscribe calls (see the Subscribe tutorial page).
     print(f"connected identity={identity} token_len={len(token or '')}")
+    # optionally persist `token` for reconnect-as-same-identity
 
 async def main():
     # auth_token=None → anonymous identity issued by local stdb
@@ -154,12 +223,14 @@ async def main():
         subprotocols=[SUBPROTOCOL],
         max_size=None,  # BitCraft tables can be huge
     ) as ws:
-        # First binary frame: compression_tag (0) + BSATN InitialConnection
+        # --- InitialConnection (required before any Subscribe) ---
+        # First binary frame: u8 compression (0=None) + BSATN ServerMessage.
+        # Tag 0x00 of the ServerMessage enum is InitialConnection { identity, token }.
         frame = await ws.recv()
         assert isinstance(frame, (bytes, bytearray))
         assert frame[0] == 0, "expected compression=None"
-        print(f"got {len(frame)} byte handshake frame")
-        # Decode BSATN ServerMessage::InitialConnection with your codec…
+        print(f"InitialConnection frame: {len(frame)} bytes")
+        # bsatn_decode(frame[1:]) → InitialConnection; then you may Subscribe.
         await asyncio.Future()  # keep alive
 
 asyncio.run(main())</code></pre>
@@ -189,6 +260,7 @@ fn main() {
         .with_uri("wss://relay.bitcraftsync.app:3014")
         .with_database_name("relay-mirror-bc14")
         .on_connect(|_ctx, identity, token| {
+            // Runs after InitialConnection — safe to Subscribe from here.
             println!("connected {identity} token_len={}", token.len());
         })
         .on_connect_error(|_ctx, err| eprintln!("connect error: {err}"))
@@ -243,6 +315,59 @@ async fn main() -&gt; Result&lt;()&gt; {
       <code>wss://relay.bitcraftsync.app:3014</code> and database →
       <code>relay-mirror-bc14</code>. Keep the same SQL / table names from
       the upstream schema.
+    </div>
+
+    <h2>TypeScript</h2>
+    <p>
+      Use the current <code>spacetimedb</code> npm package (the older
+      <code>@clockworklabs/spacetimedb-sdk</code> is deprecated). Generate
+      bindings, then point <code>withUri</code> at the relay.
+    </p>
+    <div class="code-panel active">
+<pre><code>// npm i spacetimedb
+// spacetime generate --lang typescript --out-dir src/module_bindings \
+//   --module-name relay-mirror-bc14 -s https://relay.bitcraftsync.app:3014
+
+import { DbConnection } from "./module_bindings";
+
+const conn = DbConnection.builder()
+  .withUri("wss://relay.bitcraftsync.app:3014")
+  .withDatabaseName("relay-mirror-bc14")
+  .onConnect((conn, identity, token) => {
+    // Fires after InitialConnection — start Subscribe here (see Subscribe page).
+    console.log("connected", identity.toHexString(), "token_len", token.length);
+  })
+  .onConnectError((_ctx, err) => console.error("connect error", err))
+  .onDisconnect((_ctx, err) => console.log("disconnect", err))
+  .build();</code></pre>
+    </div>
+
+    <h2 id="global-vs-regional">Global vs regional</h2>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Connect to</th><th>When</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>:3000</code> / <code>relay-mirror-bc-global</code></td>
+            <td>Shared reference / catalog-style data that is not per-world
+              (item/recipe/desc tables as mirrored globally). Not where live
+              players and claims for a world live.</td>
+          </tr>
+          <tr>
+            <td><code>:3000+N</code> / <code>relay-mirror-bcN</code></td>
+            <td>World state for region <code>N</code> — players, claims,
+              inventories, hexite, storage logs. Use this for almost all
+              gameplay tooling.</td>
+          </tr>
+          <tr>
+            <td>HTTP <code>/player</code>, <code>/claim</code>, …</td>
+            <td>Already fans out across <em>all</em> regional cache shards.
+              No need to pick a port for cross-region name search.</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="next">

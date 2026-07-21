@@ -12,17 +12,19 @@
     <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
     <h1>Tutorial</h1>
     <div class="nav-group">Guide</div>
-    <nav>
+        <nav>
       <a href="index.html">Overview</a>
       <a href="connect.html">1. Connect</a>
       <a href="subscribe.html">2. Subscribe</a>
       <a href="schema.html">3. Discover schema</a>
-      <a href="relay-cache.html">4. relay-cache joins</a>
+      <a href="players.html">4. Extract player data</a>
+      <a href="relay-cache.html">5. relay-cache joins</a>
+      <a href="troubleshoot.html">If it fails</a>
     </nav>
   </aside>
 
   <main class="main">
-    <h1>4. How relay-cache joins tables</h1>
+    <h1>5. How relay-cache joins tables</h1>
     <p class="lede">
       <code>relay-cache</code> is a same-host process that subscribes to every
       regional frontend on loopback, keeps selected tables in memory, and
@@ -119,7 +121,9 @@
           <tr>
             <td class="mono">GET /player?name=</td>
             <td><code>player_username_state</code>, <code>player_state</code></td>
-            <td>Substring search; region; last login / signed-in.</td>
+            <td>Substring search; region; last login / signed-in.
+              Walkthrough with printable columns:
+              <a href="players.html">Extract player data</a>.</td>
           </tr>
           <tr>
             <td class="mono">…/inventory</td>
@@ -171,16 +175,109 @@
 
 <span class="ok">GET /deposits?region=14</span>  → { deposits: [...], count }</div>
 
+    <h2>HTTP API cheat sheet</h2>
+    <p>
+      Base URL: <code>https://relay.bitcraftsync.app</code>. Default JSON;
+      send <code>Accept: application/x-protobuf</code> for protobuf (entity
+      ids are <code>uint64</code> there; JSON keeps them as strings).
+    </p>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Method</th><th>Params</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">GET /cache-health</td>
+            <td>—</td>
+            <td><code>ready</code>, <code>memory_pressure</code>, per-region
+              <code>ready</code> + row counts.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /proto</td>
+            <td>—</td>
+            <td>List of <code>.proto</code> files;
+              <code>/proto/relay_cache.proto</code> downloads one.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /claim?name=</td>
+            <td><code>name</code> (substring, case-insensitive)</td>
+            <td>Array of claim summaries (tier, owner username, …).</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /claim/&lt;id&gt;</td>
+            <td>—</td>
+            <td>Full enrichment (supplies, upkeep, techs, location).</td>
+          </tr>
+          <tr>
+            <td class="mono">…/inventory</td>
+            <td>—</td>
+            <td>Shared storage only; grouped by dimension.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/members</td>
+            <td>—</td>
+            <td>Roster + permissions + last login.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/citizens</td>
+            <td>—</td>
+            <td>Members + skill levels + <code>skill_names</code>.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/hexcoins</td>
+            <td>—</td>
+            <td>Per-member Hex Coin totals (<code>item_id == 1</code>).</td>
+          </tr>
+          <tr>
+            <td class="mono">…/crafts</td>
+            <td><code>completed=true|false</code> (optional)</td>
+            <td>Omit filter → in-progress and completed.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /player?name=</td>
+            <td><code>name</code> (≥2 chars recommended)</td>
+            <td>Cross-region search.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /player/&lt;id&gt;</td>
+            <td>—</td>
+            <td>Plus <code>/inventory</code>, <code>/housing</code>,
+              <code>/skills</code>, <code>/crafts?completed=</code>.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /deposits</td>
+            <td><code>region=N</code> (optional)</td>
+            <td>Active omit <code>respawn_at</code>; depleted include it.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /storage-logs</td>
+            <td>Exactly one mode:<br>
+              <code>storageId=</code> <em>or</em><br>
+              <code>playerId=</code> <em>or</em><br>
+              <code>itemId=</code>+<code>claimId=</code> <em>or</em><br>
+              <code>itemId=</code>+<code>playerId=</code><br>
+              Optional: <code>itemType=Item|Cargo</code>,
+              <code>region=N</code>, <code>limit=N</code></td>
+            <td>Upstream retention ~15–16 days. Newest-first when limited.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
     <h2>Calling the public HTTP API</h2>
     <div class="code-panel active" data-lang="http">
 <pre><code>curl -s 'https://relay.bitcraftsync.app/claim?name=concordia' | jq .
 curl -s 'https://relay.bitcraftsync.app/claim/1234567890/citizens' | jq .
+curl -s 'https://relay.bitcraftsync.app/claim/1234567890/crafts?completed=false' | jq .
 curl -s 'https://relay.bitcraftsync.app/deposits?region=14' | jq .
+curl -s 'https://relay.bitcraftsync.app/storage-logs?storageId=1008806316593474517&limit=50' | jq .
+curl -s https://relay.bitcraftsync.app/cache-health | jq .
 curl -sH 'Accept: application/x-protobuf' \
-  'https://relay.bitcraftsync.app/player/1297036692699996362/inventory' \
-  -o inventory.pb
+  'https://relay.bitcraftsync.app/player/1297036692699996362/skills' \
+  -o skills.pb
 
-# Schemas for protobuf DTOs:
+# Protobuf schemas:
 curl -s https://relay.bitcraftsync.app/proto
 curl -OJ https://relay.bitcraftsync.app/proto/relay_cache.proto</code></pre>
     </div>
@@ -191,12 +288,13 @@ curl -OJ https://relay.bitcraftsync.app/proto/relay_cache.proto</code></pre>
       Use <code>relay-cache</code> HTTP when you want claim/player/deposit
       views without re-implementing the joins — and when a shared in-memory
       cache on the relay host is acceptable (read-only, eventually consistent
-      with each region’s mirror).
+      with each region’s mirror). Stuck? See
+      <a href="troubleshoot.html">If it fails</a>.
     </div>
 
     <div class="next">
-      <a href="schema.html">← Schema</a>
-      <a href="/">Back to fleet status <span class="muted">live ports &amp; health</span></a>
+      <a href="players.html">← Extract player data</a>
+      <a href="troubleshoot.html">Next: If it fails <span class="muted">/health checks &amp; common errors</span></a>
     </div>
   </main>
 </div>
