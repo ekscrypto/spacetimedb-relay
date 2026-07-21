@@ -75,11 +75,32 @@
     </div>
     <p>
       Prefer projecting only what you need when a table is huge
-      (<code>location_state</code>, inventories, footprints). Fancy joins,
-      aggregates, <code>ORDER BY</code>, or <code>LIMIT</code> are either
-      unsupported or a bad fit for subscriptions — use the
-      <a href="relay-cache.html">HTTP cache</a> for joined views instead.
+      (<code>location_state</code>, inventories, footprints).
+      <strong>Etiquette:</strong> do not <code>SELECT * FROM location_state</code>
+      (or other multi-hundred-MB tables) from every client laptop — filter,
+      use the <a href="relay-cache.html">HTTP cache</a>, or run heavy
+      mirrors on a server. Fancy joins, aggregates, <code>ORDER BY</code>, or
+      <code>LIMIT</code> are either unsupported or a bad fit for subscriptions.
       <code>OneOffQuery</code> is rejected by the relay.
+    </p>
+
+    <h2 id="one-shot">One-shot snapshot (no live stream)</h2>
+    <p>
+      Need a dump, not a long-lived cache? That is the usual substitute for
+      <code>OneOffQuery</code>:
+    </p>
+    <ol class="steps">
+      <li><strong>Connect</strong> and wait for the greeting (<code>InitialConnection</code> / <code>IdentityToken</code>).</li>
+      <li><strong>Subscribe</strong> with the smallest SQL that answers the question (filters help).</li>
+      <li><strong>Wait</strong> for Applied / <code>InitialSubscription</code>.</li>
+      <li><strong>Read</strong> rows from the Applied payload or SDK client cache.</li>
+      <li><strong>Close</strong> the WebSocket — you are done.</li>
+    </ol>
+    <p>
+      The Python v1.json examples on this page and
+      <a href="players.html">Players</a> do exactly that (connect → subscribe →
+      print → exit). Keep the socket open only if you need live
+      <code>TransactionUpdate</code>s afterward.
     </p>
 
     <h2>One table (or a few filtered rows)</h2>

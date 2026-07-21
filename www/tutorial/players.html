@@ -264,9 +264,10 @@ curl -sS 'https://relay.bitcraftsync.app/player/1297036692699996362/skills' \
     <h2>Path B — WebSocket: read the same columns yourself</h2>
     <p>
       Use this when you want a live local cache (or columns the HTTP API
-      does not expose). Flow: connect → sequential subscribe of the four
-      tables → on each Applied, copy row fields into dicts → join on
-      <code>entity_id</code> and print.
+      does not expose). Flow: connect → subscribe the four tables (filtered)
+      → wait for Applied → join on <code>entity_id</code> and print.
+      Python below is the same runnable <strong>v1.json</strong> join as
+      <a href="subscribe.html">Subscribe</a>; Rust uses generated SDK bindings.
     </p>
 
     <ol class="steps">
@@ -288,29 +289,96 @@ curl -sS 'https://relay.bitcraftsync.app/player/1297036692699996362/skills' \
     </ol>
 
     <div class="banner good">
-      <b>SQL to use</b> (exact table names from the schema):
-      <code>SELECT * FROM skill_desc</code>,
-      <code>SELECT * FROM player_username_state</code>,
-      <code>SELECT * FROM player_state</code>,
-      <code>SELECT * FROM experience_state</code>.
-      On a single region frontend (e.g. <code>:3014</code> /
-      <code>relay-mirror-bc14</code>) you only see that region’s players.
-      The HTTP <code>/player?name=</code> API searches <em>all</em> regions.
+      <b>SQL to use</b> (exact table names from the schema). Prefer
+      filters for dumps — e.g.
+      <code>WHERE username = 'Maplesugar'</code> /
+      <code>WHERE entity_id = …</code>. Full
+      <code>SELECT * FROM player_username_state</code> on a busy region is
+      large; never full-dump <code>location_state</code> from a laptop.
+      On a single region frontend you only see that region’s players; HTTP
+      <code>/player?name=</code> searches all regions.
     </div>
 
     <div class="code-switch">
       <div class="lang-tabs">
-        <button type="button" class="active" data-lang="rust">Rust SDK</button>
-        <button type="button" data-lang="python">Python (after generate)</button>
+        <button type="button" class="active" data-lang="python">Python (v1.json)</button>
+        <button type="button" data-lang="rust">Rust SDK</button>
       </div>
-      <div class="code-panel active" data-lang="rust">
+      <div class="code-panel active" data-lang="python">
+<pre><code>#!/usr/bin/env python3
+"""Same runnable join as Subscribe → “Many tables” (v1.json).
+   pip install websockets
+"""
+import asyncio
+import json
+import websockets
+
+URL = (
+    "wss://relay.bitcraftsync.app:3014"
+    "/v1/database/relay-mirror-bc14/subscribe?compression=None"
+)
+ENTITY = 1297036692699996362  # Maplesugar on region 14
+
+QUERIES = [
+    "SELECT * FROM skill_desc",
+    "SELECT * FROM player_username_state WHERE username = 'Maplesugar'",
+    f"SELECT * FROM player_state WHERE entity_id = {ENTITY}",
+    f"SELECT * FROM experience_state WHERE entity_id = {ENTITY}",
+]
+
+async def recv_json(ws, timeout=180):
+    while True:
+        msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
+        if isinstance(msg, str):
+            return json.loads(msg)
+
+async def main():
+    async with websockets.connect(
+        URL, subprotocols=["v1.json.spacetimedb"], max_size=None
+    ) as ws:
+        assert "IdentityToken" in await recv_json(ws)  # v1 greeting
+
+        await ws.send(json.dumps({
+            "Subscribe": {"request_id": 1, "query_strings": QUERIES}
+        }))
+        applied = await recv_json(ws)
+        isub = applied["InitialSubscription"]
+
+        skill_names = {}
+        stacks = []
+        for table in isub["database_update"]["tables"]:
+            name = table["table_name"]
+            for upd in table["updates"]:
+                for raw in upd.get("inserts", []):
+                    row = json.loads(raw) if isinstance(raw, str) else raw
+                    if name == "skill_desc":
+                        skill_names[row["id"]] = row["name"]
+                    elif name == "player_username_state":
+                        print(f"username={row['username']}  entity_id={row['entity_id']}")
+                    elif name == "player_state":
+                        print(
+                            f"  signed_in={row.get('signed_in')}  "
+                            f"sign_in_timestamp={row.get('sign_in_timestamp')}"
+                        )
+                    elif name == "experience_state":
+                        stacks = row.get("experience_stacks") or []
+
+        for skill_id, xp in sorted(stacks, key=lambda p: -p[1])[:5]:
+            label = skill_names.get(skill_id, "?")
+            print(f"  {label:&lt;20} skill_id={skill_id}  xp={xp}")
+
+        # Snapshot done — close the socket (OneOffQuery substitute).
+        # For a live cache, keep the connection and apply TransactionUpdates.
+
+asyncio.run(main())</code></pre>
+      </div>
+      <div class="code-panel" data-lang="rust">
 <pre><code>// Assumes `spacetime generate --lang rust` produced module_bindings
 // with tables: skill_desc, player_username_state, player_state, experience_state.
 use module_bindings::*;
 use spacetimedb_sdk::DbContext;
 use std::collections::HashMap;
 
-/// Build skill_id → name from the catalog table.
 fn skill_names(ctx: &amp;impl DbContext) -&gt; HashMap&lt;i32, String&gt; {
     ctx.db
         .skill_desc()
@@ -319,11 +387,8 @@ fn skill_names(ctx: &amp;impl DbContext) -&gt; HashMap&lt;i32, String&gt; {
         .collect()
 }
 
-/// Print one player’s columns after all four subscriptions have applied.
 fn dump_player(ctx: &amp;impl DbContext, want_name: &amp;str) {
     let names = skill_names(ctx);
-
-    // 1) username column
     let Some(user) = ctx
         .db
         .player_username_state()
@@ -336,7 +401,6 @@ fn dump_player(ctx: &amp;impl DbContext, want_name: &amp;str) {
     let id = user.entity_id;
     println!("username={}  entity_id={}", user.username, id);
 
-    // 2) player_state columns
     if let Some(ps) = ctx.db.player_state().entity_id().find(&amp;id) {
         println!(
             "  signed_in={}  sign_in_timestamp={}  session_start_timestamp={}",
@@ -344,113 +408,19 @@ fn dump_player(ctx: &amp;impl DbContext, want_name: &amp;str) {
         );
     }
 
-    // 3) experience_state.experience_stacks — Vec of (skill_id, xp)
     if let Some(xp_row) = ctx.db.experience_state().entity_id().find(&amp;id) {
         let mut stacks: Vec&lt;_&gt; = xp_row.experience_stacks.iter().cloned().collect();
         stacks.sort_by_key(|(_skill, xp)| std::cmp::Reverse(*xp));
         println!("  skills (top 5 by xp):");
         for (skill_id, xp) in stacks.into_iter().take(5) {
             let name = names.get(&amp;skill_id).map(|s| s.as_str()).unwrap_or("?");
-            // Level: use your own XP threshold table, or call the HTTP
-            // /player/&lt;id&gt;/skills endpoint which already computes level.
             println!("    {name}  skill_id={skill_id}  xp={xp}");
         }
     }
 }
 
-// Wire-up sketch (inside on_connect), sequential Applied → next table:
-//
-// let tables = [
-//     "SELECT * FROM skill_desc",
-//     "SELECT * FROM player_username_state",
-//     "SELECT * FROM player_state",
-//     "SELECT * FROM experience_state",
-// ];
-// subscribe_one_then_next(ctx, &amp;tables, 0, || dump_player(ctx, "Maplesugar"));
-//
-// fn subscribe_one_then_next(...) {
-//   ctx.subscription_builder()
-//     .on_applied(move |ctx| {
-//       if idx + 1 == tables.len() { done(&amp;ctx); }
-//       else { subscribe_one_then_next(&amp;ctx, tables, idx + 1, done); }
-//     })
-//     .subscribe([tables[idx]]);
-// }</code></pre>
-      </div>
-      <div class="code-panel" data-lang="python">
-<pre><code>"""
-After `spacetime generate --lang python`, the generated table classes
-expose each column as an attribute on row objects in the client cache.
-
-Exact API names vary slightly by SDK version — the *column names* below
-match the BitCraft schema and are what you print.
-"""
-
-# Pseudocode aligned with SpacetimeDBAsyncClient + generated bindings:
-
-usernames = {}          # entity_id -> str
-player_state = {}       # entity_id -> dict of columns
-experience = {}         # entity_id -> list[(skill_id, xp)]
-skill_names = {}        # skill_id -> str
-
-def on_skill_desc_insert(row):
-    # columns: id, name, title, max_level
-    skill_names[row.id] = row.name
-
-def on_username_insert(row):
-    # columns: entity_id, username
-    usernames[row.entity_id] = row.username
-
-def on_player_state_insert(row):
-    # columns: entity_id, sign_in_timestamp, session_start_timestamp, signed_in
-    player_state[row.entity_id] = {
-        "sign_in_timestamp": row.sign_in_timestamp,
-        "session_start_timestamp": row.session_start_timestamp,
-        "signed_in": row.signed_in,
-    }
-
-def on_experience_insert(row):
-    # columns: entity_id, experience_stacks
-    # experience_stacks is a sequence of (skill_id, xp) pairs
-    experience[row.entity_id] = list(row.experience_stacks)
-
-def print_player(username_query: str):
-    matches = [
-        (eid, name)
-        for eid, name in usernames.items()
-        if name.lower() == username_query.lower()
-    ]
-    if not matches:
-        # fallback: substring
-        matches = [
-            (eid, name)
-            for eid, name in usernames.items()
-            if username_query.lower() in name.lower()
-        ]
-    for eid, name in matches[:5]:
-        ps = player_state.get(eid, {})
-        print(f"{name}  entity_id={eid}")
-        print(
-            f"  signed_in={ps.get('signed_in')}  "
-            f"sign_in_timestamp={ps.get('sign_in_timestamp')}"
-        )
-        stacks = sorted(
-            experience.get(eid, []),
-            key=lambda pair: pair[1],
-            reverse=True,
-        )
-        for skill_id, xp in stacks[:5]:
-            print(
-                f"    {skill_names.get(skill_id, '?'):&lt;20} "
-                f"skill_id={skill_id}  xp={xp}"
-            )
-
-# Subscribe order (wait for each Applied — see subscribe.html):
-#   1. SELECT * FROM skill_desc
-#   2. SELECT * FROM player_username_state
-#   3. SELECT * FROM player_state
-#   4. SELECT * FROM experience_state
-# Then: print_player("Maplesugar")</code></pre>
+// Sequential subscribe → dump_player: see Subscribe page (Rust tab).
+// Persist `token` from on_connect and pass `.with_token(token)` on reconnect.</code></pre>
       </div>
     </div>
 

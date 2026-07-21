@@ -41,10 +41,17 @@
       </li>
       <li>
         <strong>Offer a subprotocol</strong>
-        Prefer <code>v2.bsatn.spacetimedb</code> for current SDKs.
-        Offer <code>v1.bsatn.spacetimedb</code> when you need full v1
-        <code>TransactionUpdate</code>s (the frontend synthesises those
-        from local TULs). The listener echoes the chosen protocol.
+        The frontend negotiates whichever you list in
+        <code>Sec-WebSocket-Protocol</code> (and echoes the chosen one):
+        <ul>
+          <li><code>v2.bsatn.spacetimedb</code> — default for current SDKs (binary BSATN).</li>
+          <li><code>v1.bsatn.spacetimedb</code> — binary v1; full
+            <code>TransactionUpdate</code>s are synthesised for subscribers.</li>
+          <li><code>v1.json.spacetimedb</code> — text JSON frames (same v1
+            message shapes). Handy for scripts without a BSATN codec; see the
+            Python examples on the <a href="subscribe.html">Subscribe</a> page.</li>
+        </ul>
+        When several are offered, the relay prefers v2 over v1.
       </li>
       <li>
         <strong>Ask for uncompressed frames</strong>
@@ -76,7 +83,8 @@
           </tr>
           <tr>
             <td>Handshake header</td>
-            <td class="mono">Sec-WebSocket-Protocol: v2.bsatn.spacetimedb</td>
+            <td class="mono">Sec-WebSocket-Protocol: v2.bsatn.spacetimedb<br>
+              (or <code>v1.bsatn.spacetimedb</code> / <code>v1.json.spacetimedb</code>)</td>
           </tr>
         </tbody>
       </table>
@@ -155,10 +163,11 @@
 
     <h2>Python</h2>
     <p>
-      Two workable paths: the official SpacetimeDB Python SDK (codegen
-      bindings + async client), or a thin <code>websockets</code> client if you
-      already speak BSATN. Most tools should use the SDK after generating
-      bindings from the schema endpoint.
+      Official Python SDK + codegen when you want typed bindings long-term.
+      Prefer <strong>v1.json</strong> (<code>websockets</code> + text frames) when you
+      want copy-paste without a BSATN codec — that path is what the
+      <a href="subscribe.html">Subscribe</a> and
+      <a href="players.html">Players</a> runnable examples use.
     </p>
 
     <div class="code-switch">
@@ -188,7 +197,7 @@ def on_connect(_client, identity, token):
     # Fires after InitialConnection has been received and decoded by the SDK.
     # Safe place to start Subscribe calls (see the Subscribe tutorial page).
     print(f"connected identity={identity} token_len={len(token or '')}")
-    # optionally persist `token` for reconnect-as-same-identity
+    # Persist token; on next run pass it as auth_token=... to reconnect as same identity.
 
 async def main():
     # auth_token=None → anonymous identity issued by local stdb
@@ -336,6 +345,7 @@ const conn = DbConnection.builder()
   .onConnect((conn, identity, token) => {
     // Fires after InitialConnection — start Subscribe here (see Subscribe page).
     console.log("connected", identity.toHexString(), "token_len", token.length);
+    // localStorage.setItem("stdb_token", token);  // then .withToken(...) on next launch
   })
   .onConnectError((_ctx, err) => console.error("connect error", err))
   .onDisconnect((_ctx, err) => console.log("disconnect", err))
