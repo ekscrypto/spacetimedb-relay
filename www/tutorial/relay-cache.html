@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>relay-cache joins — relay tutorial</title>
+<link rel="stylesheet" href="css/tutorial.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+    <h1>Tutorial</h1>
+    <div class="nav-group">Guide</div>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="connect.html">1. Connect</a>
+      <a href="subscribe.html">2. Subscribe</a>
+      <a href="schema.html">3. Discover schema</a>
+      <a href="relay-cache.html">4. relay-cache joins</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <h1>4. How relay-cache joins tables</h1>
+    <p class="lede">
+      <code>relay-cache</code> is a same-host process that subscribes to every
+      regional frontend on loopback, keeps selected tables in memory, and
+      serves enriched JSON/protobuf on
+      <a href="/cache-health">https://relay.bitcraftsync.app/…</a>.
+      You do not need it to use the WebSocket relays — it is an optional
+      read API that already performed the joins community tools usually want.
+    </p>
+
+    <h2>Ingest model</h2>
+    <p>
+      Per region, the cache opens one v2 WebSocket to
+      <code>ws://127.0.0.1:&lt;port&gt;</code> and loads data in phases:
+    </p>
+    <ol class="steps">
+      <li>
+        <strong>Base query set</strong>
+        One additive <code>Subscribe</code> with all primary tables
+        (claims, buildings, inventories, players, crafts, storage logs,
+        hexite resource filters, growth, …). Wait for
+        <code>SubscribeApplied</code>.
+      </li>
+      <li>
+        <strong>Hexite locations (additive)</strong>
+        From the base dump, collect hexite <code>resource_state</code>
+        entity ids, then subscribe
+        <code>SELECT * FROM location_state WHERE entity_id = …</code>
+        per id in a second query set. Wait for Applied again.
+      </li>
+      <li>
+        <strong>Stream</strong>
+        Mark the region <code>ready</code> and apply live
+        <code>TransactionUpdate</code>s into columnar stores.
+      </li>
+    </ol>
+    <p>
+      Full <code>location_state</code> is enormous (~millions of rows per
+      region); the cache only keeps non-overworld interiors
+      (<code>dimension != 1</code>) plus the hexite PK follow-up.
+    </p>
+
+    <h2>Endpoint → tables</h2>
+    <p>
+      Each HTTP handler reads the in-memory stores and joins by entity id
+      (and a few derived keys). Entity ids are JSON strings for JS safety;
+      protobuf uses <code>uint64</code>.
+    </p>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Endpoint</th>
+            <th>Primary tables</th>
+            <th>Join / enrichment</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">GET /claim?name=</td>
+            <td><code>claim_state</code>, <code>player_username_state</code>, <code>claim_tech_state</code>, <code>claim_tech_desc</code></td>
+            <td>Name substring match; owner username; tier from learned techs.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /claim/&lt;id&gt;</td>
+            <td>Above + <code>claim_local_state</code>, <code>claim_tile_cost</code></td>
+            <td>Supplies, treasury, tiles, upkeep, location, researched tech list.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/inventory</td>
+            <td><code>building_state</code>, <code>inventory_state</code>, <code>building_desc</code>, <code>building_nickname_state</code>, <code>location_state</code> (interiors), <code>dimension_network_state</code></td>
+            <td>Shared storage only (no Town Banks). Group by dimension; attach entrance for interiors.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/members</td>
+            <td><code>claim_member_state</code>, <code>player_state</code></td>
+            <td>Roster + permissions + <code>last_login_timestamp</code>.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/citizens</td>
+            <td>Members + <code>experience_state</code>, <code>skill_desc</code></td>
+            <td>Per-member skill levels; shared <code>skill_names</code> map.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/hexcoins</td>
+            <td>Members + personal <code>inventory_state</code> bags</td>
+            <td>Sum quantity where <code>item_id == 1</code> (Hex Coin).</td>
+          </tr>
+          <tr>
+            <td class="mono">…/crafts</td>
+            <td><code>progressive_action_state</code>, <code>passive_craft_state</code>, <code>crafting_recipe_desc</code>, buildings, usernames</td>
+            <td>Progress + recipe outputs; optional <code>completed=</code> filter.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /player?name=</td>
+            <td><code>player_username_state</code>, <code>player_state</code></td>
+            <td>Substring search; region; last login / signed-in.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/inventory</td>
+            <td>Player bags via <code>deployable_state</code> / housing / rent links + <code>inventory_state</code></td>
+            <td>Pockets, toolbelt, wallet, bank, wagon, cache, recovery, deployable — items aggregated per bag.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/housing</td>
+            <td><code>player_housing_state</code>, housing desc, buildings, inventories, locations</td>
+            <td>Resolve house entity; name from username/nickname + catalog; interior storages by dimension.</td>
+          </tr>
+          <tr>
+            <td class="mono">…/skills</td>
+            <td><code>experience_state</code>, <code>skill_desc</code></td>
+            <td>XP → level via vendored thresholds.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /deposits</td>
+            <td>unowned <code>claim_state</code> (hexite name pattern), <code>claim_local_state</code>, <code>resource_state</code>, <code>growth_state</code>, hexite <code>location_state</code></td>
+            <td>Parse N/E from claim name; match resource at world x/z; <code>respawn_at</code> from growth end timestamp.</td>
+          </tr>
+          <tr>
+            <td class="mono">GET /storage-logs</td>
+            <td><code>storage_log_state</code> + building / claim / player username lookups</td>
+            <td>Filter by storage, player, or item(+claim|player); enrich names.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Example: claim detail join</h2>
+    <div class="diagram">claim_state.entity_id = C
+    │
+    ├─ claim_local_state[C]     → supplies, treasury, num_tiles, x/z
+    ├─ claim_tile_cost[num_tiles] → tile_cost, upkeep_cost, supplies_run_out
+    ├─ claim_tech_state[C]      → researching, learned[]
+    │     └─ claim_tech_desc[id] → name, tier, requirements, …
+    └─ player_username_state[owner_player_entity_id] → owner_player_username
+
+<span class="ok">GET /claim/C</span>  → single enriched Claim JSON / protobuf</div>
+
+    <h2>Example: hexite deposit join</h2>
+    <div class="diagram">claim_state where owner=0 and name ~= Hexite Deposit
+    │  parse north/east from name
+    ├─ claim_local_state[claim] → world x, z
+    ├─ resource_state @ (x,z) with hexite resource_id
+    │     └─ growth_state[resource_entity] → end_timestamp → respawn_at
+    └─ location_state[resource_entity] (from 2nd subscribe) → coords check
+
+<span class="ok">GET /deposits?region=14</span>  → { deposits: [...], count }</div>
+
+    <h2>Calling the public HTTP API</h2>
+    <div class="code-panel active" data-lang="http">
+<pre><code>curl -s 'https://relay.bitcraftsync.app/claim?name=concordia' | jq .
+curl -s 'https://relay.bitcraftsync.app/claim/1234567890/citizens' | jq .
+curl -s 'https://relay.bitcraftsync.app/deposits?region=14' | jq .
+curl -sH 'Accept: application/x-protobuf' \
+  'https://relay.bitcraftsync.app/player/1297036692699996362/inventory' \
+  -o inventory.pb
+
+# Schemas for protobuf DTOs:
+curl -s https://relay.bitcraftsync.app/proto
+curl -OJ https://relay.bitcraftsync.app/proto/relay_cache.proto</code></pre>
+    </div>
+
+    <div class="banner warn">
+      <b>When to use which.</b> Use the <code>wss://</code> mirrors when you
+      need a live local cache of arbitrary tables or custom SQL filters.
+      Use <code>relay-cache</code> HTTP when you want claim/player/deposit
+      views without re-implementing the joins — and when a shared in-memory
+      cache on the relay host is acceptable (read-only, eventually consistent
+      with each region’s mirror).
+    </div>
+
+    <div class="next">
+      <a href="schema.html">← Schema</a>
+      <a href="/">Back to fleet status <span class="muted">live ports &amp; health</span></a>
+    </div>
+  </main>
+</div>
+<script src="js/tutorial.js"></script>
+</body>
+</html>

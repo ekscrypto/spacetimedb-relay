@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect — relay tutorial</title>
+<link rel="stylesheet" href="css/tutorial.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+    <h1>Tutorial</h1>
+    <div class="nav-group">Guide</div>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="connect.html">1. Connect</a>
+      <a href="subscribe.html">2. Subscribe</a>
+      <a href="schema.html">3. Discover schema</a>
+      <a href="relay-cache.html">4. relay-cache joins</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <h1>1. Connect over wss://</h1>
+    <p class="lede">
+      Point any SpacetimeDB-compatible client at a public relay frontend.
+      The host is the TLS endpoint; the database name is the
+      <em>mirror</em> module, not the upstream BitCraft database.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <strong>Choose region and mirror name</strong>
+        From <a href="/health">/health</a> (or the home page table), take
+        <code>port</code> and <code>database</code>. Example for region 14:
+        host <code>wss://relay.bitcraftsync.app:3014</code>, database
+        <code>relay-mirror-bc14</code>.
+      </li>
+      <li>
+        <strong>Offer a subprotocol</strong>
+        Prefer <code>v2.bsatn.spacetimedb</code> for current SDKs.
+        Offer <code>v1.bsatn.spacetimedb</code> when you need full v1
+        <code>TransactionUpdate</code>s (the frontend synthesises those
+        from local TULs). The listener echoes the chosen protocol.
+      </li>
+      <li>
+        <strong>Ask for uncompressed frames</strong>
+        Use <code>?compression=None</code> on the subscribe URL. The relay
+        does not decompress inbound Brotli/Gzip payloads for you.
+      </li>
+      <li>
+        <strong>Wait for InitialConnection</strong>
+        After the WebSocket opens, the first binary server message is
+        <code>InitialConnection</code> (identity + token). Persist the token
+        if your SDK supports reconnect-as-same-identity.
+      </li>
+    </ol>
+
+    <h2>Addresses</h2>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Use</th><th>URL</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>SDK host</td>
+            <td class="mono">wss://relay.bitcraftsync.app:3014</td>
+          </tr>
+          <tr>
+            <td>Full subscribe path</td>
+            <td class="mono">wss://relay.bitcraftsync.app:3014/v1/database/relay-mirror-bc14/subscribe?compression=None</td>
+          </tr>
+          <tr>
+            <td>Handshake header</td>
+            <td class="mono">Sec-WebSocket-Protocol: v2.bsatn.spacetimedb</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="banner warn">
+      <b>No auth token required</b> for public read subscriptions on these
+      mirrors. Do not send your BitCraft upstream bearer token to the relay
+      &mdash; that token is only for the relay process itself talking to
+      BitCraft.
+    </div>
+
+    <h2>Python</h2>
+    <p>
+      Two workable paths: the official SpacetimeDB Python SDK (codegen
+      bindings + async client), or a thin <code>websockets</code> client if you
+      already speak BSATN. Most tools should use the SDK after generating
+      bindings from the schema endpoint.
+    </p>
+
+    <div class="code-switch">
+      <div class="lang-tabs">
+        <button type="button" class="active" data-lang="sdk">SDK</button>
+        <button type="button" data-lang="raw">Raw WebSocket sketch</button>
+      </div>
+      <div class="code-panel active" data-lang="sdk">
+<pre><code># pip install spacetimedb-sdk
+# Generate bindings from the relay schema first (see "Discover schema"):
+#   spacetime generate --lang python \
+#     --out-dir module_bindings \
+#     --module-name relay_mirror_bc14 \
+#     # or feed the downloaded schema JSON to your codegen pipeline
+
+import asyncio
+from spacetimedb_sdk.spacetimedb_async_client import SpacetimeDBAsyncClient
+import module_bindings
+
+HOST = "relay.bitcraftsync.app:3014"   # host:port only
+DATABASE = "relay-mirror-bc14"
+SSL = True
+
+client = SpacetimeDBAsyncClient(module_bindings)
+
+def on_connect(_client, identity, token):
+    print(f"connected identity={identity} token_len={len(token or '')}")
+
+async def main():
+    # auth_token=None → anonymous identity issued by local stdb
+    await client.run(
+        None,
+        f"https://{HOST}",
+        DATABASE,
+        on_connect,
+        [],  # subscribe in a later step — or pass initial SQL here
+        ssl_enabled=SSL,
+    )
+
+asyncio.run(main())</code></pre>
+      </div>
+      <div class="code-panel" data-lang="raw">
+<pre><code># Illustrative only — v2 frames are BSATN, not JSON.
+# Prefer the SDK unless you already have a BSATN codec.
+
+import asyncio
+import websockets
+
+SUBPROTOCOL = "v2.bsatn.spacetimedb"
+URL = (
+    "wss://relay.bitcraftsync.app:3014"
+    "/v1/database/relay-mirror-bc14/subscribe"
+    "?compression=None"
+)
+
+async def main():
+    async with websockets.connect(
+        URL,
+        subprotocols=[SUBPROTOCOL],
+        max_size=None,  # BitCraft tables can be huge
+    ) as ws:
+        # First binary frame: compression_tag (0) + BSATN InitialConnection
+        frame = await ws.recv()
+        assert isinstance(frame, (bytes, bytearray))
+        assert frame[0] == 0, "expected compression=None"
+        print(f"got {len(frame)} byte handshake frame")
+        # Decode BSATN ServerMessage::InitialConnection with your codec…
+        await asyncio.Future()  # keep alive
+
+asyncio.run(main())</code></pre>
+      </div>
+    </div>
+
+    <h2>Rust</h2>
+    <p>
+      Official <code>spacetimedb-sdk</code> after <code>spacetime generate</code> is the
+      usual path. Below: SDK builder, then the same wire shape
+      <code>relay-cache</code> uses internally (useful when you subscribe with
+      raw SQL strings and no generated module).
+    </p>
+
+    <div class="code-switch">
+      <div class="lang-tabs">
+        <button type="button" class="active" data-lang="sdk">SDK</button>
+        <button type="button" data-lang="wire">Wire (tokio-tungstenite)</button>
+      </div>
+      <div class="code-panel active" data-lang="sdk">
+<pre><code>// After: spacetime generate --lang rust -o module_bindings …
+use module_bindings::DbConnection;
+use spacetimedb_sdk::DbContext;
+
+fn main() {
+    let conn = DbConnection::builder()
+        .with_uri("wss://relay.bitcraftsync.app:3014")
+        .with_database_name("relay-mirror-bc14")
+        .on_connect(|_ctx, identity, token| {
+            println!("connected {identity} token_len={}", token.len());
+        })
+        .on_connect_error(|_ctx, err| eprintln!("connect error: {err}"))
+        .on_disconnect(|_ctx, err| {
+            if let Some(e) = err {
+                eprintln!("disconnected: {e}");
+            }
+        })
+        .build()
+        .expect("connect");
+
+    // Drive the SDK event loop however your app does (tick / block_on).
+    let _ = conn;
+}</code></pre>
+      </div>
+      <div class="code-panel" data-lang="wire">
+<pre><code>use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
+use http::header::SEC_WEBSOCKET_PROTOCOL;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message;
+
+const SUBPROTOCOL: &amp;str = "v2.bsatn.spacetimedb";
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;()&gt; {
+    let url = concat!(
+        "wss://relay.bitcraftsync.app:3014",
+        "/v1/database/relay-mirror-bc14/subscribe",
+        "?compression=None",
+    );
+    let mut req = url.into_client_request()?;
+    req.headers_mut()
+        .insert(SEC_WEBSOCKET_PROTOCOL, SUBPROTOCOL.parse()?);
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+    let Some(Ok(Message::Binary(data))) = ws.next().await else {
+        return Err(anyhow!("expected binary InitialConnection"));
+    };
+    assert_eq!(data[0], 0, "compression tag");
+    // bsatn::from_slice::&lt;ServerMessage&gt;(&amp;data[1..]) → InitialConnection
+    println!("handshake {} bytes", data.len());
+    Ok(())
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="banner good">
+      <b>Drop-in SDK host.</b> If your client already targets
+      <code>wss://bitcraft-early-access.spacetimedb.com</code> +
+      <code>bitcraft-live-14</code>, switch host →
+      <code>wss://relay.bitcraftsync.app:3014</code> and database →
+      <code>relay-mirror-bc14</code>. Keep the same SQL / table names from
+      the upstream schema.
+    </div>
+
+    <div class="next">
+      <a href="index.html">← Overview</a>
+      <a href="subscribe.html">Next: Subscribe <span class="muted">one table &amp; sequenced multi-table</span></a>
+    </div>
+  </main>
+</div>
+<script src="js/tutorial.js"></script>
+</body>
+</html>

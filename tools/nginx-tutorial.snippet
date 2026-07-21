@@ -1,0 +1,32 @@
+# nginx snippet: serve /tutorial static pages on relay.bitcraftsync.app
+#
+# Insert these blocks in the HTTPS `server { ... }` for
+# relay.bitcraftsync.app, BEFORE the catch-all `location /`
+# (which proxies to relay-coordinator on 127.0.0.1:8082).
+#
+# Files live in the repo tree that is rsynced to the host:
+#   /srv/relay/spacetimedb-relay/www/tutorial/
+#
+# Install on the host:
+#   1. Backup: sudo cp /etc/nginx/sites-available/relay.bitcraftsync.app.conf \
+#        /etc/nginx/sites-available/relay.bitcraftsync.app.conf.bak-tutorial-$(date +%Y%m%d-%H%M%S)
+#   2. Paste the blocks below before `location /`
+#   3. sudo nginx -t && sudo nginx -s reload
+#
+# Public URLs:
+#   https://relay.bitcraftsync.app/tutorial/
+#   https://relay.bitcraftsync.app/tutorial/connect.html
+#   https://relay.bitcraftsync.app/tutorial/subscribe.html
+#   https://relay.bitcraftsync.app/tutorial/schema.html
+#   https://relay.bitcraftsync.app/tutorial/relay-cache.html
+
+    # Tutorial static site (repo www/tutorial/)
+    location = /tutorial {
+        return 301 /tutorial/;
+    }
+
+    location /tutorial/ {
+        alias /srv/relay/spacetimedb-relay/www/tutorial/;
+        index index.html;
+        add_header Cache-Control "public, max-age=60";
+    }

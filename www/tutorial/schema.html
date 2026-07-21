@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schema — relay tutorial</title>
+<link rel="stylesheet" href="css/tutorial.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+    <h1>Tutorial</h1>
+    <div class="nav-group">Guide</div>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="connect.html">1. Connect</a>
+      <a href="subscribe.html">2. Subscribe</a>
+      <a href="schema.html">3. Discover schema</a>
+      <a href="relay-cache.html">4. relay-cache joins</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <h1>3. Discover the schema</h1>
+    <p class="lede">
+      Each frontend serves the upstream schema as SATS-JSON over plain HTTPS
+      on the <em>same port</em> as its WebSocket. These bytes are the ones the
+      relay cached at startup and used to codegen the running mirror — so
+      they always match the data you can subscribe to.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <strong>Build the URL from port + mirror database</strong>
+        <code>https://relay.bitcraftsync.app:&lt;port&gt;/v1/database/&lt;mirror&gt;/schema?version=9</code>
+      </li>
+      <li>
+        <strong>GET it</strong>
+        Expect <code>Content-Type: application/json</code>, roughly ~580&nbsp;KB
+        for a BitCraft module, <code>Cache-Control: public, max-age=60</code>.
+      </li>
+      <li>
+        <strong>Use table names from the response</strong>
+        Public tables appear under the schema’s table list. Mirror-only
+        reducers (<code>relay_apply_*</code>, <code>_relay_meta</code>) are
+        <em>not</em> in this document — it is the upstream schema.
+      </li>
+      <li>
+        <strong>Feed codegen</strong>
+        Point <code>spacetime generate</code> / your SDK generator at this
+        JSON (or a saved copy) so client bindings match the mirror.
+      </li>
+    </ol>
+
+    <h2>curl</h2>
+    <div class="code-panel active" data-lang="curl">
+<pre><code>curl -fsSL \
+  "https://relay.bitcraftsync.app:3014/v1/database/relay-mirror-bc14/schema?version=9" \
+  -o schema-bc14.json
+
+# Quick peek at public table names (jq):
+jq -r '.. | objects | select(has("name") and has("columns"))? | .name' \
+  schema-bc14.json | sort -u | head</code></pre>
+    </div>
+
+    <h2>Python</h2>
+    <div class="code-panel active" data-lang="python">
+<pre><code>import json
+import urllib.request
+
+URL = (
+    "https://relay.bitcraftsync.app:3014"
+    "/v1/database/relay-mirror-bc14/schema?version=9"
+)
+
+with urllib.request.urlopen(URL, timeout=60) as resp:
+    raw = resp.read()
+    print(resp.status, resp.headers.get("Content-Type"), f"{len(raw)} bytes")
+
+schema = json.loads(raw)
+# Shape is RawModuleDef v9 SATS-JSON. Walk tables for names:
+tables = []
+
+def walk(obj):
+    if isinstance(obj, dict):
+        if "name" in obj and "columns" in obj:
+            tables.append(obj["name"])
+        for v in obj.values():
+            walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            walk(v)
+
+walk(schema)
+print(f"{len(tables)} tables, e.g. {tables[:5]}")</code></pre>
+    </div>
+
+    <h2>Rust</h2>
+    <div class="code-panel active" data-lang="rust">
+<pre><code>use anyhow::{bail, Result};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;()&gt; {
+    let url = concat!(
+        "https://relay.bitcraftsync.app:3014",
+        "/v1/database/relay-mirror-bc14/schema?version=9",
+    );
+    let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+    println!("downloaded {} bytes", bytes.len());
+
+    // Prefer the same parser the relay uses (SATS-JSON → module def)
+    // if you depend on relay-protocol; otherwise serde_json::Value is fine
+    // for listing table names during exploration.
+    let v: serde_json::Value = serde_json::from_slice(&amp;bytes)?;
+    if !v.is_object() {
+        bail!("expected JSON object");
+    }
+    println!("schema JSON root keys: {:?}",
+        v.as_object().unwrap().keys().collect::&lt;Vec&lt;_&gt;&gt;());
+    Ok(())
+}</code></pre>
+    </div>
+
+    <div class="banner good">
+      <b>Invariant.</b> The schema endpoint is never a live proxy to
+      upstream. During a schema-drift republish window you still see the
+      schema that matches the currently published mirror — not a newer
+      upstream shape the mirror has not migrated to yet.
+    </div>
+
+    <h2>Generate client bindings</h2>
+    <p>
+      Once you have the schema (or can reach the module), generate SDK
+      bindings the usual SpacetimeDB way. Against a reachable module:
+    </p>
+    <div class="code-panel active" data-lang="gen">
+<pre><code># Example — adjust flags to your spacetime CLI version:
+spacetime generate --lang rust \
+  --out-dir ./module_bindings \
+  --module-name relay-mirror-bc14 \
+  -s https://relay.bitcraftsync.app:3014
+
+spacetime generate --lang python \
+  --out-dir ./module_bindings \
+  --module-name relay-mirror-bc14 \
+  -s https://relay.bitcraftsync.app:3014</code></pre>
+    </div>
+    <p>
+      If generate expects a file, pass the downloaded
+      <code>schema-bc14.json</code>. Table SQL names in subscribe strings
+      must match the schema (e.g. <code>claim_state</code>, not the Rust
+      struct name).
+    </p>
+
+    <div class="next">
+      <a href="subscribe.html">← Subscribe</a>
+      <a href="relay-cache.html">Next: relay-cache <span class="muted">how HTTP endpoints join tables</span></a>
+    </div>
+  </main>
+</div>
+<script src="js/tutorial.js"></script>
+</body>
+</html>

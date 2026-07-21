@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to use the relay — tutorial</title>
+<link rel="stylesheet" href="css/tutorial.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+    <h1>Tutorial</h1>
+    <div class="nav-group">Guide</div>
+    <nav>
+      <a href="index.html" class="active">Overview</a>
+      <a href="connect.html">1. Connect</a>
+      <a href="subscribe.html">2. Subscribe</a>
+      <a href="schema.html">3. Discover schema</a>
+      <a href="relay-cache.html">4. relay-cache joins</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <h1>How to use the relay</h1>
+    <p class="lede">
+      Step-by-step guide to connecting a SpacetimeDB client to the public
+      BitCraft relays, subscribing to tables safely at BitCraft scale,
+      reading the schema, and understanding how <code>relay-cache</code>
+      joins mirrored tables into HTTP endpoints.
+    </p>
+
+    <div class="banner warn">
+      <b>Subscriptions only.</b> The public frontends reject
+      <code>OneOffQuery</code>. Subscribe to the tables you need and read
+      from the client cache (or call the HTTP cache API). Do not call
+      reducers through the relay &mdash; reducers go to upstream BitCraft
+      on your own connection if you need them.
+    </div>
+
+    <div class="toc">
+      <a href="connect.html">
+        <span class="num">01</span> Connect over <code>wss://</code>
+        <span class="desc">Python and Rust &mdash; host, database, subprotocol, first handshake.</span>
+      </a>
+      <a href="subscribe.html">
+        <span class="num">02</span> Subscribe to tables
+        <span class="desc">One table, then multi-table with wait-for-Applied sequencing.</span>
+      </a>
+      <a href="schema.html">
+        <span class="num">03</span> Discover the schema
+        <span class="desc">HTTP <code>/schema?version=9</code> on the same port as the WebSocket.</span>
+      </a>
+      <a href="relay-cache.html">
+        <span class="num">04</span> How relay-cache joins tables
+        <span class="desc">Which mirrored tables feed each <code>/claim</code>, <code>/player</code>, <code>/deposits</code> response.</span>
+      </a>
+    </div>
+
+    <h2>What you are connecting to</h2>
+    <p>
+      Each BitCraft region (and global) runs as its own relay instance.
+      The port <em>is</em> the region: region <code>N</code> listens on
+      <code>3000 + N</code>; global is <code>3000</code>.
+    </p>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Piece</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Host</td>
+            <td class="mono">wss://relay.bitcraftsync.app:&lt;port&gt;</td>
+          </tr>
+          <tr>
+            <td>Port</td>
+            <td><code>3000</code> (global) or <code>3000 + regionID</code> (e.g. region 14 → <code>3014</code>)</td>
+          </tr>
+          <tr>
+            <td>Database (mirror)</td>
+            <td><code>relay-mirror-bc-global</code> / <code>relay-mirror-bc&lt;N&gt;</code></td>
+          </tr>
+          <tr>
+            <td>Subscribe URL</td>
+            <td class="mono">…/v1/database/&lt;mirror&gt;/subscribe?compression=None</td>
+          </tr>
+          <tr>
+            <td>Schema URL</td>
+            <td class="mono">https://relay.bitcraftsync.app:&lt;port&gt;/v1/database/&lt;mirror&gt;/schema?version=9</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Live ports and mirror names are listed on the
+      <a href="/">home page</a> (from <a href="/health">/health</a>).
+      Prefer those over hard-coding &mdash; the fleet changes when regions
+      are added.
+    </p>
+
+    <div class="diagram"><span class="hi">Your client</span>
+    │  wss://relay.bitcraftsync.app:3014/…/subscribe
+    ▼
+<span class="ok">Frontend proxy F</span>  (v1 / v2 negotiation, metrics)
+    │  loopback
+    ▼
+<span class="ok">Local SpacetimeDB L</span>  (mirror module relay-mirror-bc14)
+    ▲
+    │  relay_apply_* writes
+<span class="hi">Relay R</span> ←── single upstream sub to BitCraft region 14</div>
+
+    <h2>Recommended client path</h2>
+    <ol>
+      <li>Pick a region from <a href="/">/ </a> or <code>/health</code>.</li>
+      <li>Fetch schema over HTTPS (codegen / inspect table names).</li>
+      <li>Open a WebSocket with <code>v2.bsatn.spacetimedb</code> (or v1 if your SDK needs it).</li>
+      <li>Subscribe <strong>sequentially</strong> for large table sets &mdash; wait for each
+          <code>SubscribeApplied</code> before the next query set.</li>
+      <li>For enriched claim/player views without joining yourself, call the
+          public HTTP cache (<code>/claim</code>, <code>/player</code>, …).</li>
+    </ol>
+
+    <div class="next">
+      <span></span>
+      <a href="connect.html">Next: Connect <span class="muted">Python &amp; Rust WebSocket setup</span></a>
+    </div>
+  </main>
+</div>
+<script src="js/tutorial.js"></script>
+</body>
+</html>

@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subscribe — relay tutorial</title>
+<link rel="stylesheet" href="css/tutorial.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+    <h1>Tutorial</h1>
+    <div class="nav-group">Guide</div>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="connect.html">1. Connect</a>
+      <a href="subscribe.html">2. Subscribe</a>
+      <a href="schema.html">3. Discover schema</a>
+      <a href="relay-cache.html">4. relay-cache joins</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <h1>2. Subscribe to tables</h1>
+    <p class="lede">
+      After <code>InitialConnection</code>, send SQL subscriptions. For a
+      handful of small tables you can subscribe in one shot. For BitCraft-scale
+      dumps, subscribe <strong>one query set at a time</strong> and wait for
+      <code>SubscribeApplied</code> before starting the next.
+    </p>
+
+    <div class="banner warn">
+      <b>Why sequencing matters.</b> A single set-replace subscribe covering
+      hundreds of BitCraft tables can produce a multi-hundred-MB
+      <code>SubscribeApplied</code>. Some edges reset long transfers (~90&nbsp;s).
+      The relay itself uses <code>--subscribe-chunk-size 1</code> upstream for
+      the same reason. Your downstream client should mirror that discipline
+      when pulling large working sets from the mirror.
+    </div>
+
+    <h2>One table</h2>
+    <p>
+      Subscribe with a single SQL query. When <code>on_applied</code> /
+      <code>SubscribeApplied</code> fires, the matching rows are in your
+      client cache and live <code>TransactionUpdate</code>s will follow.
+    </p>
+
+    <div class="code-switch">
+      <div class="lang-tabs">
+        <button type="button" class="active" data-lang="python">Python</button>
+        <button type="button" data-lang="rust">Rust</button>
+      </div>
+      <div class="code-panel active" data-lang="python">
+<pre><code># Inside on_connect (SDK) or after InitialConnection (raw):
+QUERIES = ["SELECT * FROM chat_message_state"]
+
+# SDK: pass QUERIES into client.run(...), or register a subscription
+# builder if your SDK version exposes one. When the applied callback
+# runs, iterate the local cache:
+#
+#   for row in client.db.chat_message_state.iter():
+#       print(row)
+
+# Raw v2 wire (conceptual): encode ClientMessage::Subscribe {
+#   request_id: 1,
+#   query_set_id: 1,          # new id = additive set
+#   query_strings: QUERIES,
+# } as BSATN, prefix is NOT needed on client→server for v2 in most
+# SDK stacks (SDK adds framing). Wait for ServerMessage::SubscribeApplied
+# with the same request_id before treating the table as complete.</code></pre>
+      </div>
+      <div class="code-panel" data-lang="rust">
+<pre><code>// SDK (generated bindings)
+ctx.subscription_builder()
+    .on_applied(|ctx| {
+        println!(
+            "applied — {} chat rows",
+            ctx.db.chat_message_state().count()
+        );
+    })
+    .on_error(|_ctx, err| eprintln!("subscribe error: {err}"))
+    .subscribe(["SELECT * FROM chat_message_state"]);
+
+// Or typed query builder, if generated for that table:
+// .add_query(|q| q.from.chat_message_state()).subscribe();</code></pre>
+      </div>
+    </div>
+
+    <h2>Many tables — synchronising strategy</h2>
+    <p>
+      Rule: <strong>do not start the next subscribe until the previous
+      query set has applied</strong>. Apply live updates that arrive during
+      the wait (they belong to already-applied sets). Use a fresh
+      <code>query_set_id</code> for each additive set on the v2 wire;
+      reusing an id replaces that set.
+    </p>
+
+    <div class="diagram"><span class="hi">connect</span>
+   │
+   ▼
+<span class="ok">Subscribe</span> query_set=1  [table A]
+   │  (may receive TransactionUpdate for other activity)
+   ▼
+<span class="ok">SubscribeApplied</span> #1  → merge rows for A
+   │
+   ▼
+<span class="ok">Subscribe</span> query_set=2  [table B]
+   │
+   ▼
+<span class="ok">SubscribeApplied</span> #2  → merge rows for B
+   │
+   ▼
+<span class="muted">… repeat …</span>
+   │
+   ▼
+<span class="hi">ready</span> — all sets applied; stream TransactionUpdates</div>
+
+    <ol class="steps">
+      <li>
+        <strong>Partition work into query sets</strong>
+        One table per set is the safest default for huge tables
+        (<code>footprint_tile_state</code>, full inventories, …). Small
+        related tables can share a set.
+      </li>
+      <li>
+        <strong>Send Subscribe for set <em>i</em></strong>
+        Record <code>request_id</code> / handle so you can match Applied.
+      </li>
+      <li>
+        <strong>Wait for Applied (and keep applying TUs)</strong>
+        Ignore unrelated server messages; on
+        <code>SubscriptionError</code>, abort or retry that set.
+      </li>
+      <li>
+        <strong>Only then advance <em>i</em></strong>
+        Mark ready when the last set applies. On reconnect, restart from
+        index 0 (or your own snapshot strategy).
+      </li>
+    </ol>
+
+    <div class="code-switch">
+      <div class="lang-tabs">
+        <button type="button" class="active" data-lang="python">Python</button>
+        <button type="button" data-lang="rust">Rust</button>
+      </div>
+      <div class="code-panel active" data-lang="python">
+<pre><code>import asyncio
+
+TABLES = [
+    "claim_state",
+    "building_state",
+    "inventory_state",
+    "player_username_state",
+]
+
+async def subscribe_sequential(client):
+    """Wait for each subscription's applied callback before the next."""
+    for table in TABLES:
+        done = asyncio.Event()
+
+        def on_applied(_client, _msg, *, _done=done, _table=table):
+            print(f"SubscribeApplied: {_table}")
+            _done.set()
+
+        # Pseudocode — wire to your SDK's subscription / callback API:
+        # client.subscribe(
+        #     [f"SELECT * FROM {table}"],
+        #     on_applied=on_applied,
+        # )
+        #
+        # With a raw BSATN client: send Subscribe(query_set_id=i),
+        # then loop reading frames until SubscribeApplied for that id,
+        # applying any TransactionUpdate seen in between.
+
+        await done.wait()
+
+    print("all sequential subscriptions applied")</code></pre>
+      </div>
+      <div class="code-panel" data-lang="rust">
+<pre><code>use std::sync::{Arc, Mutex};
+
+/// Sequential subscribe: each on_applied starts the next query set.
+fn subscribe_next(ctx: &amp;impl spacetimedb_sdk::DbContext, tables: Arc&lt;Mutex&lt;Vec&lt;&amp;'static str&gt;&gt;&gt;) {
+    let Some(table) = tables.lock().unwrap().pop() else {
+        println!("all sequential subscriptions applied");
+        return;
+    };
+    let tables2 = tables.clone();
+    let sql = format!("SELECT * FROM {table}");
+    println!("subscribing {table}");
+    ctx.subscription_builder()
+        .on_applied(move |ctx| {
+            println!("SubscribeApplied: {table}");
+            subscribe_next(&amp;ctx, tables2);
+        })
+        .on_error(|_ctx, err| eprintln!("subscribe error: {err}"))
+        .subscribe([sql]);
+}
+
+// On connect:
+// let mut t = vec![
+//     "player_username_state",
+//     "inventory_state",
+//     "building_state",
+//     "claim_state",
+// ];
+// t.reverse(); // pop from the end → claim_state first
+// subscribe_next(&amp;ctx, Arc::new(Mutex::new(t)));</code></pre>
+      </div>
+    </div>
+
+    <h3>Wire-level notes (v2)</h3>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Field</th><th>Role</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>request_id</code></td>
+            <td>Client-chosen; echoed on <code>SubscribeApplied</code>.</td>
+          </tr>
+          <tr>
+            <td><code>query_set_id</code></td>
+            <td>New id appends an additive set; reuse replaces that set.</td>
+          </tr>
+          <tr>
+            <td><code>query_strings</code></td>
+            <td>SQL list for this set, e.g. <code>SELECT * FROM claim_state</code>.</td>
+          </tr>
+          <tr>
+            <td>During wait</td>
+            <td>Apply <code>TransactionUpdate</code>s so already-subscribed sets stay live.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      This is the same pattern <code>relay-cache</code> uses on loopback: one
+      base multi-query set, wait for Applied, then an additive second set
+      for hexite <code>location_state</code> PKs discovered from the first
+      dump. See <a href="relay-cache.html">relay-cache joins</a>.
+    </p>
+
+    <div class="next">
+      <a href="connect.html">← Connect</a>
+      <a href="schema.html">Next: Schema <span class="muted">HTTP discovery &amp; codegen</span></a>
+    </div>
+  </main>
+</div>
+<script src="js/tutorial.js"></script>
+</body>
+</html>

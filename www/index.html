@@ -216,14 +216,17 @@
       persistent subscription to each upstream game region and fans it out to
       any number of downstream clients from a sibling SpacetimeDB &mdash; so
       community tools (BitCraftMap, BitCraftSync, BitJita, &hellip;) share one
-      upstream cost instead of each holding their own subscription. Point your
+      upstream cost instead of each holding their own subscription.     Point your
       SpacetimeDB SDK at the addresses below; it&rsquo;s a drop-in
-      <code>wss://</code> replacement.
+      <code>wss://</code> replacement. New here?
+      Start with the <a href="/tutorial/">step-by-step tutorial</a>
+      (connect, subscribe, schema, relay-cache joins).
     </p>
     <p class="disclaimer">
       Community project &mdash; not affiliated with Clockwork Labs.
       SpacetimeDB&trade; is a trademark of
       <a href="https://clockworklabs.io" target="_blank" rel="noopener">Clockwork Labs</a>.
+      &middot; <a href="/tutorial/">How to use the relay</a>
     </p>
     <div class="health-line">
       <span id="overall-pill" class="pill">fetching&hellip;</span>
@@ -300,7 +303,9 @@
     <code>TransactionUpdate</code>s) or <code>v2.bsatn.spacetimedb</code> (plain
     passthrough). See the
     <a href="https://github.com/ekscrypto/spacetimedb-relay#connecting-downstream-clients" target="_blank" rel="noopener">README</a>
-    for protocol details. Ports with no relay behind them return nginx
+    for protocol details. See also the
+    <a href="/tutorial/">How to use the relay</a> tutorial (Python &amp; Rust).
+    Ports with no relay behind them return nginx
     <code>502</code>; only sources reported live by <code>/health</code> are listed.
   </p>
   <div class="banner warn">
