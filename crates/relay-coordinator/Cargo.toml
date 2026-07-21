@@ -23,6 +23,7 @@ tracing-subscriber = { workspace = true }
 
 # /health aggregator: HTTP server, instance poller, host metrics.
 axum = { workspace = true }
+tower-http = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 sysinfo = { workspace = true, features = ["network"] }
 parking_lot = { workspace = true }

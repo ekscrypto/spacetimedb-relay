@@ -20,6 +20,7 @@ use axum::Router;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::Semaphore;
+use tower_http::cors::CorsLayer;
 
 use crate::health::HealthState;
 use crate::sys_metrics::SysState;
@@ -85,6 +86,7 @@ pub async fn run(
         let app = Router::new()
             .route("/", get(index))
             .route("/health", get(health_json))
+            .layer(CorsLayer::permissive())
             .with_state(health);
         match TcpListener::bind(bind).await {
             Ok(tcp) => {

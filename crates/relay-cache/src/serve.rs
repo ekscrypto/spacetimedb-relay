@@ -19,6 +19,7 @@ use axum::Router;
 use prost::Message;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tower_http::cors::CorsLayer;
 
 use crate::decode::{DeployableKind, OVERWORLD_DIMENSION};
 use crate::shard::ShardHandle;
@@ -76,6 +77,7 @@ pub async fn serve(
         .route("/player/:entity_id/crafts", get(player_crafts))
         .route("/deposits", get(hexite_deposits))
         .route("/storage-logs", get(storage_logs))
+        .layer(CorsLayer::permissive())
         .with_state(fleet);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
