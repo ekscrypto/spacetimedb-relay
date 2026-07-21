@@ -35,10 +35,9 @@
 
     <div class="banner warn">
       <b>Subscriptions only.</b> The public frontends reject
-      <code>OneOffQuery</code>. Subscribe to the tables you need and read
-      from the client cache (or call the HTTP cache API). Do not call
-      reducers through the relay &mdash; reducers go to upstream BitCraft
-      on your own connection if you need them.
+      <code>OneOffQuery</code> and <code>CallReducer</code>. Subscribe to
+      the tables you need and read from the client cache (or the HTTP
+      cache API). The relay is read-only; reducer calls are not supported.
     </div>
 
     <div class="toc">

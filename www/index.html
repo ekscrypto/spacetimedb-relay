@@ -309,10 +309,11 @@
     <code>502</code>; only sources reported live by <code>/health</code> are listed.
   </p>
   <div class="banner warn">
-    <b>Subscriptions only.</b> <code>OneOffQuery</code> is not supported through
-    this relay. Issuing a one-off query will return an error immediately. Use
-    SDK table subscriptions instead &mdash; subscribe to the tables your tool
-    needs and read rows from the local cache.
+    <b>Subscriptions only.</b> <code>OneOffQuery</code> and
+    <code>CallReducer</code> are not supported through this relay. Issuing
+    either will return an error immediately. Use SDK table subscriptions
+    instead &mdash; subscribe to the tables your tool needs and read rows
+    from the local cache. The relay is read-only.
   </div>
   <div class="panel">
     <table>
