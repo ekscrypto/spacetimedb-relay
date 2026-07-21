@@ -87,8 +87,8 @@ impl InventorySoA {
     }
 
     /// Inventories whose `player_owner_entity_id == player` (town banks,
-    /// recovery chests). Deployable storage (Personal Cache / Cart / Mount)
-    /// usually has `player_owner_entity_id = 0` and is reached via
+    /// recovery chests). Deployable storage (Personal Cache / Cart / Mount /
+    /// Boat) usually has `player_owner_entity_id = 0` and is reached via
     /// `deployable.by_owner(player)` → `by_owner(deployable_entity_id)`
     /// instead. Body bags use `owner_entity_id == player`.
     pub fn by_player_owner(&self, player: u64) -> &[u32] {

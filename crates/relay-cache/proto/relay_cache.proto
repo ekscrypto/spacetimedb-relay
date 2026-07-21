@@ -175,7 +175,7 @@ message PlayerInventoryBag {
   string name = 2;
   optional string nickname = 3;
   // "pockets" | "toolbelt" | "wallet" | "bank" | "wagon" | "cache" |
-  // "recovery" | "deployable"
+  // "boat" | "recovery" | "deployable"
   string category = 4;
   optional uint64 claim_entity_id = 5;
   optional string claim_name = 6;

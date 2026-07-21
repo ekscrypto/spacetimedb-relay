@@ -79,7 +79,7 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362
 # (BitJita lastLogin); omitted when unknown / zero.
 
 # Personal inventories (pockets / toolbelt / wallet / bank / wagon /
-# cache / recovery / deployable). Items aggregated per bag.
+# cache / boat / recovery / deployable). Items aggregated per bag.
 curl -s http://127.0.0.1:8089/player/1297036692699996362/inventory
 # → { "player": {...}, "inventories": [
 #      { "entity_id", "name", "nickname", "category",

@@ -40,7 +40,10 @@ pub const LOCATION_TABLE: &str = "location_state";
 pub const DIMENSION_NETWORK_TABLE: &str = "dimension_network_state";
 pub const PLAYER_USERNAME_TABLE: &str = "player_username_state";
 pub const PLAYER_STATE_TABLE: &str = "player_state";
-pub const DEPLOYABLE_TABLE: &str = "deployable_state";
+/// Live deployables (carts, mounts, caches, boats, …). Prefer v2 — newer
+/// boats (Skiff II+, Clipper, …) exist only here; v1 `deployable_state` is
+/// a stale subset (~2k fewer rows on bc14).
+pub const DEPLOYABLE_TABLE: &str = "deployable_state_v2";
 pub const DEPLOYABLE_DESC_TABLE: &str = "deployable_desc";
 pub const PLAYER_HOUSING_TABLE: &str = "player_housing_state";
 pub const PLAYER_HOUSING_DESC_TABLE: &str = "player_housing_desc";
@@ -802,6 +805,7 @@ pub enum DeployableKind {
     Cart,
     Cache,
     Mount,
+    Boat,
     Other,
 }
 
@@ -1296,6 +1300,7 @@ pub fn decode_deployable_desc_with_fields(
 
 fn deployable_kind_from_cell(cell: &Cell) -> Result<DeployableKind> {
     let json = cell_json(cell)?;
+    // BSATN → Jsonb emits `{"Boat":{}}`; ignore Stall / SiegeEngine as Other.
     let Value::Object(obj) = json else {
         bail!("deployable_type is not an object: {json}");
     };
@@ -1305,6 +1310,8 @@ fn deployable_kind_from_cell(cell: &Cell) -> Result<DeployableKind> {
         Ok(DeployableKind::Cache)
     } else if obj.contains_key("Mount") {
         Ok(DeployableKind::Mount)
+    } else if obj.contains_key("Boat") {
+        Ok(DeployableKind::Boat)
     } else {
         Ok(DeployableKind::Other)
     }
@@ -2026,5 +2033,21 @@ mod tests {
 
         let empty = Cell::Jsonb(json!([]));
         assert!(!functions_is_storage(&empty).unwrap());
+    }
+
+    #[test]
+    fn deployable_kind_recognizes_boat() {
+        assert_eq!(
+            deployable_kind_from_cell(&Cell::Jsonb(json!({"Boat": {}}))).unwrap(),
+            DeployableKind::Boat
+        );
+        assert_eq!(
+            deployable_kind_from_cell(&Cell::Jsonb(json!({"Mount": {}}))).unwrap(),
+            DeployableKind::Mount
+        );
+        assert_eq!(
+            deployable_kind_from_cell(&Cell::Jsonb(json!({"Stall": {}}))).unwrap(),
+            DeployableKind::Other
+        );
     }
 }

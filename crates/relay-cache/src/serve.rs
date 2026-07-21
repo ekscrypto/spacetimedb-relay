@@ -2082,7 +2082,7 @@ async fn player_by_pk(
 /// 1. `inventory.owner_entity_id == player` (body bags)
 /// 2. `inventory.player_owner_entity_id == player` (banks / recovery)
 /// 3. `deployable.owner_id == player` → `inventory.owner_entity_id ==
-///    deployable.entity_id` (Personal Cache, Cart, Mount, …). Live
+///    deployable.entity_id` (Personal Cache, Cart, Mount, Boat, …). Live
 ///    BitCraft often leaves `player_owner_entity_id = 0` on these rows,
 ///    so (2) alone misses them.
 fn player_inventory_slots(s: &RegionStore, player_id: u64) -> Vec<u32> {
@@ -2121,6 +2121,7 @@ fn deployable_bag_fields(
     let category = match kind {
         DeployableKind::Cart => "wagon",
         DeployableKind::Cache => "cache",
+        DeployableKind::Boat => "boat",
         _ => "deployable",
     };
     let claim_id = s.deployable.claim_entity_id[d_slot as usize];

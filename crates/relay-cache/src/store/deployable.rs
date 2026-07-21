@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: MIT
 
-//! Lookup store for `deployable_state` + thin catalog for `deployable_desc`.
+//! Lookup store for `deployable_state_v2` + thin catalog for `deployable_desc`.
 //!
 //! Schema relationship for player-owned storage:
-//!   `deployable_state.owner_id`           → player entity
-//!   `inventory_state.owner_entity_id`     → `deployable_state.entity_id`
+//!   `deployable_state_v2.owner_id`        → player entity
+//!   `inventory_state.owner_entity_id`     → `deployable_state_v2.entity_id`
 //!
-//! Personal Cache / Cart / Mount inventories often leave
+//! Personal Cache / Cart / Mount / Boat inventories often leave
 //! `inventory_state.player_owner_entity_id = 0`, so player inventory
 //! queries must walk `by_owner(player)` on this store and then
 //! `inventory.by_owner(deployable_entity_id)`.
+//!
+//! Prefer v2 over legacy `deployable_state`: newer boats (Skiff II+,
+//! Clipper, …) are written only to v2.
 
 use hashbrown::HashMap;
 
