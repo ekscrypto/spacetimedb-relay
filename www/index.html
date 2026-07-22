@@ -478,7 +478,8 @@
             with game coords (<code>north</code>=z, <code>east</code>=x).
             Active deposits omit <code>respawn_at</code>; depleted ones
             set it from public <code>growth_state</code> (Depleted&rarr;Hexite,
-            ~6&ndash;8 days).
+            6–8 days). Join misses surface as
+            <code>status: "unknown"</code> (not harvestable).
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/deposits</div>
             <div class="curl"><span class="prompt">$</span> curl 'https://relay.bitcraftsync.app/deposits?region=14'</div>
           </td>

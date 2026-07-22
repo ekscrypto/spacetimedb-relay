@@ -20,8 +20,7 @@ use url::Url;
 
 use spacetimedb_client_api_messages::websocket::common::QuerySetId;
 use spacetimedb_client_api_messages::websocket::v2::{
-    ClientMessage, InitialConnection, ServerMessage, Subscribe, SubscribeApplied,
-    TransactionUpdate,
+    ClientMessage, InitialConnection, ServerMessage, Subscribe, SubscribeApplied, TransactionUpdate,
 };
 use spacetimedb_sats::bsatn;
 

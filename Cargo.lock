@@ -1904,6 +1904,7 @@ dependencies = [
  "spacetimedb-client-api-messages 2.2.0",
  "spacetimedb-sats 2.2.0",
  "sysinfo",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",

@@ -17,6 +17,8 @@ pub struct DiscoveredRegion {
     pub region: u32,
     pub database: String,
     pub frontend_port: u16,
+    /// Loopback dashboard port (`--dashboard-bind`) for `/metrics` polls.
+    pub dashboard_port: u16,
 }
 
 /// Walk `unit_dir` for `relay-bc<N>.service` units and return the
@@ -41,6 +43,7 @@ pub fn discover_regions(unit_dir: &Path) -> Result<Vec<DiscoveredRegion>> {
             region,
             database: src.database,
             frontend_port: src.frontend_port,
+            dashboard_port: src.dashboard_port,
         });
     }
     Ok(out)
@@ -62,5 +65,28 @@ mod tests {
         assert_eq!(parse_region_number("global"), None);
         assert_eq!(parse_region_number("bitcraft-live-"), None);
         assert_eq!(parse_region_number("relay-bc14"), None);
+    }
+
+    #[test]
+    fn discover_forwards_dashboard_port() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("relay-bc14.service"),
+            "[Service]\n\
+             ExecStart=/relay \\\n\
+             --mirror-database relay-mirror-bc14 \\\n\
+             --frontend-bind 127.0.0.1:3014 \\\n\
+             --dashboard-bind 127.0.0.1:3114\n",
+        )
+        .unwrap();
+        let regions = discover_regions(dir.path()).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].region, 14);
+        assert_eq!(regions[0].frontend_port, 3014);
+        assert_eq!(regions[0].dashboard_port, 3114);
+        assert_eq!(regions[0].database, "relay-mirror-bc14");
     }
 }

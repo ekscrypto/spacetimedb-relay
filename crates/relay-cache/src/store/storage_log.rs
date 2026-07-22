@@ -90,12 +90,7 @@ impl StorageLogSoA {
     }
 
     /// Logs for `item_id` by a given player (optional `item_type` filter).
-    pub fn by_item_and_player(
-        &self,
-        item_id: i32,
-        item_type: Option<u8>,
-        player: u64,
-    ) -> Vec<u32> {
+    pub fn by_item_and_player(&self, item_id: i32, item_type: Option<u8>, player: u64) -> Vec<u32> {
         let mut out = Vec::new();
         for slot in self.item_slots(item_id, item_type) {
             let i = slot as usize;
@@ -108,11 +103,7 @@ impl StorageLogSoA {
 
     fn item_slots(&self, item_id: i32, item_type: Option<u8>) -> Vec<u32> {
         match item_type {
-            Some(t) => self
-                .by_item
-                .get(&(item_id, t))
-                .cloned()
-                .unwrap_or_default(),
+            Some(t) => self.by_item.get(&(item_id, t)).cloned().unwrap_or_default(),
             None => {
                 let mut out = Vec::new();
                 if let Some(v) = self.by_item.get(&(item_id, Pocket::ITEM)) {
@@ -135,7 +126,12 @@ impl StorageLogSoA {
             self.write_at(slot, &row);
             let new_item = (row.item_id, row.item_type);
             if old_storage != row.storage_entity_id {
-                reindex_u64(&mut self.by_storage, slot, old_storage, row.storage_entity_id);
+                reindex_u64(
+                    &mut self.by_storage,
+                    slot,
+                    old_storage,
+                    row.storage_entity_id,
+                );
             }
             if old_player != row.player_entity_id {
                 reindex_u64(&mut self.by_player, slot, old_player, row.player_entity_id);

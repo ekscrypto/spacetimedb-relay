@@ -412,9 +412,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    let coordinator = args.coordinator_socket.map(|path| {
-        CoordinatorClient::new(path, mirror_database.clone())
-    });
+    let coordinator = args
+        .coordinator_socket
+        .map(|path| CoordinatorClient::new(path, mirror_database.clone()));
 
     let cfg = stdb_mode::StdbModeConfig {
         upstream_host: args.upstream,

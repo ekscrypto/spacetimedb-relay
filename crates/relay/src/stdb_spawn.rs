@@ -71,7 +71,13 @@ pub async fn spawn(
     // write path is pure overhead. Removing it eliminates the iowait that
     // bottlenecked per-region apply throughput under the per-mirror layout.
     let child = tokio::process::Command::new(spacetime_bin)
-        .args(["start", "--in-memory", "--listen-addr", &listen_addr, "--data-dir"])
+        .args([
+            "start",
+            "--in-memory",
+            "--listen-addr",
+            &listen_addr,
+            "--data-dir",
+        ])
         .arg(&stdb_data_dir)
         // Don't inherit our file descriptors — stdb emits its own log
         // format to stdout, which would interleave with the relay's
@@ -93,8 +99,7 @@ pub async fn spawn(
         "local SpacetimeDB instance ready"
     );
 
-    let ws_url = Url::parse(&format!("ws://127.0.0.1:{port}"))
-        .expect("generated URL is valid");
+    let ws_url = Url::parse(&format!("ws://127.0.0.1:{port}")).expect("generated URL is valid");
     Ok((ws_url, http_base, StdbProcess(child), is_fresh))
 }
 
@@ -120,7 +125,10 @@ async fn wait_for_health(http_base: &str) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if std::time::Instant::now() >= deadline {
-            return Err(anyhow!("stdb health check timed out after 60s — is {} a valid spacetime binary?", health_url));
+            return Err(anyhow!(
+                "stdb health check timed out after 60s — is {} a valid spacetime binary?",
+                health_url
+            ));
         }
         match client.get(&health_url).send().await {
             Ok(r) if r.status().is_success() => return Ok(()),

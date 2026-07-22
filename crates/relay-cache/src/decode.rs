@@ -1140,7 +1140,10 @@ pub fn decode_storage_log_with_fields(
     let (action, item_id, item_type, quantity) = decode_action_log_data(&cells[cols.data])?;
     Ok(StorageLogRow {
         id: cell_u64(&cells[cols.id], "storage_log.id")?,
-        storage_entity_id: cell_u64(&cells[cols.object_entity_id], "storage_log.object_entity_id")?,
+        storage_entity_id: cell_u64(
+            &cells[cols.object_entity_id],
+            "storage_log.object_entity_id",
+        )?,
         player_entity_id: cell_u64(
             &cells[cols.subject_entity_id],
             "storage_log.subject_entity_id",
@@ -1150,10 +1153,7 @@ pub fn decode_storage_log_with_fields(
         item_id,
         item_type,
         quantity,
-        timestamp_micros: decode_timestamp_micros(
-            &cells[cols.timestamp],
-            "storage_log.timestamp",
-        )?,
+        timestamp_micros: decode_timestamp_micros(&cells[cols.timestamp], "storage_log.timestamp")?,
         days_since_epoch: cell_i32(
             &cells[cols.days_since_epoch],
             "storage_log.days_since_epoch",
@@ -1789,8 +1789,7 @@ fn decode_optional_location(cell: &Cell) -> Result<(bool, i32, i32, u32)> {
         .get("dimension")
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("location.dimension missing"))?;
-    let dimension =
-        u32::try_from(dimension).map_err(|_| anyhow!("location.dimension overflow"))?;
+    let dimension = u32::try_from(dimension).map_err(|_| anyhow!("location.dimension overflow"))?;
     Ok((true, x, z, dimension))
 }
 
@@ -1912,8 +1911,9 @@ fn cell_string(cell: &Cell, ctx: &str) -> Result<String> {
 /// U8 is mapped to `Cell::Smallint` by relay-protocol.
 fn cell_u8(cell: &Cell, ctx: &str) -> Result<u8> {
     match cell {
-        Cell::Smallint(Some(n)) => u8::try_from(*n)
-            .map_err(|_| anyhow!("{ctx}: Smallint {n} out of u8 range")),
+        Cell::Smallint(Some(n)) => {
+            u8::try_from(*n).map_err(|_| anyhow!("{ctx}: Smallint {n} out of u8 range"))
+        }
         Cell::Smallint(None) => bail!("{ctx}: Smallint is NULL"),
         other => bail!("{ctx}: expected Smallint, got {other:?}"),
     }
@@ -1939,10 +1939,7 @@ mod tests {
             (true, 24521, 18473, 1)
         );
         let wrapped = Cell::Jsonb(json!({"some": {"x": 1, "z": 2, "dimension": 1}}));
-        assert_eq!(
-            decode_optional_location(&wrapped).unwrap(),
-            (true, 1, 2, 1)
-        );
+        assert_eq!(decode_optional_location(&wrapped).unwrap(), (true, 1, 2, 1));
         assert_eq!(
             decode_optional_location(&Cell::Jsonb(Value::Null)).unwrap(),
             (false, 0, 0, 0)

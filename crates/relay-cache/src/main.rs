@@ -54,8 +54,7 @@ async fn main() -> Result<()> {
     };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(default_filter)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .init();
 
@@ -100,6 +99,7 @@ async fn main() -> Result<()> {
             r.region,
             r.database.clone(),
             bind_url,
+            r.dashboard_port,
             schema.clone(),
             args.debug,
             shutdown_signal_clone(),

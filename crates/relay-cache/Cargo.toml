@@ -36,7 +36,7 @@ parking_lot = { workspace = true }
 sysinfo = { workspace = true }
 hashbrown = { workspace = true }
 hex = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 
 spacetimedb-sats = { workspace = true }
 spacetimedb-client-api-messages = { workspace = true }
@@ -46,3 +46,6 @@ relay-coordinator = { workspace = true }
 
 [build-dependencies]
 prost-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

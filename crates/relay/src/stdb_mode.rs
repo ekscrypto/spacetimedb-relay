@@ -245,8 +245,7 @@ pub async fn run(
     // saturated AND counter frozen). Without this, a CPU-bound but healthy
     // stdb is misdiagnosed as a dead connection and force-reconnected,
     // which only adds load and worsens the slowdown.
-    let apply_completed =
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let apply_completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     enum InnerExit {
         Shutdown,
@@ -290,7 +289,9 @@ pub async fn run(
             }
         });
 
-        // On reconnect, start sequential subscribe over.
+        // On reconnect, start sequential subscribe over and clear the
+        // readiness flag so dependents (relay-cache) wait for a full re-sync.
+        metrics.set_initial_subscribe_complete(false);
         if sequential {
             sequential_progress = SequentialState {
                 next_idx: 0,
@@ -526,7 +527,7 @@ pub async fn run(
                             // advance subscribe state. Never blocks on
                             // the local stdb — all apply work goes to
                             // the channel.
-                            dispatch_message(
+                            let subscribe_complete = dispatch_message(
                                 message,
                                 meta,
                                 &subscribe_tables,
@@ -536,6 +537,9 @@ pub async fn run(
                                 sequential,
                             )
                             .await;
+                            if subscribe_complete {
+                                metrics.set_initial_subscribe_complete(true);
+                            }
                         }
                         Err(e) => tracing::warn!(
                             target: "relay::stdb_mode",
@@ -564,6 +568,7 @@ pub async fn run(
                 UpstreamEvent::Disconnected { reason } => {
                     tracing::warn!(target: "relay::stdb_mode", %reason, "upstream disconnected");
                     metrics.upstream.mark_down(Some(reason.clone()));
+                    metrics.set_initial_subscribe_complete(false);
                     break InnerExit::UpstreamGone;
                 }
             }
@@ -621,7 +626,10 @@ pub async fn run(
         // return Err → DriverError::Closed → connection-fatal → task signals
         // ws_dropped and breaks. For UpstreamGone/Shutdown/FrameLimitReached
         // the driver is still live and the apply task drains naturally.
-        if matches!(exit_reason, InnerExit::StdbConnectionDead | InnerExit::ModuleDead) {
+        if matches!(
+            exit_reason,
+            InnerExit::StdbConnectionDead | InnerExit::ModuleDead
+        ) {
             in_flight_cancel.close();
         }
         // Drain the apply pipeline and recover the driver.
@@ -815,8 +823,7 @@ pub async fn run(
                         Ok(d) => break d,
                         Err(e) => {
                             let retry_secs = stdb_backoff_secs;
-                            stdb_backoff_secs =
-                                (stdb_backoff_secs * 2).min(STDB_BACKOFF_MAX_SECS);
+                            stdb_backoff_secs = (stdb_backoff_secs * 2).min(STDB_BACKOFF_MAX_SECS);
                             tracing::warn!(
                                 target: "relay::stdb_mode",
                                 database = %cfg.mirror_database,
@@ -852,10 +859,8 @@ pub async fn run(
                     .context("relay_bind_writer after stdb reconnect")?;
                 module_dead = driver.module_dead_receiver();
                 // Reset the saturation watchdog and in_flight mirror.
-                apply_in_flight_available.store(
-                    MAX_IN_FLIGHT,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                apply_in_flight_available
+                    .store(MAX_IN_FLIGHT, std::sync::atomic::Ordering::Relaxed);
 
                 tracing::info!(
                     target: "relay::stdb_mode",
@@ -960,6 +965,8 @@ fn save_identity_token(path: &std::path::Path, token: &str) -> std::io::Result<(
 /// `apply_tx` is unbounded, so `send()` never blocks. This is what
 /// keeps the upstream socket draining even when the local-stdb applier
 /// is slow.
+/// Returns `true` when the upstream initial subscribe just finished
+/// (all sequential tables, or the single set-replace SubscribeApplied).
 async fn dispatch_message(
     message: ServerMessage,
     meta: Option<UpstreamReducerMeta>,
@@ -968,7 +975,7 @@ async fn dispatch_message(
     apply_tx: &mpsc::UnboundedSender<ApplyJob>,
     sequential_progress: &mut SequentialState,
     sequential: bool,
-) {
+) -> bool {
     match message {
         ServerMessage::InitialConnection(ic) => {
             tracing::info!(
@@ -1003,6 +1010,7 @@ async fn dispatch_message(
                         .await;
                 }
             }
+            false
         }
         ServerMessage::SubscribeApplied(sa) => {
             tracing::info!(
@@ -1049,6 +1057,7 @@ async fn dispatch_message(
                             "failed to send next sequential subscribe"
                         );
                     }
+                    false
                 } else {
                     tracing::info!(
                         target: "relay::stdb_mode",
@@ -1056,7 +1065,12 @@ async fn dispatch_message(
                         "all sequential subscriptions applied"
                     );
                     sequential_progress.all_applied = true;
+                    true
                 }
+            } else {
+                // Set-replace Subscribe: one SubscribeApplied covers the
+                // full working set.
+                true
             }
         }
         ServerMessage::TransactionUpdate(tu) => {
@@ -1088,10 +1102,11 @@ async fn dispatch_message(
                     });
                 }
             }
+            false
         }
         // Reducer/procedure results, errors, and other one-offs are
         // not propagated to the local stdb.
-        _ => {}
+        _ => false,
     }
 }
 

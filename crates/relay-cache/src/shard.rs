@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use relay_protocol::{MirroredField, MirroredSchema};
@@ -31,6 +31,14 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const STABLE_AFTER: Duration = Duration::from_secs(5);
+/// How often to re-check hexite location coverage after ready.
+const HEXITE_INTEGRITY_INTERVAL: Duration = Duration::from_secs(30);
+/// Don't trip integrity reconnect until the location PK phase has had
+/// time to land (and claim_local joins to settle).
+const HEXITE_INTEGRITY_GRACE: Duration = Duration::from_secs(15);
+const METRICS_POLL_TIMEOUT: Duration = Duration::from_secs(2);
+const READY_GATE_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const READY_GATE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Shared handle for one region's in-memory store. HTTP handlers hold
 /// `Arc<ShardHandle>` and take a read lock for queries.
@@ -124,6 +132,7 @@ pub fn spawn_shard(
     region: u32,
     database: String,
     bind_url: Url,
+    dashboard_port: u16,
     schema: Arc<MirroredSchema>,
     debug_mode: bool,
     mut shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
@@ -138,6 +147,7 @@ pub fn spawn_shard(
             region,
             database,
             bind_url,
+            dashboard_port,
             schema,
             store,
             debug_mode,
@@ -156,10 +166,12 @@ pub fn spawn_shard(
     handle
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_shard_loop(
     region: u32,
     database: String,
     bind_url: Url,
+    dashboard_port: u16,
     schema: Arc<MirroredSchema>,
     store: Arc<RwLock<RegionStore>>,
     debug_mode: bool,
@@ -167,17 +179,23 @@ async fn run_shard_loop(
 ) -> Result<()> {
     let meta = TableMeta::from_schema(&schema)?;
     let mut backoff = BACKOFF_MIN;
+    let http = reqwest::Client::builder()
+        .timeout(METRICS_POLL_TIMEOUT)
+        .build()
+        .context("build metrics HTTP client")?;
 
     loop {
+        match wait_for_relay_ready(region, dashboard_port, &http, shutdown).await? {
+            ReadyGate::Shutdown => {
+                tracing::info!(target: "relay_cache::shard", region, "shard shutting down");
+                clear_store(&store, region);
+                return Ok(());
+            }
+            ReadyGate::Ready => {}
+        }
+
         let result = session(
-            region,
-            &database,
-            &bind_url,
-            &schema,
-            &meta,
-            &store,
-            debug_mode,
-            shutdown,
+            region, &database, &bind_url, &schema, &meta, &store, debug_mode, shutdown,
         )
         .await;
 
@@ -187,7 +205,17 @@ async fn run_shard_loop(
                 clear_store(&store, region);
                 return Ok(());
             }
-            Ok(SessionEnd::Disconnected { connected_at }) => {
+            Ok(end) => {
+                let (connected_at, reason) = match &end {
+                    SessionEnd::Disconnected { connected_at } => (*connected_at, "disconnected"),
+                    SessionEnd::PrematureEmpty { connected_at } => {
+                        (*connected_at, "empty bulk load")
+                    }
+                    SessionEnd::HexiteLocationsMissing { connected_at } => {
+                        (*connected_at, "hexite locations missing")
+                    }
+                    SessionEnd::Shutdown => unreachable!(),
+                };
                 clear_store(&store, region);
                 if connected_at.elapsed() >= STABLE_AFTER {
                     backoff = BACKOFF_MIN;
@@ -195,8 +223,9 @@ async fn run_shard_loop(
                 tracing::warn!(
                     target: "relay_cache::shard",
                     region,
+                    reason,
                     backoff_secs = backoff.as_secs(),
-                    "disconnected; reconnecting"
+                    "reconnecting"
                 );
             }
             Err(e) => {
@@ -222,9 +251,108 @@ async fn run_shard_loop(
     }
 }
 
+enum ReadyGate {
+    Ready,
+    Shutdown,
+}
+
 enum SessionEnd {
     Shutdown,
-    Disconnected { connected_at: Instant },
+    Disconnected {
+        connected_at: Instant,
+    },
+    /// Base SubscribeApplied had no claims — mirror was empty/mid-sync.
+    PrematureEmpty {
+        connected_at: Instant,
+    },
+    /// Hexite resources present without location_state attach.
+    HexiteLocationsMissing {
+        connected_at: Instant,
+    },
+}
+
+/// Poll the region's loopback dashboard until upstream + local_stdb are
+/// up and `initial_subscribe_complete` is true.
+async fn wait_for_relay_ready(
+    region: u32,
+    dashboard_port: u16,
+    http: &reqwest::Client,
+    shutdown: &mut std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+) -> Result<ReadyGate> {
+    let url = format!("http://127.0.0.1:{dashboard_port}/metrics");
+    let mut backoff = READY_GATE_BACKOFF_MIN;
+    loop {
+        match http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) if metrics_indicate_ready(&body) => {
+                        tracing::info!(
+                            target: "relay_cache::shard",
+                            region,
+                            dashboard_port,
+                            "relay ready (upstream+stdb up, initial subscribe complete)"
+                        );
+                        return Ok(ReadyGate::Ready);
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            target: "relay_cache::shard",
+                            region,
+                            dashboard_port,
+                            "relay metrics not ready yet; waiting"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "relay_cache::shard",
+                            region,
+                            error = %e,
+                            "metrics JSON decode failed; waiting"
+                        );
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::debug!(
+                    target: "relay_cache::shard",
+                    region,
+                    status = %resp.status(),
+                    "metrics HTTP non-success; waiting"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "relay_cache::shard",
+                    region,
+                    error = %e,
+                    "metrics poll failed; waiting"
+                );
+            }
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut *shutdown => {
+                return Ok(ReadyGate::Shutdown);
+            }
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(READY_GATE_BACKOFF_MAX);
+    }
+}
+
+fn metrics_indicate_ready(body: &serde_json::Value) -> bool {
+    let link_up = |key: &str| {
+        body.get(key)
+            .and_then(|v| v.get("state"))
+            .and_then(|s| s.as_str())
+            == Some("up")
+    };
+    let complete = body
+        .get("initial_subscribe_complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    link_up("upstream") && link_up("local_stdb") && complete
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,23 +402,12 @@ async fn session(
         query_set_id = 1,
         "subscribing base query set"
     );
-    wire::send_subscribe(
-        &mut conn,
-        1,
-        1,
-        base_queries,
-        region,
-        BASE_PHASE,
-    )
-    .await?;
-    let (sa_base, base_wire_bytes) = wire::expect_subscribe_applied(
-        &mut conn,
-        region,
-        BASE_PHASE,
-        debug_mode,
-        |tu| apply_transaction_to(&mut building, schema, meta, tu),
-    )
-    .await?;
+    wire::send_subscribe(&mut conn, 1, 1, base_queries, region, BASE_PHASE).await?;
+    let (sa_base, base_wire_bytes) =
+        wire::expect_subscribe_applied(&mut conn, region, BASE_PHASE, debug_mode, |tu| {
+            apply_transaction_to(&mut building, schema, meta, tu)
+        })
+        .await?;
     let mut hexite_ids = collect_hexite_entity_ids(schema, meta, &sa_base)?;
     merge_subscribe_applied(&mut building, schema, meta, &sa_base)?;
     tracing::info!(
@@ -298,8 +415,21 @@ async fn session(
         region,
         base_wire_bytes,
         n_hexite = hexite_ids.len(),
+        n_claim = building.claim.len(),
         "base query set Applied and merged"
     );
+
+    // Empty mirror (frontend up before sequential sync finished, or race
+    // after stdb restart). Never mark ready — reconnect and re-gate.
+    if building.claim.len() == 0 {
+        tracing::warn!(
+            target: "relay_cache::shard",
+            region,
+            base_wire_bytes,
+            "empty bulk load (0 claims); refusing ready"
+        );
+        return Ok(SessionEnd::PrematureEmpty { connected_at });
+    }
 
     hexite_ids.sort_unstable();
     hexite_ids.dedup();
@@ -320,23 +450,12 @@ async fn session(
             query_set_id = 2,
             "subscribing hexite location query set (additive)"
         );
-        wire::send_subscribe(
-            &mut conn,
-            2,
-            2,
-            loc_queries,
-            region,
-            HEXITE_PHASE,
-        )
-        .await?;
-        let (sa_loc, loc_wire_bytes) = wire::expect_subscribe_applied(
-            &mut conn,
-            region,
-            HEXITE_PHASE,
-            debug_mode,
-            |tu| apply_transaction_to(&mut building, schema, meta, tu),
-        )
-        .await?;
+        wire::send_subscribe(&mut conn, 2, 2, loc_queries, region, HEXITE_PHASE).await?;
+        let (sa_loc, loc_wire_bytes) =
+            wire::expect_subscribe_applied(&mut conn, region, HEXITE_PHASE, debug_mode, |tu| {
+                apply_transaction_to(&mut building, schema, meta, tu)
+            })
+            .await?;
         merge_subscribe_applied(&mut building, schema, meta, &sa_loc)?;
         tracing::info!(
             target: "relay_cache::shard",
@@ -348,6 +467,7 @@ async fn session(
     }
 
     building.ready = true;
+    let ready_at = Instant::now();
     let n_resource = building.resource.len();
     let n_claim = building.claim.len();
     let n_growth = building.growth.len();
@@ -369,6 +489,10 @@ async fn session(
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut integrity = tokio::time::interval(HEXITE_INTEGRITY_INTERVAL);
+    integrity.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick so grace can elapse.
+    integrity.tick().await;
 
     loop {
         tokio::select! {
@@ -385,6 +509,23 @@ async fn session(
                         "ping failed"
                     );
                     return Ok(SessionEnd::Disconnected { connected_at });
+                }
+            }
+            _ = integrity.tick() => {
+                if ready_at.elapsed() < HEXITE_INTEGRITY_GRACE {
+                    continue;
+                }
+                let missing = {
+                    let s = store.read();
+                    s.resource.len() > 0 && s.resource.any_missing_location()
+                };
+                if missing {
+                    tracing::warn!(
+                        target: "relay_cache::shard",
+                        region,
+                        "hexite resources missing location_state; reconnecting to reload"
+                    );
+                    return Ok(SessionEnd::HexiteLocationsMissing { connected_at });
                 }
             }
             frame = wire::recv_server_message(&mut conn) => {
@@ -1161,4 +1302,30 @@ fn apply_rows(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::metrics_indicate_ready;
+    use serde_json::json;
+
+    #[test]
+    fn metrics_ready_requires_all_three() {
+        assert!(!metrics_indicate_ready(&json!({})));
+        assert!(!metrics_indicate_ready(&json!({
+            "upstream": { "state": "up" },
+            "local_stdb": { "state": "up" },
+            "initial_subscribe_complete": false
+        })));
+        assert!(!metrics_indicate_ready(&json!({
+            "upstream": { "state": "up" },
+            "local_stdb": { "state": "down" },
+            "initial_subscribe_complete": true
+        })));
+        assert!(metrics_indicate_ready(&json!({
+            "upstream": { "state": "up" },
+            "local_stdb": { "state": "up" },
+            "initial_subscribe_complete": true
+        })));
+    }
 }

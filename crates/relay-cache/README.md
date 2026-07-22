@@ -121,8 +121,10 @@ curl -s 'http://127.0.0.1:8089/player/1297036692699996362/crafts?completed=true'
 # with `{0} (N: {1}, E: {2})|~Hexite Deposit|` — N/E parsed from the name.
 # Respawn: `claim_local` world x/z ⋈ hexite `resource_state` location ⋈
 # `growth_state.end_timestamp` on that resource entity.
-# Active: omit `respawn_at`. Depleted: `respawn_at` from
+# Active: omit `respawn_at` and `status`. Depleted: `respawn_at` from
 # `growth_state.end_timestamp` (public; Depleted→Hexite grows 6–8 days).
+# Join miss: `status: "unknown"` (do **not** treat as harvestable — the
+# shard may still be attaching overworld location PKs).
 curl -s 'http://127.0.0.1:8089/deposits'
 curl -s 'http://127.0.0.1:8089/deposits?region=14'
 # → { "deposits": [

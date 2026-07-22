@@ -943,10 +943,13 @@ fn parse_storage_logs_mode(q: &StorageLogsQuery) -> Result<StorageLogsMode, Stri
     let claim = q.claim_id.as_deref().filter(|s| !s.is_empty());
     let item = q.item_id;
 
-    const HINT: &str = "use one of: storageId=… | playerId=… | itemId=…&claimId=… | itemId=…&playerId=…";
+    const HINT: &str =
+        "use one of: storageId=… | playerId=… | itemId=…&claimId=… | itemId=…&playerId=…";
 
     if storage.is_some() && (player.is_some() || claim.is_some() || item.is_some()) {
-        return Err(format!("`storageId` cannot be combined with other filters; {HINT}"));
+        return Err(format!(
+            "`storageId` cannot be combined with other filters; {HINT}"
+        ));
     }
     if let Some(s) = storage {
         return Ok(StorageLogsMode::Storage {
@@ -1099,10 +1102,9 @@ fn collect_storage_logs(
             s.storage_log
                 .by_item_in_storages(item_id, item_type, &storage_ids)
         }
-        StorageLogsMode::ItemPlayer { item_id, player_id } => {
-            s.storage_log
-                .by_item_and_player(item_id, item_type, player_id)
-        }
+        StorageLogsMode::ItemPlayer { item_id, player_id } => s
+            .storage_log
+            .by_item_and_player(item_id, item_type, player_id),
     };
 
     let mut logs: Vec<pb::StorageLogEntry> = slots
@@ -1114,9 +1116,7 @@ fn collect_storage_logs(
         // Compare via days then id as tiebreak; timestamp string is ISO so
         // lexicographic works, but prefer the underlying micros via id order
         // when equal — sort by timestamp string desc is fine for ISO8601.
-        b.timestamp
-            .cmp(&a.timestamp)
-            .then_with(|| b.id.cmp(&a.id))
+        b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id))
     });
     logs
 }
@@ -1234,10 +1234,8 @@ fn deposit_from_claim_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDepos
         if !s.claim_local.has_location[li] {
             return None;
         }
-        s.resource.find_by_location(
-            s.claim_local.location_x[li],
-            s.claim_local.location_z[li],
-        )
+        s.resource
+            .find_by_location(s.claim_local.location_x[li], s.claim_local.location_z[li])
     });
 
     let (respawn_at, status) = match resource_slot {
@@ -1253,10 +1251,13 @@ fn deposit_from_claim_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDepos
                 // Depleted but growth row not yet visible (rare race).
                 (None, Some("respawning".into()))
             } else {
+                // Matched active hexite resource ⇒ harvestable.
                 (None, None)
             }
         }
-        None => (None, None),
+        // Join miss: claim coords without a located resource. Do not
+        // imply harvestable — the cache may be mid self-heal.
+        None => (None, Some("unknown".into())),
     };
 
     Some(pb::HexiteDeposit {
@@ -2105,7 +2106,13 @@ fn player_inventory_slots(s: &RegionStore, player_id: u64) -> Vec<u32> {
 fn deployable_bag_fields(
     s: &RegionStore,
     d_slot: u32,
-) -> (&'static str, String, Option<String>, Option<u64>, Option<String>) {
+) -> (
+    &'static str,
+    String,
+    Option<String>,
+    Option<u64>,
+    Option<String>,
+) {
     let desc_id = s.deployable.deployable_description_id[d_slot as usize];
     let (desc_name, kind) = s
         .deployable_desc
@@ -2431,11 +2438,7 @@ async fn player_housing(
             .by_entity_id(network_id)
             .map(|n| n.entrance_dimension_id);
         let (catalog, nickname) = entrance_catalog_and_nickname(&s, entrance_building_id);
-        let house_name = house_display_name(
-            &player.username,
-            &catalog,
-            nickname.as_deref(),
-        );
+        let house_name = house_display_name(&player.username, &catalog, nickname.as_deref());
         let buildings = match entrance_dimension_id {
             Some(dim) if dim != 0 => collect_housing_buildings(&s, dim),
             _ => Vec::new(),
@@ -2539,6 +2542,61 @@ mod tests {
         assert_eq!(dep.entity_id, Some(100));
         assert_eq!(dep.region, Some(14));
         assert!(dep.respawn_at.is_some());
+        assert!(dep.status.is_none());
+    }
+
+    #[test]
+    fn deposit_from_claim_slot_unknown_when_join_misses() {
+        use crate::decode::ClaimRow;
+
+        let mut s = RegionStore::empty(14);
+        s.claim.upsert(ClaimRow {
+            entity_id: 100,
+            owner_player_entity_id: 0,
+            owner_building_entity_id: 97,
+            name: "{0} (N: {1}, E: {2})|~Hexite Deposit|~6158|~8174".into(),
+            neutral: true,
+        });
+        // No claim_local / resource → join miss.
+        let slot = s.claim.find(100).unwrap();
+        let dep = deposit_from_claim_slot(&s, slot).unwrap();
+        assert!(dep.respawn_at.is_none());
+        assert_eq!(dep.status.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn deposit_from_claim_slot_harvestable_when_active_resource() {
+        use crate::decode::{ClaimLocalRow, ClaimRow, ResourceRow, HEXITE_DEPOSIT_RESOURCE_ID};
+
+        let mut s = RegionStore::empty(14);
+        s.claim.upsert(ClaimRow {
+            entity_id: 100,
+            owner_player_entity_id: 0,
+            owner_building_entity_id: 97,
+            name: "{0} (N: {1}, E: {2})|~Hexite Deposit|~6158|~8174".into(),
+            neutral: true,
+        });
+        s.claim_local.upsert(ClaimLocalRow {
+            entity_id: 100,
+            supplies: 0,
+            building_maintenance: 0.0,
+            num_tiles: 1261,
+            treasury: 0,
+            supplies_purchase_threshold: 0,
+            supplies_purchase_price: 0.0,
+            location_x: 24521,
+            location_z: 18473,
+            location_dimension: 1,
+            has_location: true,
+        });
+        s.resource.upsert(ResourceRow {
+            entity_id: 999,
+            resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
+        });
+        assert!(s.resource.set_location(999, 24521, 18473));
+        let slot = s.claim.find(100).unwrap();
+        let dep = deposit_from_claim_slot(&s, slot).unwrap();
+        assert!(dep.respawn_at.is_none());
         assert!(dep.status.is_none());
     }
 

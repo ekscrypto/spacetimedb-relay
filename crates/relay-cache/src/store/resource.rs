@@ -52,6 +52,14 @@ impl ResourceSoA {
         self.resource_id[slot as usize] != DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID
     }
 
+    /// True when at least one hexite resource lacks a `location_state` attach.
+    /// That breaks the `/deposits` claim→resource join.
+    pub fn any_missing_location(&self) -> bool {
+        self.pk
+            .values()
+            .any(|&slot| !self.has_location[slot as usize])
+    }
+
     pub fn upsert(&mut self, row: ResourceRow) {
         if !is_hexite_resource_id(row.resource_id) {
             self.delete(row.entity_id);
@@ -148,5 +156,17 @@ mod tests {
         assert!(!s.is_active(slot));
         // Location ignored for unknown entities.
         assert!(!s.set_location(99, 1, 2));
+    }
+
+    #[test]
+    fn any_missing_location_detects_unlocated_rows() {
+        let mut s = ResourceSoA::with_capacity(2);
+        s.upsert(ResourceRow {
+            entity_id: 10,
+            resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
+        });
+        assert!(s.any_missing_location());
+        assert!(s.set_location(10, 1, 2));
+        assert!(!s.any_missing_location());
     }
 }
