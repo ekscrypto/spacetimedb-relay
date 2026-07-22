@@ -220,13 +220,15 @@
       SpacetimeDB SDK at the addresses below; it&rsquo;s a drop-in
       <code>wss://</code> replacement. New here?
       Start with the <a href="/tutorial/">step-by-step tutorial</a>
-      (connect, subscribe, schema, relay-cache joins).
+      (connect, subscribe, schema, relay-cache joins), or open the
+      <a href="/explorer/">data explorer</a> to browse mirror tables in the browser.
     </p>
     <p class="disclaimer">
       Community project &mdash; not affiliated with Clockwork Labs.
       SpacetimeDB&trade; is a trademark of
       <a href="https://clockworklabs.io" target="_blank" rel="noopener">Clockwork Labs</a>.
       &middot; <a href="/tutorial/">How to use the relay</a>
+      &middot; <a href="/explorer/">Data explorer</a>
     </p>
     <div class="health-line">
       <span id="overall-pill" class="pill">fetching&hellip;</span>
@@ -304,7 +306,8 @@
     passthrough). See the
     <a href="https://github.com/ekscrypto/spacetimedb-relay#connecting-downstream-clients" target="_blank" rel="noopener">README</a>
     for protocol details. See also the
-    <a href="/tutorial/">How to use the relay</a> tutorial (Python &amp; Rust).
+    <a href="/tutorial/">How to use the relay</a> tutorial (Python &amp; Rust)
+    and the in-browser <a href="/explorer/">data explorer</a>.
     Ports with no relay behind them return nginx
     <code>502</code>; only sources reported live by <code>/health</code> are listed.
   </p>
@@ -344,7 +347,8 @@
     with <code>Cache-Control: public, max-age=60</code>. The
     <code>?version=9</code> query is accepted but ignored: only the v9 format
     is cached. Useful for codegen, type inspection, or feeding a local SDK
-    without hitting upstream.
+    without hitting upstream. The <a href="/explorer/">data explorer</a>
+    uses this endpoint to list tables.
   </p>
   <div class="panel">
     <table class="endpoints">

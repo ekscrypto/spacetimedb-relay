@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data explorer — relay.bitcraftsync.app</title>
+<link rel="stylesheet" href="css/explorer.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+      <h1>Data explorer</h1>
+      <div class="field">
+        <label for="region">Region</label>
+        <select id="region" disabled>
+          <option>Loading&hellip;</option>
+        </select>
+      </div>
+    </div>
+    <div class="table-search">
+      <div class="field" style="margin:0">
+        <label for="table-filter">Tables</label>
+        <input id="table-filter" type="search" placeholder="Filter table names&hellip;" disabled>
+      </div>
+    </div>
+    <div class="table-list" id="table-list">
+      <div class="loading">Pick a region to load its schema.</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="toolbar">
+      <div class="toolbar-row">
+        <div class="field sql">
+          <label for="sql">Subscribe SQL</label>
+          <textarea id="sql" rows="2" placeholder="SELECT * FROM &lt;table&gt;" disabled></textarea>
+        </div>
+        <button type="button" class="btn" id="btn-subscribe" disabled>Subscribe</button>
+        <button type="button" class="btn danger" id="btn-disconnect" disabled>Disconnect</button>
+      </div>
+      <div class="status-bar" id="status">
+        <span>Idle</span>
+      </div>
+    </div>
+
+    <div class="banner warn" id="huge-warn"></div>
+    <div class="banner err" id="error-banner"></div>
+
+    <div class="meta" id="meta" style="display:none">
+      <span id="meta-table"></span>
+      <span class="cols" id="meta-cols"></span>
+    </div>
+
+    <div class="filters" id="filters" style="display:none">
+      <input class="search" id="row-search" type="search" placeholder="Search rows&hellip;">
+      <span class="hint" id="row-count"></span>
+    </div>
+
+    <div class="grid-wrap" id="grid-wrap">
+      <div class="placeholder" id="placeholder">
+        <h2>Browse mirror tables</h2>
+        <p>
+          Pick a region, choose a table, then subscribe. Rows stream in over
+          <code>v1.json.spacetimedb</code> as the snapshot applies, then stay
+          live via <code>TransactionUpdate</code>s.
+        </p>
+        <p>
+          Prefer a <code>WHERE</code> clause on large tables. Full dumps of
+          <code>location_state</code> / <code>footprint_tile_state</code> can
+          be hundreds of MB — enough to hang a browser tab.
+        </p>
+        <p>
+          See the <a href="/tutorial/">tutorial</a> for SDK examples, or
+          <a href="/tutorial/relay-cache.html">relay-cache</a> for joined
+          claim/player HTTP views.
+        </p>
+      </div>
+      <div class="grid-inner" id="grid-inner" style="display:none">
+        <table class="grid" id="grid">
+          <thead id="grid-head"></thead>
+          <tbody id="grid-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="js/explorer.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# nginx snippet: serve /explorer static pages on relay.bitcraftsync.app
+#
+# Insert these blocks in the HTTPS `server { ... }` for
+# relay.bitcraftsync.app, BEFORE the catch-all `location /`
+# (which proxies to relay-coordinator on 127.0.0.1:8082).
+#
+# Files live in the repo tree that is rsynced to the host:
+#   /srv/relay/spacetimedb-relay/www/explorer/
+#
+# Install on the host:
+#   1. Backup: sudo cp /etc/nginx/sites-available/relay.bitcraftsync.app.conf \
+#        /etc/nginx/sites-available/relay.bitcraftsync.app.conf.bak-explorer-$(date +%Y%m%d-%H%M%S)
+#   2. Paste the blocks below before `location /` (alongside /tutorial/ if present)
+#   3. sudo nginx -t && sudo nginx -s reload
+#
+# Public URLs:
+#   https://relay.bitcraftsync.app/explorer/
+#
+# Note: the explorer fetches schema from https://relay.bitcraftsync.app:<port>/…
+# (cross-origin). relay-frontend sends Access-Control-Allow-Origin: * on
+# schema responses (same permissive policy as /health and relay-cache).
+
+    # Data explorer static site (repo www/explorer/)
+    location = /explorer {
+        return 301 /explorer/;
+    }
+
+    location /explorer/ {
+        alias /srv/relay/spacetimedb-relay/www/explorer/;
+        index index.html;
+        add_header Cache-Control "public, max-age=60";
+    }
