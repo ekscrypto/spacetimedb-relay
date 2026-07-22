@@ -194,6 +194,11 @@ fn build_response(body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(b"Content-Type: application/json\r\n");
     out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     out.extend_from_slice(b"Cache-Control: public, max-age=60\r\n");
+    // Schema is public read-only. Match coordinator `/health` and
+    // relay-cache (`CorsLayer::permissive`) so browser tools — including
+    // a local static server hitting production frontends — can fetch it.
+    // Cross-origin from :443 (or localhost) to :3000+N is the normal path.
+    out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
     out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
@@ -334,6 +339,7 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("Content-Type: application/json\r\n"));
         assert!(text.contains("Content-Length: 13\r\n"));
+        assert!(text.contains("Access-Control-Allow-Origin: *\r\n"));
         assert!(text.contains("Connection: close\r\n"));
         // Exactly one blank line separates headers from body.
         let blank = "\r\n\r\n";
