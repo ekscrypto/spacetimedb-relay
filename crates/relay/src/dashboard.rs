@@ -109,7 +109,12 @@ fn epoch_secs() -> u64 {
 ///
 /// Pure (no lock, no clock) so unit tests can exercise the rollover
 /// boundary deterministically. Result is a count (units = bucket units).
-fn windowed_sum(buckets: &[u64; WINDOW_BUCKETS], now_bucket: u64, elapsed: u64, minutes: usize) -> u64 {
+fn windowed_sum(
+    buckets: &[u64; WINDOW_BUCKETS],
+    now_bucket: u64,
+    elapsed: u64,
+    minutes: usize,
+) -> u64 {
     const BUCKETS_PER_MIN: usize = (60 / BUCKET_SECS) as usize; // 6
     let want = minutes.saturating_mul(BUCKETS_PER_MIN).min(WINDOW_BUCKETS);
     let now_slot = (now_bucket as usize) % WINDOW_BUCKETS;
@@ -356,6 +361,12 @@ pub struct Metrics {
     /// Optional handle to the frontend proxy. `None` when
     /// `--frontend-bind` is empty.
     pub frontend: Mutex<Option<FrontendHandles>>,
+    /// True once the upstream initial subscribe has finished: all
+    /// sequential `SubscribeMulti` tables applied, or the single
+    /// set-replace `SubscribeApplied` received in non-sequential mode.
+    /// Cleared on upstream reconnect / disconnect so dependents
+    /// (relay-cache readiness gate) wait for a full re-sync.
+    initial_subscribe_complete: AtomicU8,
 }
 
 #[derive(Clone)]
@@ -382,11 +393,17 @@ impl Metrics {
             mirror_database,
             events,
             frontend: Mutex::new(None),
+            initial_subscribe_complete: AtomicU8::new(0),
         })
     }
 
     pub fn install_frontend(&self, handles: FrontendHandles) {
         *self.frontend.lock() = Some(handles);
+    }
+
+    pub fn set_initial_subscribe_complete(&self, complete: bool) {
+        self.initial_subscribe_complete
+            .store(u8::from(complete), Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -415,6 +432,8 @@ impl Metrics {
                 available: self.available_permits.load(Ordering::Relaxed),
             },
             frontend,
+            initial_subscribe_complete: self.initial_subscribe_complete.load(Ordering::Relaxed)
+                != 0,
         }
     }
 }
@@ -457,6 +476,9 @@ pub struct MetricsSnapshot {
     pub in_flight: InFlightSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frontend: Option<relay_frontend::FrontendSnapshot>,
+    /// True after the upstream initial subscribe finished (all sequential
+    /// tables, or the single set-replace SubscribeApplied).
+    pub initial_subscribe_complete: bool,
 }
 
 #[derive(Serialize)]
