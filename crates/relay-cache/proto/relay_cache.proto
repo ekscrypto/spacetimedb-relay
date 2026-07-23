@@ -100,6 +100,8 @@ message ClaimMember {
   bool co_owner_permission = 8;
   // Unix seconds from player_state.sign_in_timestamp (BitJita lastLogin).
   optional int64 last_login_timestamp = 9;
+  // Unix seconds from mobile_entity_state.timestamp (ms → s). Survives logout.
+  optional int64 last_active_timestamp = 10;
 }
 
 message ClaimMemberList {
@@ -119,6 +121,7 @@ message ClaimCitizen {
   string user_name = 2;
   repeated CitizenSkill skills = 3;
   optional int64 last_login_timestamp = 4;
+  optional int64 last_active_timestamp = 5;
 }
 
 message SkillNameEntry {
@@ -164,6 +167,9 @@ message Player {
   // Unix seconds from player_state.sign_in_timestamp.
   optional int64 last_login_timestamp = 4;
   optional bool signed_in = 5;
+  // Unix seconds from mobile_entity_state.timestamp (ms → s). Survives logout;
+  // approximates in-game "last active" (private player_timestamp_state).
+  optional int64 last_active_timestamp = 6;
 }
 
 message PlayerList {

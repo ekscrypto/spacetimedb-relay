@@ -105,7 +105,8 @@
           <tr>
             <td class="mono">…/members</td>
             <td><code>claim_member_state</code>, <code>player_state</code></td>
-            <td>Roster + permissions + <code>last_login_timestamp</code>.</td>
+            <td>Roster + permissions + <code>last_login_timestamp</code> /
+              <code>last_active_timestamp</code>.</td>
           </tr>
           <tr>
             <td class="mono">…/citizens</td>
@@ -125,7 +126,7 @@
           <tr>
             <td class="mono">GET /player?name=</td>
             <td><code>player_username_state</code>, <code>player_state</code></td>
-            <td>Substring search; region; last login / signed-in.
+            <td>Substring search; region; last login / last active / signed-in.
               Walkthrough with printable columns:
               <a href="players.html">Extract player data</a>.</td>
           </tr>

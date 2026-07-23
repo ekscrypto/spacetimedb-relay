@@ -20,9 +20,10 @@ use crate::decode::{
     CLAIM_MEMBER_TABLE, CLAIM_TABLE, CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE,
     CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
     DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE, EXPERIENCE_TABLE,
-    GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE, LOCATION_TABLE, PASSIVE_CRAFT_TABLE,
-    PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE, PLAYER_USERNAME_TABLE,
-    PROGRESSIVE_ACTION_TABLE, RENT_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE, STORAGE_LOG_TABLE,
+    GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE, LOCATION_TABLE, MOBILE_ENTITY_TABLE,
+    PASSIVE_CRAFT_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE,
+    PLAYER_USERNAME_TABLE, PROGRESSIVE_ACTION_TABLE, RENT_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE,
+    STORAGE_LOG_TABLE,
 };
 use crate::store::RegionStore;
 use crate::wire;
@@ -64,6 +65,7 @@ struct TableMeta {
     dimension_network_fields: Vec<MirroredField>,
     player_username_fields: Vec<MirroredField>,
     player_state_fields: Vec<MirroredField>,
+    mobile_entity_fields: Vec<MirroredField>,
     deployable_fields: Vec<MirroredField>,
     deployable_desc_fields: Vec<MirroredField>,
     player_housing_fields: Vec<MirroredField>,
@@ -98,6 +100,7 @@ impl TableMeta {
             dimension_network_fields: fields_owned(schema, DIMENSION_NETWORK_TABLE)?,
             player_username_fields: fields_owned(schema, PLAYER_USERNAME_TABLE)?,
             player_state_fields: fields_owned(schema, PLAYER_STATE_TABLE)?,
+            mobile_entity_fields: fields_owned(schema, MOBILE_ENTITY_TABLE)?,
             deployable_fields: fields_owned(schema, DEPLOYABLE_TABLE)?,
             deployable_desc_fields: fields_owned(schema, DEPLOYABLE_DESC_TABLE)?,
             player_housing_fields: fields_owned(schema, PLAYER_HOUSING_TABLE)?,
@@ -604,6 +607,9 @@ fn base_subscribe_queries() -> Vec<String> {
         format!("SELECT * FROM {DIMENSION_NETWORK_TABLE}"),
         format!("SELECT * FROM {PLAYER_USERNAME_TABLE}"),
         format!("SELECT * FROM {PLAYER_STATE_TABLE}"),
+        // ~20–25k rows/region; last-active proxy after logout (sign_in_timestamp
+        // is zeroed). Private player_timestamp_state is not subscribeable.
+        format!("SELECT * FROM {MOBILE_ENTITY_TABLE}"),
         format!("SELECT * FROM {DEPLOYABLE_TABLE}"),
         format!("SELECT * FROM {DEPLOYABLE_DESC_TABLE}"),
         format!("SELECT * FROM {PLAYER_HOUSING_TABLE}"),
@@ -919,6 +925,26 @@ fn apply_rows(
                     schema,
                 )?;
                 store.player_state.upsert(decoded);
+            }
+        }
+        MOBILE_ENTITY_TABLE => {
+            for row in deletes {
+                let decoded = decode::decode_mobile_entity_with_fields(
+                    row,
+                    &meta.mobile_entity_fields,
+                    meta.cols.mobile_entity,
+                    schema,
+                )?;
+                store.mobile_entity.delete(decoded.entity_id);
+            }
+            for row in inserts {
+                let decoded = decode::decode_mobile_entity_with_fields(
+                    row,
+                    &meta.mobile_entity_fields,
+                    meta.cols.mobile_entity,
+                    schema,
+                )?;
+                store.mobile_entity.upsert(decoded);
             }
         }
         DEPLOYABLE_TABLE => {

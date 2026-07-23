@@ -20,6 +20,7 @@ pub mod experience;
 pub mod growth;
 pub mod inventory;
 pub mod location_dim;
+pub mod mobile_entity;
 pub mod passive_craft;
 pub mod player_housing;
 pub mod player_state;
@@ -45,6 +46,7 @@ pub use experience::ExperienceSoA;
 pub use growth::GrowthStore;
 pub use inventory::{InventorySoA, Pocket};
 pub use location_dim::LocationDimStore;
+pub use mobile_entity::MobileEntitySoA;
 pub use passive_craft::PassiveCraftSoA;
 pub use player_housing::{PlayerHousingDescStore, PlayerHousingSoA};
 pub use player_state::PlayerStateSoA;
@@ -76,6 +78,7 @@ pub struct RegionStore {
     pub dimension_network: DimensionNetworkStore,
     pub player_username: PlayerUsernameSoA,
     pub player_state: PlayerStateSoA,
+    pub mobile_entity: MobileEntitySoA,
     pub deployable: DeployableSoA,
     pub deployable_desc: DeployableDescStore,
     pub player_housing: PlayerHousingSoA,
@@ -110,6 +113,7 @@ impl RegionStore {
             dimension_network: DimensionNetworkStore::new(),
             player_username: PlayerUsernameSoA::with_capacity(0),
             player_state: PlayerStateSoA::with_capacity(0),
+            mobile_entity: MobileEntitySoA::with_capacity(0),
             deployable: DeployableSoA::with_capacity(0),
             deployable_desc: DeployableDescStore::new(),
             player_housing: PlayerHousingSoA::with_capacity(0),

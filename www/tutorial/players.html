@@ -68,7 +68,14 @@
             <td><code>entity_id</code>, <code>sign_in_timestamp</code> (i32 unix&nbsp;s),
               <code>session_start_timestamp</code>, <code>signed_in</code> (bool)</td>
             <td><code>sign_in_timestamp</code> is what tools call last login.
-              <code>0</code> means unknown.</td>
+              <code>0</code> means unknown (cleared on logout).</td>
+          </tr>
+          <tr>
+            <td class="mono">mobile_entity_state</td>
+            <td><code>entity_id</code>, <code>timestamp</code> (u64 unix&nbsp;ms),
+              location fields…</td>
+            <td>Last movement/position update. Survives logout; relay-cache
+              exposes it as <code>last_active_timestamp</code> (unix&nbsp;s).</td>
           </tr>
           <tr>
             <td class="mono">experience_state</td>
@@ -89,12 +96,13 @@
     <div class="diagram"><span class="hi">player_username_state</span>.entity_id = P
         │  username
         ├─ <span class="hi">player_state</span>[P]           → signed_in, sign_in_timestamp
+        ├─ <span class="hi">mobile_entity_state</span>[P]    → timestamp (last active; survives logout)
         ├─ <span class="hi">experience_state</span>[P]       → [(skill_id, xp), …]
         │       └─ <span class="hi">skill_desc</span>[skill_id] → name
         └─ level = xp_to_level(xp)          (threshold table; relay-cache vendors it)
 
 <span class="ok">joined player view</span>
-  { entity_id, username, region?, signed_in?, last_login?, skills: [{name, level, xp}] }</div>
+  { entity_id, username, region?, signed_in?, last_login?, last_active?, skills: [{name, level, xp}] }</div>
 
     <!-- ========== PATH A ========== -->
     <h2>Path A — HTTP cache (easiest)</h2>
@@ -109,7 +117,7 @@
         <strong>Search by name</strong>
         <code>GET https://relay.bitcraftsync.app/player?name=maple</code>
         returns an array of
-        <code>{ entity_id, username, region, signed_in?, last_login_timestamp? }</code>.
+        <code>{ entity_id, username, region, signed_in?, last_login_timestamp?, last_active_timestamp? }</code>.
         Prefer ≥2 characters.
       </li>
       <li>
@@ -132,7 +140,8 @@
     "entity_id": "1297036692699996362",
     "username": "Maplesugar",
     "region": 14,
-    "signed_in": false
+    "signed_in": false,
+    "last_active_timestamp": 1784779859
   }
 ]
 

@@ -40,6 +40,9 @@ pub const LOCATION_TABLE: &str = "location_state";
 pub const DIMENSION_NETWORK_TABLE: &str = "dimension_network_state";
 pub const PLAYER_USERNAME_TABLE: &str = "player_username_state";
 pub const PLAYER_STATE_TABLE: &str = "player_state";
+/// Last movement/position clock (u64 unix ms). Persists after logout;
+/// public proxy for private `player_timestamp_state`.
+pub const MOBILE_ENTITY_TABLE: &str = "mobile_entity_state";
 /// Live deployables (carts, mounts, caches, boats, …). Prefer v2 — newer
 /// boats (Skiff II+, Clipper, …) exist only here; v1 `deployable_state` is
 /// a stale subset (~2k fewer rows on bc14).
@@ -265,6 +268,12 @@ pub struct PlayerStateCols {
 }
 
 #[derive(Clone, Copy)]
+pub struct MobileEntityCols {
+    pub entity_id: usize,
+    pub timestamp: usize,
+}
+
+#[derive(Clone, Copy)]
 pub struct DeployableCols {
     pub entity_id: usize,
     pub owner_id: usize,
@@ -323,6 +332,7 @@ pub struct ColMaps {
     pub dimension_network: DimensionNetworkCols,
     pub player_username: PlayerUsernameCols,
     pub player_state: PlayerStateCols,
+    pub mobile_entity: MobileEntityCols,
     pub deployable: DeployableCols,
     pub deployable_desc: DeployableDescCols,
     pub player_housing: PlayerHousingCols,
@@ -356,6 +366,7 @@ pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
         dimension_network: resolve_dimension_network_cols(schema)?,
         player_username: resolve_player_username_cols(schema)?,
         player_state: resolve_player_state_cols(schema)?,
+        mobile_entity: resolve_mobile_entity_cols(schema)?,
         deployable: resolve_deployable_cols(schema)?,
         deployable_desc: resolve_deployable_desc_cols(schema)?,
         player_housing: resolve_player_housing_cols(schema)?,
@@ -632,6 +643,14 @@ fn resolve_player_state_cols(schema: &MirroredSchema) -> Result<PlayerStateCols>
     })
 }
 
+fn resolve_mobile_entity_cols(schema: &MirroredSchema) -> Result<MobileEntityCols> {
+    let f = fields_of(schema, MOBILE_ENTITY_TABLE)?;
+    Ok(MobileEntityCols {
+        entity_id: find_field(f, "entity_id", MOBILE_ENTITY_TABLE)?,
+        timestamp: find_field(f, "timestamp", MOBILE_ENTITY_TABLE)?,
+    })
+}
+
 fn resolve_deployable_cols(schema: &MirroredSchema) -> Result<DeployableCols> {
     let f = fields_of(schema, DEPLOYABLE_TABLE)?;
     Ok(DeployableCols {
@@ -798,6 +817,13 @@ pub struct PlayerStateRow {
     pub sign_in_timestamp: i32,
     pub session_start_timestamp: i32,
     pub signed_in: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileEntityRow {
+    pub entity_id: u64,
+    /// Unix milliseconds (`mobile_entity_state.timestamp` is U64).
+    pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1262,6 +1288,19 @@ pub fn decode_player_state_with_fields(
             "player_state.session_start_timestamp",
         )?,
         signed_in: cell_bool(&cells[cols.signed_in], "player_state.signed_in")?,
+    })
+}
+
+pub fn decode_mobile_entity_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: MobileEntityCols,
+    schema: &MirroredSchema,
+) -> Result<MobileEntityRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(MobileEntityRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "mobile_entity.entity_id")?,
+        timestamp_ms: cell_u64(&cells[cols.timestamp], "mobile_entity.timestamp")?,
     })
 }
 

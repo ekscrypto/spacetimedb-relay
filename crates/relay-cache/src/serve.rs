@@ -466,6 +466,7 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
                 "dimension_network": s.dimension_network.len(),
                 "player_username": s.player_username.len(),
                 "player_state": s.player_state.len(),
+                "mobile_entity": s.mobile_entity.len(),
                 "deployable": s.deployable.len(),
                 "deployable_desc": s.deployable_desc.len(),
                 "player_housing": s.player_housing.len(),
@@ -712,6 +713,11 @@ fn respond_claim_members(headers: &HeaderMap, body: pb::ClaimMemberList) -> Resp
                         .unwrap()
                         .insert("last_login_timestamp".into(), json!(ts));
                 }
+                if let Some(ts) = m.last_active_timestamp {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("last_active_timestamp".into(), json!(ts));
+                }
                 obj
             })
             .collect();
@@ -756,6 +762,11 @@ fn respond_claim_citizens(headers: &HeaderMap, body: pb::ClaimCitizens) -> Respo
                     obj.as_object_mut()
                         .unwrap()
                         .insert("last_login_timestamp".into(), json!(ts));
+                }
+                if let Some(ts) = c.last_active_timestamp {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("last_active_timestamp".into(), json!(ts));
                 }
                 obj
             })
@@ -1372,6 +1383,7 @@ async fn claim_members(
                     officer_permission: s.claim_member.officer_permission[i],
                     co_owner_permission: s.claim_member.co_owner_permission[i],
                     last_login_timestamp: s.player_state.last_login_timestamp(player_entity_id),
+                    last_active_timestamp: s.mobile_entity.last_active_timestamp(player_entity_id),
                 }
             })
             .collect();
@@ -1441,6 +1453,7 @@ async fn claim_citizens(
                 user_name: s.claim_member.user_name[i].to_string(),
                 skills,
                 last_login_timestamp: s.player_state.last_login_timestamp(player_id),
+                last_active_timestamp: s.mobile_entity.last_active_timestamp(player_id),
             });
         }
         let skill_names: Vec<pb::SkillNameEntry> = skill_name_map
@@ -1904,6 +1917,9 @@ fn player_to_json(p: &pb::Player) -> Value {
     if let Some(signed_in) = p.signed_in {
         map.insert("signed_in".into(), json!(signed_in));
     }
+    if let Some(ts) = p.last_active_timestamp {
+        map.insert("last_active_timestamp".into(), json!(ts));
+    }
     Value::Object(map)
 }
 
@@ -1928,6 +1944,7 @@ fn player_from_store(
         region: s.region,
         last_login_timestamp,
         signed_in,
+        last_active_timestamp: s.mobile_entity.last_active_timestamp(entity_id),
     }
 }
 
@@ -2287,6 +2304,7 @@ async fn player_inventory(
                 region: 0,
                 last_login_timestamp: None,
                 signed_in: None,
+                last_active_timestamp: None,
             })
         }
     }) else {
@@ -3128,6 +3146,7 @@ mod tests {
             region: 14,
             last_login_timestamp: Some(1_700_000_000),
             signed_in: Some(true),
+            last_active_timestamp: Some(1_700_000_100),
         };
         let decoded = pb::Player::decode(player.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, player);
@@ -3137,5 +3156,9 @@ mod tests {
             1_700_000_000
         );
         assert_eq!(player_to_json(&player)["signed_in"], true);
+        assert_eq!(
+            player_to_json(&player)["last_active_timestamp"],
+            1_700_000_100
+        );
     }
 }
