@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
-use crate::decode::{DeployableKind, OVERWORLD_DIMENSION};
+use crate::decode::{is_player_skill_id, DeployableKind, OVERWORLD_DIMENSION};
 use crate::shard::ShardHandle;
 use crate::store::{Pocket, RegionStore};
 
@@ -1432,6 +1432,9 @@ async fn claim_citizens(
             let mut skills = Vec::new();
             if let Some(stacks) = s.experience.get(player_id) {
                 for &(skill_id, xp) in stacks {
+                    if !is_player_skill_id(skill_id) {
+                        continue;
+                    }
                     let level = crate::xp::xp_to_level(i64::from(xp));
                     if level <= 0 {
                         continue;
@@ -1569,6 +1572,9 @@ async fn player_skills(
         let mut skills = Vec::new();
         if let Some(stacks) = s.experience.get(pk) {
             for &(skill_id, xp) in stacks {
+                if !is_player_skill_id(skill_id) {
+                    continue;
+                }
                 let level = crate::xp::xp_to_level(i64::from(xp));
                 let name = s.skill_desc.name(skill_id).unwrap_or("").to_owned();
                 skills.push(pb::PlayerSkill {

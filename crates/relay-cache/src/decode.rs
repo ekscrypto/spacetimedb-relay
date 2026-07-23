@@ -65,8 +65,16 @@ pub const HEXITE_DEPOSIT_RESOURCE_ID: i32 = 348497955;
 /// Depleted Hexite Deposit — same entity, growing back via `growth_state`.
 pub const DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID: i32 = 854132798;
 
+/// `skill_desc.id` for the recipe-wildcard sentinel named `"ANY"`.
+/// Present on every player's `experience_stacks` at 0 XP; not a real skill.
+pub const SKILL_ID_ANY: i32 = 1;
+
 pub fn is_hexite_resource_id(resource_id: i32) -> bool {
     resource_id == HEXITE_DEPOSIT_RESOURCE_ID || resource_id == DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID
+}
+
+pub fn is_player_skill_id(skill_id: i32) -> bool {
+    skill_id != SKILL_ID_ANY
 }
 
 /// Overworld dimension id used when a building has no interior location row.
@@ -1969,6 +1977,13 @@ fn cell_bool(cell: &Cell, ctx: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn any_sentinel_is_not_a_player_skill() {
+        assert!(!is_player_skill_id(SKILL_ID_ANY));
+        assert!(is_player_skill_id(2)); // Forestry
+        assert!(is_player_skill_id(22)); // Hexite Gathering
+    }
 
     #[test]
     fn decode_optional_location_accepts_bare_and_wrapped() {
