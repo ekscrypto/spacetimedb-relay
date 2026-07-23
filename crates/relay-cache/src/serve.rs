@@ -1404,6 +1404,39 @@ async fn claim_members(
     no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
 }
 
+/// Build citizen skill rows from a region's `experience_state` entry.
+/// Returns `None` when this shard has no experience row for `player_id`
+/// (caller should try the player's home region). Empty `Some` means the
+/// row exists but every stack was filtered out.
+fn citizen_skills_from_store(
+    s: &RegionStore,
+    player_id: u64,
+    skill_name_map: &mut HashMap<i32, String>,
+) -> Option<Vec<pb::CitizenSkill>> {
+    let stacks = s.experience.get(player_id)?;
+    let mut skills = Vec::new();
+    for &(skill_id, xp) in stacks {
+        if !is_player_skill_id(skill_id) {
+            continue;
+        }
+        let level = crate::xp::xp_to_level(i64::from(xp));
+        if level <= 0 {
+            continue;
+        }
+        if let Some(name) = s.skill_desc.name(skill_id) {
+            skill_name_map
+                .entry(skill_id)
+                .or_insert_with(|| name.to_owned());
+        }
+        skills.push(pb::CitizenSkill {
+            skill_id,
+            level,
+            xp: i64::from(xp),
+        });
+    }
+    Some(skills)
+}
+
 async fn claim_citizens(
     State(fleet): State<Fleet>,
     headers: HeaderMap,
@@ -1416,6 +1449,18 @@ async fn claim_citizens(
         )
         .into_response();
     };
+
+    // Claim membership lives on the claim's region shard, but
+    // `experience_state` / `player_state` / `mobile_entity_state` live on
+    // each player's home region. Members who claim-hop (or never live on
+    // the claim region) therefore miss skills if we only read the claim
+    // shard — same data `/player/{id}/skills` finds elsewhere.
+    let mut skill_name_map: HashMap<i32, String> = HashMap::new();
+    let mut claim_summary: Option<pb::ClaimSummary> = None;
+    let mut claim_region = 0u32;
+    let mut citizens: Vec<pb::ClaimCitizen> = Vec::new();
+    let mut needs_home_region: Vec<usize> = Vec::new();
+
     for shard in &fleet.shards {
         let s = shard.store.read();
         if !s.ready {
@@ -1424,33 +1469,22 @@ async fn claim_citizens(
         let Some(claim_slot) = s.claim.find(pk) else {
             continue;
         };
-        let mut skill_name_map: HashMap<i32, String> = HashMap::new();
-        let mut citizens = Vec::new();
+        claim_region = s.region;
+        claim_summary = Some(pb::ClaimSummary {
+            entity_id: pk,
+            name: s.claim.name[claim_slot as usize].to_string(),
+            region: s.region,
+        });
         for &slot in s.claim_member.by_claim(pk) {
             let i = slot as usize;
             let player_id = s.claim_member.player_entity_id[i];
-            let mut skills = Vec::new();
-            if let Some(stacks) = s.experience.get(player_id) {
-                for &(skill_id, xp) in stacks {
-                    if !is_player_skill_id(skill_id) {
-                        continue;
-                    }
-                    let level = crate::xp::xp_to_level(i64::from(xp));
-                    if level <= 0 {
-                        continue;
-                    }
-                    if let Some(name) = s.skill_desc.name(skill_id) {
-                        skill_name_map
-                            .entry(skill_id)
-                            .or_insert_with(|| name.to_owned());
-                    }
-                    skills.push(pb::CitizenSkill {
-                        skill_id,
-                        level,
-                        xp: i64::from(xp),
-                    });
+            let skills = match citizen_skills_from_store(&s, player_id, &mut skill_name_map) {
+                Some(skills) => skills,
+                None => {
+                    needs_home_region.push(citizens.len());
+                    Vec::new()
                 }
-            }
+            };
             citizens.push(pb::ClaimCitizen {
                 entity_id: player_id,
                 user_name: s.claim_member.user_name[i].to_string(),
@@ -1459,24 +1493,48 @@ async fn claim_citizens(
                 last_active_timestamp: s.mobile_entity.last_active_timestamp(player_id),
             });
         }
-        let skill_names: Vec<pb::SkillNameEntry> = skill_name_map
-            .into_iter()
-            .map(|(skill_id, name)| pb::SkillNameEntry { skill_id, name })
-            .collect();
-        return respond_claim_citizens(
-            &headers,
-            pb::ClaimCitizens {
-                claim: Some(pb::ClaimSummary {
-                    entity_id: pk,
-                    name: s.claim.name[claim_slot as usize].to_string(),
-                    region: s.region,
-                }),
-                citizens,
-                skill_names,
-            },
-        );
+        break;
     }
-    no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+
+    let Some(claim) = claim_summary else {
+        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"}))
+            .into_response();
+    };
+
+    for idx in needs_home_region {
+        let player_id = citizens[idx].entity_id;
+        for shard in &fleet.shards {
+            let s = shard.store.read();
+            if !s.ready || s.region == claim_region {
+                continue;
+            }
+            let Some(skills) = citizen_skills_from_store(&s, player_id, &mut skill_name_map) else {
+                continue;
+            };
+            let c = &mut citizens[idx];
+            c.skills = skills;
+            if c.last_login_timestamp.is_none() {
+                c.last_login_timestamp = s.player_state.last_login_timestamp(player_id);
+            }
+            if c.last_active_timestamp.is_none() {
+                c.last_active_timestamp = s.mobile_entity.last_active_timestamp(player_id);
+            }
+            break;
+        }
+    }
+
+    let skill_names: Vec<pb::SkillNameEntry> = skill_name_map
+        .into_iter()
+        .map(|(skill_id, name)| pb::SkillNameEntry { skill_id, name })
+        .collect();
+    respond_claim_citizens(
+        &headers,
+        pb::ClaimCitizens {
+            claim: Some(claim),
+            citizens,
+            skill_names,
+        },
+    )
 }
 
 async fn claim_hexcoins(
