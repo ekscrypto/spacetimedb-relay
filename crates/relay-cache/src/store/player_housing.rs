@@ -47,8 +47,7 @@ impl PlayerHousingSoA {
         self.pk.get(&player_entity_id).copied()
     }
 
-    /// Slot for a housing row keyed by its dimension network (debug / future).
-    #[allow(dead_code)]
+    /// Slot for a housing row keyed by its dimension network.
     pub fn by_network(&self, network_entity_id: u64) -> Option<u32> {
         self.by_network.get(&network_entity_id).copied()
     }

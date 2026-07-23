@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 
 clap = { workspace = true }
 parking_lot = { workspace = true }
+dashmap.workspace = true
 sysinfo = { workspace = true }
 hashbrown = { workspace = true }
 hex = { workspace = true }

@@ -17,6 +17,7 @@
 #   https://relay.bitcraftsync.app/claim?name=...
 #   https://relay.bitcraftsync.app/claim/<id>
 #   https://relay.bitcraftsync.app/claim/<id>/inventory
+#   wss://relay.bitcraftsync.app/claim/<id>/inventory/ws
 #   https://relay.bitcraftsync.app/claim/<id>/members
 #   https://relay.bitcraftsync.app/claim/<id>/citizens
 #   https://relay.bitcraftsync.app/claim/<id>/hexcoins
@@ -24,7 +25,9 @@
 #   https://relay.bitcraftsync.app/player?name=...
 #   https://relay.bitcraftsync.app/player/<id>
 #   https://relay.bitcraftsync.app/player/<id>/inventory
+#   wss://relay.bitcraftsync.app/player/<id>/inventory/ws
 #   https://relay.bitcraftsync.app/player/<id>/housing
+#   wss://relay.bitcraftsync.app/player/<id>/housing/ws
 #   https://relay.bitcraftsync.app/player/<id>/skills
 #   https://relay.bitcraftsync.app/player/<id>/crafts
 #   https://relay.bitcraftsync.app/deposits
@@ -32,6 +35,13 @@
 #   https://relay.bitcraftsync.app/storage-logs?storageId=...
 #   https://relay.bitcraftsync.app/storage-logs?playerId=...
 #   https://relay.bitcraftsync.app/storage-logs?itemId=...&claimId=...
+#
+# Requires the usual Upgrade map in http {} (already present for relay
+# frontends):
+#   map $http_upgrade $connection_upgrade {
+#       default upgrade;
+#       ''      close;
+#   }
 
     # relay-cache (loopback read API)
     location /cache-health {
@@ -56,9 +66,12 @@
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        # Inventory JSON for busy claims can be multi-MB
-        proxy_read_timeout 60s;
-        proxy_send_timeout 60s;
+        # Live inventory WS (/claim/:id/inventory/ws) + large HTTP inventories
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 
     location /player {
@@ -67,8 +80,12 @@
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 60s;
-        proxy_send_timeout 60s;
+        # Live inventory WS (/player/:id/inventory/ws, /housing/ws)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 
     location /deposits {

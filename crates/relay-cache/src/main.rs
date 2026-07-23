@@ -15,13 +15,16 @@
 //!   7. player skills (XP → level)
 //!   8. claim / player crafts (progressive + passive)
 //!   9. Hexite Deposits (neutral claim_state + growth_state)
+//!  10. live WS snapshots for player inventory / housing / claim inventory
 
 mod config;
 mod decode;
 mod discovery;
+mod interest;
 mod serve;
 mod shard;
 mod store;
+mod stream;
 mod wire;
 mod xp;
 
@@ -38,6 +41,7 @@ use url::Url;
 
 use crate::config::Args;
 use crate::discovery::discover_regions;
+use crate::interest::InterestHub;
 use crate::serve::Fleet;
 use crate::shard::spawn_shard;
 
@@ -91,6 +95,8 @@ async fn main() -> Result<()> {
         "schema loaded"
     );
 
+    let interest = InterestHub::new();
+
     let mut shards = Vec::with_capacity(regions.len());
     for r in &regions {
         let bind_url = Url::parse(&format!("ws://127.0.0.1:{}", r.frontend_port))
@@ -101,6 +107,7 @@ async fn main() -> Result<()> {
             bind_url,
             r.dashboard_port,
             schema.clone(),
+            interest.clone(),
             args.debug,
             shutdown_signal_clone(),
         );
@@ -120,6 +127,7 @@ async fn main() -> Result<()> {
     let fleet = Fleet {
         shards,
         memory_pressure,
+        interest,
     };
 
     let http_task = if args.bind.is_empty() {

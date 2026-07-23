@@ -4,7 +4,8 @@
 //!
 //! Success bodies on the data routes negotiate JSON (default) vs
 //! protobuf via `Accept: application/x-protobuf`. `/cache-health` and all
-//! error envelopes stay JSON.
+//! error envelopes stay JSON. Inventory live streams use WebSocket
+//! upgrades under `/player/.../ws` and `/claim/.../ws`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,12 +23,16 @@ use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
 use crate::decode::{is_player_skill_id, DeployableKind, OVERWORLD_DIMENSION};
+use crate::interest::InterestHub;
 use crate::shard::ShardHandle;
 use crate::store::{Pocket, RegionStore};
+use crate::stream;
 
 mod pb {
     include!(concat!(env!("OUT_DIR"), "/relay_cache.rs"));
 }
+
+pub(crate) use pb::*;
 
 const PROTOBUF_MIME: &str = "application/x-protobuf";
 const PROTO_SOURCE_MIME: &str = "text/plain; charset=utf-8";
@@ -51,6 +56,7 @@ pub struct Fleet {
     pub shards: Vec<Arc<ShardHandle>>,
     /// Set by the RSS sampler when resident set approaches the ceiling.
     pub memory_pressure: Arc<AtomicBool>,
+    pub interest: Arc<InterestHub>,
 }
 
 pub async fn serve(
@@ -65,6 +71,10 @@ pub async fn serve(
         .route("/claim", get(claim_by_name))
         .route("/claim/:entity_id", get(claim_by_pk))
         .route("/claim/:entity_id/inventory", get(claim_inventory))
+        .route(
+            "/claim/:entity_id/inventory/ws",
+            get(stream::claim_inventory_ws),
+        )
         .route("/claim/:entity_id/members", get(claim_members))
         .route("/claim/:entity_id/citizens", get(claim_citizens))
         .route("/claim/:entity_id/hexcoins", get(claim_hexcoins))
@@ -72,7 +82,15 @@ pub async fn serve(
         .route("/player", get(player_by_name))
         .route("/player/:entity_id", get(player_by_pk))
         .route("/player/:entity_id/inventory", get(player_inventory))
+        .route(
+            "/player/:entity_id/inventory/ws",
+            get(stream::player_inventory_ws),
+        )
         .route("/player/:entity_id/housing", get(player_housing))
+        .route(
+            "/player/:entity_id/housing/ws",
+            get(stream::player_housing_ws),
+        )
         .route("/player/:entity_id/skills", get(player_skills))
         .route("/player/:entity_id/crafts", get(player_crafts))
         .route("/deposits", get(hexite_deposits))
@@ -237,7 +255,7 @@ fn claim_to_json(c: &pb::Claim) -> Value {
     obj
 }
 
-fn claim_inventory_to_json(inv: &pb::ClaimInventory) -> Value {
+pub(crate) fn claim_inventory_to_json(inv: &pb::ClaimInventory) -> Value {
     let claim_json = inv.claim.as_ref().map_or(Value::Null, |claim| {
         json!({
             "entity_id": claim.entity_id.to_string(),
@@ -486,6 +504,11 @@ async fn cache_health(State(fleet): State<Fleet>) -> impl IntoResponse {
     no_store_json(json!({
         "ready": all_ready,
         "memory_pressure": pressure,
+        "streams": {
+            "active": fleet.interest.active_streams(),
+            "lifetime_notifies": fleet.interest.lifetime_notifies(),
+            "lifetime_pushes": fleet.interest.lifetime_pushes(),
+        },
         "regions": regions,
     }))
 }
@@ -566,6 +589,14 @@ async fn claim_inventory(
         .into_response();
     };
 
+    match build_claim_inventory(&fleet, pk) {
+        Some(inv) => respond_claim_inventory(&headers, inv),
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"}))
+            .into_response(),
+    }
+}
+
+pub(crate) fn build_claim_inventory(fleet: &Fleet, pk: u64) -> Option<pb::ClaimInventory> {
     for shard in &fleet.shards {
         let s = shard.store.read();
         if !s.ready {
@@ -672,20 +703,16 @@ async fn claim_inventory(
         let dimensions: Vec<pb::DimensionGroup> =
             dimensions_out.into_iter().map(|(_, _, v)| v).collect();
 
-        return respond_claim_inventory(
-            &headers,
-            pb::ClaimInventory {
-                claim: Some(pb::ClaimSummary {
-                    entity_id: pk,
-                    name: claim_name.to_owned(),
-                    region,
-                }),
-                dimensions,
-            },
-        );
+        return Some(pb::ClaimInventory {
+            claim: Some(pb::ClaimSummary {
+                entity_id: pk,
+                name: claim_name.to_owned(),
+                region,
+            }),
+            dimensions,
+        });
     }
-
-    no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+    None
 }
 
 const HEXCOIN_ITEM_ID: i32 = 1;
@@ -2012,7 +2039,7 @@ fn player_from_store(
     }
 }
 
-fn player_inventory_to_json(inv: &pb::PlayerInventory) -> Value {
+pub(crate) fn player_inventory_to_json(inv: &pb::PlayerInventory) -> Value {
     let player = inv.player.as_ref().map_or(Value::Null, player_to_json);
     let inventories: Vec<Value> = inv
         .inventories
@@ -2046,7 +2073,7 @@ fn player_inventory_to_json(inv: &pb::PlayerInventory) -> Value {
     })
 }
 
-fn player_housing_to_json(h: &pb::PlayerHousing) -> Value {
+pub(crate) fn player_housing_to_json(h: &pb::PlayerHousing) -> Value {
     let player = h.player.as_ref().map_or(Value::Null, player_to_json);
     let house = match &h.house {
         Some(house) => json!({
@@ -2356,9 +2383,17 @@ async fn player_inventory(
         .into_response();
     };
 
-    let player = find_player(&fleet, pk);
-    let inventories = collect_player_bags(&fleet, pk);
-    let Some(player) = player.or_else(|| {
+    match build_player_inventory(&fleet, pk) {
+        Some(inv) => respond_player_inventory(&headers, inv),
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
+            .into_response(),
+    }
+}
+
+pub(crate) fn build_player_inventory(fleet: &Fleet, pk: u64) -> Option<pb::PlayerInventory> {
+    let player = find_player(fleet, pk);
+    let inventories = collect_player_bags(fleet, pk);
+    let player = player.or_else(|| {
         if inventories.is_empty() {
             None
         } else {
@@ -2371,18 +2406,11 @@ async fn player_inventory(
                 last_active_timestamp: None,
             })
         }
-    }) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-            .into_response();
-    };
-
-    respond_player_inventory(
-        &headers,
-        pb::PlayerInventory {
-            player: Some(player),
-            inventories,
-        },
-    )
+    })?;
+    Some(pb::PlayerInventory {
+        player: Some(player),
+        inventories,
+    })
 }
 
 fn collect_housing_buildings(
@@ -2471,10 +2499,15 @@ async fn player_housing(
         .into_response();
     };
 
-    let Some(player) = find_player(&fleet, pk) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-            .into_response();
-    };
+    match build_player_housing(&fleet, pk) {
+        Some(housing) => respond_player_housing(&headers, housing),
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
+            .into_response(),
+    }
+}
+
+pub(crate) fn build_player_housing(fleet: &Fleet, pk: u64) -> Option<pb::PlayerHousing> {
+    let player = find_player(fleet, pk)?;
 
     // player_housing_state.entity_id == player PK. The table is global
     // (mirrored into every region); region_index selects the shard that
@@ -2498,15 +2531,12 @@ async fn player_housing(
     }
 
     let Some((region_index, entrance_building_id, network_id)) = housing else {
-        return respond_player_housing(
-            &headers,
-            pb::PlayerHousing {
-                status: "noHouse".into(),
-                player: Some(player),
-                house: None,
-                buildings: Vec::new(),
-            },
-        );
+        return Some(pb::PlayerHousing {
+            status: "noHouse".into(),
+            player: Some(player),
+            house: None,
+            buildings: Vec::new(),
+        });
     };
 
     let house_region = u32::from(region_index);
@@ -2525,35 +2555,29 @@ async fn player_housing(
             Some(dim) if dim != 0 => collect_housing_buildings(&s, dim),
             _ => Vec::new(),
         };
-        return respond_player_housing(
-            &headers,
-            pb::PlayerHousing {
-                status: "ok".into(),
-                player: Some(player),
-                house: Some(pb::HouseSummary {
-                    entity_id: entrance_building_id,
-                    name: house_name,
-                    region: house_region,
-                }),
-                buildings,
-            },
-        );
+        return Some(pb::PlayerHousing {
+            status: "ok".into(),
+            player: Some(player),
+            house: Some(pb::HouseSummary {
+                entity_id: entrance_building_id,
+                name: house_name,
+                region: house_region,
+            }),
+            buildings,
+        });
     }
 
     // Housing row exists but the region shard isn't ready yet.
-    respond_player_housing(
-        &headers,
-        pb::PlayerHousing {
-            status: "ok".into(),
-            player: Some(player.clone()),
-            house: Some(pb::HouseSummary {
-                entity_id: entrance_building_id,
-                name: house_display_name(&player.username, "Player Housing", None),
-                region: house_region,
-            }),
-            buildings: Vec::new(),
-        },
-    )
+    Some(pb::PlayerHousing {
+        status: "ok".into(),
+        player: Some(player.clone()),
+        house: Some(pb::HouseSummary {
+            entity_id: entrance_building_id,
+            name: house_display_name(&player.username, "Player Housing", None),
+            region: house_region,
+        }),
+        buildings: Vec::new(),
+    })
 }
 
 #[cfg(test)]

@@ -21,10 +21,11 @@ use crate::decode::{
     CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
     DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE, EXPERIENCE_TABLE,
     GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE, LOCATION_TABLE, MOBILE_ENTITY_TABLE,
-    PASSIVE_CRAFT_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE,
-    PLAYER_USERNAME_TABLE, PROGRESSIVE_ACTION_TABLE, RENT_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE,
-    STORAGE_LOG_TABLE,
+    OVERWORLD_DIMENSION, PASSIVE_CRAFT_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE,
+    PLAYER_STATE_TABLE, PLAYER_USERNAME_TABLE, PROGRESSIVE_ACTION_TABLE, RENT_TABLE,
+    RESOURCE_TABLE, SKILL_DESC_TABLE, STORAGE_LOG_TABLE,
 };
+use crate::interest::{InterestHub, TouchBatch};
 use crate::store::RegionStore;
 use crate::wire;
 
@@ -131,12 +132,14 @@ fn fields_owned(schema: &MirroredSchema, table: &str) -> Result<Vec<MirroredFiel
 }
 
 /// Spawn the reconnect loop for one region. Returns the handle HTTP uses.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_shard(
     region: u32,
     database: String,
     bind_url: Url,
     dashboard_port: u16,
     schema: Arc<MirroredSchema>,
+    interest: Arc<InterestHub>,
     debug_mode: bool,
     mut shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 ) -> Arc<ShardHandle> {
@@ -153,6 +156,7 @@ pub fn spawn_shard(
             dashboard_port,
             schema,
             store,
+            interest,
             debug_mode,
             &mut shutdown,
         )
@@ -177,6 +181,7 @@ async fn run_shard_loop(
     dashboard_port: u16,
     schema: Arc<MirroredSchema>,
     store: Arc<RwLock<RegionStore>>,
+    interest: Arc<InterestHub>,
     debug_mode: bool,
     shutdown: &mut std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 ) -> Result<()> {
@@ -198,7 +203,7 @@ async fn run_shard_loop(
         }
 
         let result = session(
-            region, &database, &bind_url, &schema, &meta, &store, debug_mode, shutdown,
+            region, &database, &bind_url, &schema, &meta, &store, &interest, debug_mode, shutdown,
         )
         .await;
 
@@ -366,6 +371,7 @@ async fn session(
     schema: &MirroredSchema,
     meta: &TableMeta,
     store: &Arc<RwLock<RegionStore>>,
+    interest: &InterestHub,
     debug_mode: bool,
     shutdown: &mut std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 ) -> Result<SessionEnd> {
@@ -408,7 +414,7 @@ async fn session(
     wire::send_subscribe(&mut conn, 1, 1, base_queries, region, BASE_PHASE).await?;
     let (sa_base, base_wire_bytes) =
         wire::expect_subscribe_applied(&mut conn, region, BASE_PHASE, debug_mode, |tu| {
-            apply_transaction_to(&mut building, schema, meta, tu)
+            apply_transaction_to(&mut building, schema, meta, tu, None)
         })
         .await?;
     let mut hexite_ids = collect_hexite_entity_ids(schema, meta, &sa_base)?;
@@ -456,7 +462,7 @@ async fn session(
         wire::send_subscribe(&mut conn, 2, 2, loc_queries, region, HEXITE_PHASE).await?;
         let (sa_loc, loc_wire_bytes) =
             wire::expect_subscribe_applied(&mut conn, region, HEXITE_PHASE, debug_mode, |tu| {
-                apply_transaction_to(&mut building, schema, meta, tu)
+                apply_transaction_to(&mut building, schema, meta, tu, None)
             })
             .await?;
         merge_subscribe_applied(&mut building, schema, meta, &sa_loc)?;
@@ -535,7 +541,9 @@ async fn session(
                 match frame {
                     Ok(frame) => match frame.message {
                         ServerMessage::TransactionUpdate(tu) => {
-                            if let Err(e) = apply_transaction(store, schema, meta, &tu) {
+                            if let Err(e) =
+                                apply_transaction(store, schema, meta, &tu, Some(interest))
+                            {
                                 tracing::warn!(
                                     target: "relay_cache::shard",
                                     region,
@@ -675,7 +683,7 @@ fn merge_subscribe_applied(
             continue;
         }
         let rows: Vec<Bytes> = table.rows.into_iter().collect();
-        apply_rows(store, schema, meta, name, &[], &rows)?;
+        apply_rows(store, schema, meta, name, &[], &rows, None)?;
     }
     for table in sa.rows.tables.iter() {
         let name: &str = table.table.as_ref();
@@ -683,7 +691,7 @@ fn merge_subscribe_applied(
             continue;
         }
         let rows: Vec<Bytes> = table.rows.into_iter().collect();
-        apply_rows(store, schema, meta, name, &[], &rows)?;
+        apply_rows(store, schema, meta, name, &[], &rows, None)?;
     }
     Ok(())
 }
@@ -693,9 +701,18 @@ fn apply_transaction(
     schema: &MirroredSchema,
     meta: &TableMeta,
     tu: &TransactionUpdate,
+    interest: Option<&InterestHub>,
 ) -> Result<()> {
-    let mut guard = store.write();
-    apply_transaction_to(&mut guard, schema, meta, tu)
+    let collect = interest.is_some_and(|h| h.has_subscribers());
+    let mut touches = collect.then(TouchBatch::default);
+    {
+        let mut guard = store.write();
+        apply_transaction_to(&mut guard, schema, meta, tu, touches.as_mut())?;
+    }
+    if let (Some(hub), Some(batch)) = (interest, touches) {
+        batch.flush(hub);
+    }
+    Ok(())
 }
 
 fn apply_transaction_to(
@@ -703,6 +720,7 @@ fn apply_transaction_to(
     schema: &MirroredSchema,
     meta: &TableMeta,
     tu: &TransactionUpdate,
+    mut touches: Option<&mut TouchBatch>,
 ) -> Result<()> {
     for set in tu.query_sets.iter() {
         for table in set.tables.iter() {
@@ -723,7 +741,15 @@ fn apply_transaction_to(
             if deletes.is_empty() && inserts.is_empty() {
                 continue;
             }
-            apply_rows(store, schema, meta, name, &deletes, &inserts)?;
+            apply_rows(
+                store,
+                schema,
+                meta,
+                name,
+                &deletes,
+                &inserts,
+                touches.as_deref_mut(),
+            )?;
         }
     }
     Ok(())
@@ -736,6 +762,7 @@ fn apply_rows(
     table: &str,
     deletes: &[Bytes],
     inserts: &[Bytes],
+    mut touches: Option<&mut TouchBatch>,
 ) -> Result<()> {
     match table {
         CLAIM_TABLE => {
@@ -766,6 +793,9 @@ fn apply_rows(
                     meta.cols.building,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_building(store, decoded.entity_id, decoded.claim_entity_id, t);
+                }
                 store.building.delete(decoded.entity_id);
             }
             for row in inserts {
@@ -775,7 +805,10 @@ fn apply_rows(
                     meta.cols.building,
                     schema,
                 )?;
-                store.building.upsert(decoded);
+                store.building.upsert(decoded.clone());
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_building(store, decoded.entity_id, decoded.claim_entity_id, t);
+                }
             }
         }
         INVENTORY_TABLE => {
@@ -786,6 +819,15 @@ fn apply_rows(
                     meta.cols.inventory,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_inventory(
+                        store,
+                        decoded.entity_id,
+                        decoded.owner_entity_id,
+                        decoded.player_owner_entity_id,
+                        t,
+                    );
+                }
                 store.inventory.delete(decoded.entity_id);
             }
             for row in inserts {
@@ -795,6 +837,15 @@ fn apply_rows(
                     meta.cols.inventory,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_inventory(
+                        store,
+                        decoded.entity_id,
+                        decoded.owner_entity_id,
+                        decoded.player_owner_entity_id,
+                        t,
+                    );
+                }
                 store.inventory.upsert(decoded);
             }
         }
@@ -826,6 +877,9 @@ fn apply_rows(
                     meta.cols.building_nickname,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_building_entity(store, decoded.entity_id, t);
+                }
                 store.building_nickname.delete(decoded.entity_id);
             }
             for row in inserts {
@@ -835,7 +889,10 @@ fn apply_rows(
                     meta.cols.building_nickname,
                     schema,
                 )?;
-                store.building_nickname.upsert(decoded);
+                store.building_nickname.upsert(decoded.clone());
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_building_entity(store, decoded.entity_id, t);
+                }
             }
         }
         LOCATION_TABLE => {
@@ -846,6 +903,9 @@ fn apply_rows(
                     meta.cols.location,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_location_entity(store, decoded.entity_id, decoded.dimension, t);
+                }
                 store.location_dim.delete(decoded.entity_id);
                 store.resource.clear_location(decoded.entity_id);
             }
@@ -865,6 +925,9 @@ fn apply_rows(
                 store
                     .resource
                     .set_location(decoded.entity_id, decoded.x, decoded.z);
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_location_entity(store, decoded.entity_id, decoded.dimension, t);
+                }
             }
         }
         DIMENSION_NETWORK_TABLE => {
@@ -875,6 +938,9 @@ fn apply_rows(
                     meta.cols.dimension_network,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_dimension_network(store, decoded.entity_id, t);
+                }
                 store.dimension_network.delete_by_entity(decoded.entity_id);
             }
             for row in inserts {
@@ -884,7 +950,10 @@ fn apply_rows(
                     meta.cols.dimension_network,
                     schema,
                 )?;
-                store.dimension_network.upsert(decoded);
+                store.dimension_network.upsert(decoded.clone());
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_dimension_network(store, decoded.entity_id, t);
+                }
             }
         }
         PLAYER_USERNAME_TABLE => {
@@ -955,6 +1024,9 @@ fn apply_rows(
                     meta.cols.deployable,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    t.player_inv(decoded.owner_id);
+                }
                 store.deployable.delete(decoded.entity_id);
             }
             for row in inserts {
@@ -964,6 +1036,13 @@ fn apply_rows(
                     meta.cols.deployable,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    // Owner change: notify both old (if overwrite) and new.
+                    if let Some(slot) = store.deployable.find(decoded.entity_id) {
+                        t.player_inv(store.deployable.owner_id[slot as usize]);
+                    }
+                    t.player_inv(decoded.owner_id);
+                }
                 store.deployable.upsert(decoded);
             }
         }
@@ -995,6 +1074,9 @@ fn apply_rows(
                     meta.cols.player_housing,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    t.player_housing(decoded.entity_id);
+                }
                 store.player_housing.delete(decoded.entity_id);
             }
             for row in inserts {
@@ -1004,6 +1086,9 @@ fn apply_rows(
                     meta.cols.player_housing,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    t.player_housing(decoded.entity_id);
+                }
                 store.player_housing.upsert(decoded);
             }
         }
@@ -1328,6 +1413,103 @@ fn apply_rows(
         }
     }
     Ok(())
+}
+
+fn touch_inventory(
+    store: &RegionStore,
+    entity_id: u64,
+    owner: u64,
+    player_owner: u64,
+    touches: &mut TouchBatch,
+) {
+    if player_owner != 0 {
+        touches.player_inv(player_owner);
+    }
+    if owner != 0 {
+        if let Some(d_slot) = store.deployable.find(owner) {
+            touches.player_inv(store.deployable.owner_id[d_slot as usize]);
+        } else if let Some(b_slot) = store.building.find(owner) {
+            touch_building(
+                store,
+                owner,
+                store.building.claim_entity_id[b_slot as usize],
+                touches,
+            );
+        } else {
+            // Body bags: owner_entity_id == player.
+            touches.player_inv(owner);
+        }
+    }
+    if let Some(d_slot) = store.deployable.find(entity_id) {
+        touches.player_inv(store.deployable.owner_id[d_slot as usize]);
+    }
+}
+
+fn touch_building(
+    store: &RegionStore,
+    building_entity_id: u64,
+    claim_entity_id: u64,
+    touches: &mut TouchBatch,
+) {
+    if claim_entity_id != 0 {
+        touches.claim_inv(claim_entity_id);
+    }
+    touch_housing_for_entity(store, building_entity_id, touches);
+}
+
+fn touch_building_entity(store: &RegionStore, building_entity_id: u64, touches: &mut TouchBatch) {
+    if let Some(b_slot) = store.building.find(building_entity_id) {
+        touch_building(
+            store,
+            building_entity_id,
+            store.building.claim_entity_id[b_slot as usize],
+            touches,
+        );
+    } else {
+        touch_housing_for_entity(store, building_entity_id, touches);
+    }
+}
+
+fn touch_housing_for_entity(store: &RegionStore, entity_id: u64, touches: &mut TouchBatch) {
+    let dim = store.location_dim.get_or_overworld(entity_id);
+    if dim == OVERWORLD_DIMENSION {
+        return;
+    }
+    let Some(net) = store.dimension_network.by_entrance_dim(dim) else {
+        return;
+    };
+    if let Some(h_slot) = store.player_housing.by_network(net.entity_id) {
+        touches.player_housing(store.player_housing.entity_id[h_slot as usize]);
+    }
+}
+
+fn touch_location_entity(
+    store: &RegionStore,
+    entity_id: u64,
+    dimension: u32,
+    touches: &mut TouchBatch,
+) {
+    if dimension == OVERWORLD_DIMENSION {
+        return;
+    }
+    if let Some(net) = store.dimension_network.by_entrance_dim(dimension) {
+        if let Some(h_slot) = store.player_housing.by_network(net.entity_id) {
+            touches.player_housing(store.player_housing.entity_id[h_slot as usize]);
+        }
+    }
+    // Building moved into/out of a housing dim — also wake claim if any.
+    if let Some(b_slot) = store.building.find(entity_id) {
+        let claim = store.building.claim_entity_id[b_slot as usize];
+        if claim != 0 {
+            touches.claim_inv(claim);
+        }
+    }
+}
+
+fn touch_dimension_network(store: &RegionStore, network_entity_id: u64, touches: &mut TouchBatch) {
+    if let Some(h_slot) = store.player_housing.by_network(network_entity_id) {
+        touches.player_housing(store.player_housing.entity_id[h_slot as usize]);
+    }
 }
 
 #[cfg(test)]

@@ -3,8 +3,8 @@
 Same-host in-memory read cache over the relay fleet. Subscribes to each
 regional frontend on loopback (`ws://127.0.0.1:<port>`, v2), holds claim /
 building / inventory / player tables in columnar memory, and serves HTTP
-queries on `127.0.0.1:8089` (JSON by default; protobuf via
-`Accept: application/x-protobuf`).
+queries plus live inventory WebSocket streams on `127.0.0.1:8089` (JSON by
+default; protobuf via `Accept: application/x-protobuf` on HTTP).
 
 Replaces the cross-host polling model of `bitcraft-relay-sync` for
 hot-path reads — no 5-minute snapshot staleness, no Postgres round-trip.
@@ -88,6 +88,14 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/inventory
 #        "claim_entity_id", "claim_name",
 #        "items": [ { "item_id", "item_type", "quantity" } ] }, ...
 #    ] }
+
+# Live inventory streams (JSON text frames, same payload as the HTTP
+# routes above). Initial snapshot on connect; further snapshots after
+# coalesced store updates (~75 ms). Same for housing and claim inventory:
+#   ws://127.0.0.1:8089/player/<id>/inventory/ws
+#   ws://127.0.0.1:8089/player/<id>/housing/ws
+#   ws://127.0.0.1:8089/claim/<id>/inventory/ws
+# Active stream counts appear under /cache-health → streams.
 
 # First house for the player (resolved from `player_housing_state`, whose
 # `entity_id` is the player PK). `house.name` is
