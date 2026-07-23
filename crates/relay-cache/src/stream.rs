@@ -24,9 +24,10 @@
 //!   "data": { …same as HTTP… } }
 //! ```
 //! or `{ "type", "entity_id", "error": "…" }` when missing.
+//! Plus `{ "ts": <unix ms UTC> }` every 5s for connectivity detection.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -51,6 +52,8 @@ const MAX_STREAMS: u64 = 512;
 const MAX_BUNDLE_KEYS: usize = 64;
 /// Wait for the first subscribe frame on `/inventory/ws`.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Application-level heartbeat so clients can detect a half-open socket.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn player_inventory_ws(
     ws: WebSocketUpgrade,
@@ -206,9 +209,27 @@ fn tagged_frame(topic: Topic, pk: u64, snap: Option<&Snapshot>) -> serde_json::V
     }
 }
 
+fn heartbeat_frame() -> serde_json::Value {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    json!({ "ts": ts })
+}
+
+fn new_heartbeat_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    // Don't fire immediately — first heartbeat after one full period.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
 async fn run_stream(socket: WebSocket, fleet: Fleet, topic: Topic, pk: u64, initial: Snapshot) {
     let mut sub = fleet.interest.subscribe(topic, pk);
     let (mut sink, mut source) = socket.split();
+    let mut heartbeat = new_heartbeat_interval();
+    // Consume the immediate first tick so the period starts now.
+    heartbeat.tick().await;
 
     tracing::info!(
         target: "relay_cache::stream",
@@ -237,6 +258,11 @@ async fn run_stream(socket: WebSocket, fleet: Fleet, topic: Topic, pk: u64, init
                     Some(Ok(Message::Pong(_))) | Some(Ok(Message::Text(_)))
                     | Some(Ok(Message::Binary(_))) => {}
                     Some(Err(_)) => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                if send_json(&mut sink, &heartbeat_frame()).await.is_err() {
+                    break;
                 }
             }
             changed = sub.receiver().changed() => {
@@ -333,6 +359,9 @@ async fn run_bundle_stream(socket: WebSocket, fleet: Fleet) {
         return;
     }
 
+    let mut heartbeat = new_heartbeat_interval();
+    heartbeat.tick().await;
+
     loop {
         tokio::select! {
             biased;
@@ -385,6 +414,11 @@ async fn run_bundle_stream(socket: WebSocket, fleet: Fleet) {
                     }
                     Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) => {}
                     Some(Err(_)) => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                if send_json(&mut sink, &heartbeat_frame()).await.is_err() {
+                    break;
                 }
             }
             dirty = dirty_rx.recv() => {

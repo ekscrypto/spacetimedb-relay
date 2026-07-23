@@ -101,7 +101,8 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/inventory
 #   { "type": "player_inventory"|"player_housing"|"claim_inventory",
 #     "entity_id": "<id>", "data": {…} }
 # then `{ "type": "subscribed", "count": N }`, then further tagged
-# snapshots on change. A later subscribe frame replaces the set.
+# snapshots on change. Heartbeat every 5s: { "ts": <unix ms UTC> }
+# A later subscribe frame replaces the set.
 # Max 64 entities per subscribe. Active stream counts under /cache-health.
 
 # First house for the player (resolved from `player_housing_state`, whose
