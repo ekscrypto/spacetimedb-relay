@@ -89,13 +89,20 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/inventory
 #        "items": [ { "item_id", "item_type", "quantity" } ] }, ...
 #    ] }
 
-# Live inventory streams (JSON text frames, same payload as the HTTP
-# routes above). Initial snapshot on connect; further snapshots after
-# coalesced store updates (~75 ms). Same for housing and claim inventory:
+# Live inventory streams (JSON text frames). Per-entity:
 #   ws://127.0.0.1:8089/player/<id>/inventory/ws
 #   ws://127.0.0.1:8089/player/<id>/housing/ws
 #   ws://127.0.0.1:8089/claim/<id>/inventory/ws
-# Active stream counts appear under /cache-health → streams.
+# Multiplexed (one socket for a page — preferred):
+#   ws://127.0.0.1:8089/inventory/ws
+# After connect, send:
+#   { "players": ["<id>", …], "houses": ["<id>", …], "claims": ["<id>", …] }
+# Server replies with tagged snapshots
+#   { "type": "player_inventory"|"player_housing"|"claim_inventory",
+#     "entity_id": "<id>", "data": {…} }
+# then `{ "type": "subscribed", "count": N }`, then further tagged
+# snapshots on change. A later subscribe frame replaces the set.
+# Max 64 entities per subscribe. Active stream counts under /cache-health.
 
 # First house for the player (resolved from `player_housing_state`, whose
 # `entity_id` is the player PK). `house.name` is

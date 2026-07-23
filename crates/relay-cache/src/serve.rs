@@ -5,7 +5,8 @@
 //! Success bodies on the data routes negotiate JSON (default) vs
 //! protobuf via `Accept: application/x-protobuf`. `/cache-health` and all
 //! error envelopes stay JSON. Inventory live streams use WebSocket
-//! upgrades under `/player/.../ws` and `/claim/.../ws`.
+//! upgrades under `/player/.../ws`, `/claim/.../ws`, and multiplexed
+//! `/inventory/ws`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -95,6 +96,7 @@ pub async fn serve(
         .route("/player/:entity_id/crafts", get(player_crafts))
         .route("/deposits", get(hexite_deposits))
         .route("/storage-logs", get(storage_logs))
+        .route("/inventory/ws", get(stream::inventory_bundle_ws))
         .layer(CorsLayer::permissive())
         .with_state(fleet);
 

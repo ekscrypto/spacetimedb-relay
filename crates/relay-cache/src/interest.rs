@@ -128,6 +128,10 @@ impl Subscription {
     pub fn receiver(&mut self) -> &mut watch::Receiver<u64> {
         &mut self.rx
     }
+
+    pub fn clone_receiver(&self) -> watch::Receiver<u64> {
+        self.rx.clone()
+    }
 }
 
 impl Drop for Subscription {
