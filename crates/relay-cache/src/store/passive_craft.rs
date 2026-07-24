@@ -38,6 +38,10 @@ impl PassiveCraftSoA {
         self.pk.len()
     }
 
+    pub fn find(&self, entity_id: u64) -> Option<u32> {
+        self.pk.get(&entity_id).copied()
+    }
+
     pub fn by_owner(&self, owner: u64) -> &[u32] {
         self.by_owner.get(&owner).map(Vec::as_slice).unwrap_or(&[])
     }

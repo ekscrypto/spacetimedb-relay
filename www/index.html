@@ -220,7 +220,7 @@
       SpacetimeDB SDK at the addresses below; it&rsquo;s a drop-in
       <code>wss://</code> replacement. New here?
       Start with the <a href="/tutorial/">step-by-step tutorial</a>
-      (connect, subscribe, schema, relay-cache joins), or open the
+      (connect, subscribe, schema, relay-cache joins, live inventory WS), or open the
       <a href="/explorer/">data explorer</a> to browse mirror tables in the browser.
     </p>
     <p class="disclaimer">
@@ -228,6 +228,7 @@
       SpacetimeDB&trade; is a trademark of
       <a href="https://clockworklabs.io" target="_blank" rel="noopener">Clockwork Labs</a>.
       &middot; <a href="/tutorial/">How to use the relay</a>
+      &middot; <a href="/tutorial/inventory-ws.html">Live inventory WebSocket</a>
       &middot; <a href="/explorer/">Data explorer</a>
     </p>
     <div class="health-line">
@@ -408,8 +409,9 @@
           <td>
             Cache readiness (<code>relay-cache</code>): per-region
             <code>ready</code> flag and row counts, plus
-            <code>memory_pressure</code>. Protobuf schema list and raw
-            <code>.proto</code> download for the cache DTOs.
+            <code>memory_pressure</code> and live inventory
+            <code>streams</code> (interest leases / subscribers). Protobuf
+            schema list and raw <code>.proto</code> download for the cache DTOs.
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/cache-health</div>
             <div class="curl"><span class="prompt">$</span> curl https://relay.bitcraftsync.app/proto</div>
             <div class="curl"><span class="prompt">$</span> curl -OJ https://relay.bitcraftsync.app/proto/relay_cache.proto</div>
@@ -512,6 +514,64 @@
             Optional: <code>itemType</code> (<code>Item</code>|<code>Cargo</code>),
             <code>region</code>, <code>limit</code> (newest N)
           </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Section 5: Live inventory WebSocket -->
+  <h2>Live inventory WebSocket</h2>
+  <p class="section-note">
+    Prefer this over polling
+    <code>/player/&lt;id&gt;/inventory</code>,
+    <code>…/housing</code>,
+    <code>/claim/&lt;id&gt;/inventory</code>, and
+    <code>…/crafts</code> when a page needs live bags, house interiors,
+    claim shared storage, and/or crafts. One multiplexed socket;
+    send a JSON subscribe frame after connect. Full protocol, heartbeats,
+    and a browser example:
+    <a href="/tutorial/inventory-ws.html">tutorial step 6</a>.
+  </p>
+  <div class="panel">
+    <table class="endpoints">
+      <thead>
+        <tr>
+          <th>Endpoint</th>
+          <th>Returns</th>
+          <th>Client → server</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="ep">wss://relay.bitcraftsync.app/inventory/ws</span></td>
+          <td>
+            Tagged JSON snapshots matching the HTTP inventory / housing /
+            crafts shapes (<code>type</code> + <code>entity_id</code> +
+            <code>data</code>), then
+            <code>{ "type": "subscribed", "count": N }</code>, then live
+            full snapshots on change (~75&nbsp;ms coalesce). Heartbeat every
+            5s: <code>{ "ts": &lt;unix ms&gt; }</code> (no
+            <code>type</code>). Soft cap ~512 interest leases.
+            <div class="curl"><span class="prompt">$</span> wss://relay.bitcraftsync.app/inventory/ws</div>
+          </td>
+          <td>
+            First text frame (and later replaces):
+            <code>{"players":["…"],"houses":["…"],"claims":["…"],"player_crafts":["…"],"claim_crafts":["…"]}</code>
+            — max 64 keys; prefer string u64 ids.
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <span class="ep">/player/&lt;id&gt;/inventory/ws</span><br>
+            <span class="ep">/player/&lt;id&gt;/housing/ws</span><br>
+            <span class="ep">/claim/&lt;id&gt;/inventory/ws</span>
+          </td>
+          <td>
+            Per-entity streams (same snapshot JSON as HTTP). Kept for
+            single-key debugging; pages should use
+            <code>/inventory/ws</code>.
+          </td>
+          <td>&mdash;</td>
         </tr>
       </tbody>
     </table>

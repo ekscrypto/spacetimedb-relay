@@ -906,24 +906,37 @@ fn craft_to_json(c: &pb::Craft) -> Value {
     })
 }
 
+pub(crate) fn claim_crafts_to_json(body: &pb::ClaimCrafts) -> Value {
+    let claim = body.claim.as_ref().map(|c| {
+        json!({
+            "entity_id": c.entity_id.to_string(),
+            "name": c.name,
+            "region": c.region,
+        })
+    });
+    let crafts: Vec<Value> = body.crafts.iter().map(craft_to_json).collect();
+    json!({
+        "claim": claim,
+        "crafts": crafts,
+        "count": body.count,
+    })
+}
+
+pub(crate) fn player_crafts_to_json(body: &pb::PlayerCrafts) -> Value {
+    let player = body.player.as_ref().map(player_to_json);
+    let crafts: Vec<Value> = body.crafts.iter().map(craft_to_json).collect();
+    json!({
+        "player": player,
+        "crafts": crafts,
+        "count": body.count,
+    })
+}
+
 fn respond_claim_crafts(headers: &HeaderMap, body: pb::ClaimCrafts) -> Response {
     if wants_protobuf(headers) {
         no_store_protobuf(body.encode_to_vec())
     } else {
-        let claim = body.claim.as_ref().map(|c| {
-            json!({
-                "entity_id": c.entity_id.to_string(),
-                "name": c.name,
-                "region": c.region,
-            })
-        });
-        let crafts: Vec<Value> = body.crafts.iter().map(craft_to_json).collect();
-        no_store_json(json!({
-            "claim": claim,
-            "crafts": crafts,
-            "count": body.count,
-        }))
-        .into_response()
+        no_store_json(claim_crafts_to_json(&body)).into_response()
     }
 }
 
@@ -931,14 +944,7 @@ fn respond_player_crafts(headers: &HeaderMap, body: pb::PlayerCrafts) -> Respons
     if wants_protobuf(headers) {
         no_store_protobuf(body.encode_to_vec())
     } else {
-        let player = body.player.as_ref().map(player_to_json);
-        let crafts: Vec<Value> = body.crafts.iter().map(craft_to_json).collect();
-        no_store_json(json!({
-            "player": player,
-            "crafts": crafts,
-            "count": body.count,
-        }))
-        .into_response()
+        no_store_json(player_crafts_to_json(&body)).into_response()
     }
 }
 
@@ -1834,6 +1840,21 @@ async fn claim_crafts(
         )
         .into_response();
     };
+    match build_claim_crafts(&fleet, pk, q.completed) {
+        Some(body) => respond_claim_crafts(&headers, body),
+        None => {
+            no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+        }
+    }
+}
+
+/// Build claim crafts snapshot. `completed` filters like the HTTP query param;
+/// pass `None` for both in-progress and completed (WS path).
+pub(crate) fn build_claim_crafts(
+    fleet: &Fleet,
+    pk: u64,
+    completed: Option<bool>,
+) -> Option<pb::ClaimCrafts> {
     for shard in &fleet.shards {
         let s = shard.store.read();
         if !s.ready {
@@ -1842,22 +1863,19 @@ async fn claim_crafts(
         let Some(claim_slot) = s.claim.find(pk) else {
             continue;
         };
-        let crafts = collect_crafts_at_claim(&s, pk, q.completed);
+        let crafts = collect_crafts_at_claim(&s, pk, completed);
         let count = crafts.len() as i32;
-        return respond_claim_crafts(
-            &headers,
-            pb::ClaimCrafts {
-                claim: Some(pb::ClaimSummary {
-                    entity_id: pk,
-                    name: s.claim.name[claim_slot as usize].to_string(),
-                    region: s.region,
-                }),
-                crafts,
-                count,
-            },
-        );
+        return Some(pb::ClaimCrafts {
+            claim: Some(pb::ClaimSummary {
+                entity_id: pk,
+                name: s.claim.name[claim_slot as usize].to_string(),
+                region: s.region,
+            }),
+            crafts,
+            count,
+        });
     }
-    no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+    None
 }
 
 async fn player_crafts(
@@ -1873,34 +1891,41 @@ async fn player_crafts(
         )
         .into_response();
     };
-    let Some(player) = find_player(&fleet, pk) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-            .into_response();
-    };
+    match build_player_crafts(&fleet, pk, q.completed) {
+        Some(body) => respond_player_crafts(&headers, body),
+        None => {
+            no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
+                .into_response()
+        }
+    }
+}
+
+/// Build player crafts snapshot. `completed` filters like the HTTP query param;
+/// pass `None` for both (WS path).
+pub(crate) fn build_player_crafts(
+    fleet: &Fleet,
+    pk: u64,
+    completed: Option<bool>,
+) -> Option<pb::PlayerCrafts> {
+    let player = find_player(fleet, pk)?;
     for shard in &fleet.shards {
         let s = shard.store.read();
         if !s.ready || s.region != player.region {
             continue;
         }
-        let crafts = collect_crafts_for_player(&s, pk, q.completed);
+        let crafts = collect_crafts_for_player(&s, pk, completed);
         let count = crafts.len() as i32;
-        return respond_player_crafts(
-            &headers,
-            pb::PlayerCrafts {
-                player: Some(player),
-                crafts,
-                count,
-            },
-        );
-    }
-    respond_player_crafts(
-        &headers,
-        pb::PlayerCrafts {
+        return Some(pb::PlayerCrafts {
             player: Some(player),
-            crafts: Vec::new(),
-            count: 0,
-        },
-    )
+            crafts,
+            count,
+        });
+    }
+    Some(pb::PlayerCrafts {
+        player: Some(player),
+        crafts: Vec::new(),
+        count: 0,
+    })
 }
 
 fn dimension_meta(s: &RegionStore, dimension_id: u32) -> (&'static str, Option<pb::Entrance>) {

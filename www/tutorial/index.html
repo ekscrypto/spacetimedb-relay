@@ -23,7 +23,8 @@
       <a href="schema.html">3. Discover schema</a>
       <a href="players.html">4. Extract player data</a>
       <a href="relay-cache.html">5. relay-cache joins</a>
-      <a href="troubleshoot.html">6. If it fails</a>
+      <a href="inventory-ws.html">6. Live inventory WS</a>
+      <a href="troubleshoot.html">7. If it fails</a>
     </nav>
   </aside>
 
@@ -33,8 +34,8 @@
       Step-by-step guide to connecting a SpacetimeDB client to the public
       BitCraft relays, subscribing to tables safely at BitCraft scale,
       reading the schema, extracting real player column values (name, XP,
-      skills), and understanding how <code>relay-cache</code> joins mirrored
-      tables into HTTP endpoints.
+      skills), using <code>relay-cache</code> HTTP joins, and streaming live
+      inventory over one WebSocket.
     </p>
 
     <div class="banner warn">
@@ -69,8 +70,12 @@
         <span class="num">05</span> How relay-cache joins tables
         <span class="desc">Endpoint map + query params, protobuf, <code>/cache-health</code>.</span>
       </a>
+      <a href="inventory-ws.html">
+        <span class="num">06</span> Live inventory WebSocket
+        <span class="desc">One socket for players / houses / claims — subscribe frame, heartbeats.</span>
+      </a>
       <a href="troubleshoot.html">
-        <span class="num">06</span> If it fails
+        <span class="num">07</span> If it fails
         <span class="desc"><code>/health</code> checks, 502, 90s resets, common mistakes.</span>
       </a>
     </div>

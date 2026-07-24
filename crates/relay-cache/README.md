@@ -96,9 +96,11 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/inventory
 # Multiplexed (one socket for a page — preferred):
 #   ws://127.0.0.1:8089/inventory/ws
 # After connect, send:
-#   { "players": ["<id>", …], "houses": ["<id>", …], "claims": ["<id>", …] }
+#   { "players": ["<id>", …], "houses": ["<id>", …], "claims": ["<id>", …],
+#     "player_crafts": ["<id>", …], "claim_crafts": ["<id>", …] }
 # Server replies with tagged snapshots
-#   { "type": "player_inventory"|"player_housing"|"claim_inventory",
+#   { "type": "player_inventory"|"player_housing"|"claim_inventory"
+#            |"player_crafts"|"claim_crafts",
 #     "entity_id": "<id>", "data": {…} }
 # then `{ "type": "subscribed", "count": N }`, then further tagged
 # snapshots on change. Heartbeat every 5s: { "ts": <unix ms UTC> }

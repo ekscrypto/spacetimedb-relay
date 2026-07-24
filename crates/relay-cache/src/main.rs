@@ -16,6 +16,7 @@
 //!   8. claim / player crafts (progressive + passive)
 //!   9. Hexite Deposits (neutral claim_state + growth_state)
 //!  10. live WS snapshots for player inventory / housing / claim inventory
+//!      and claim / player crafts (multiplexed `/inventory/ws`)
 
 mod config;
 mod decode;

@@ -23,7 +23,8 @@
       <a href="schema.html">3. Discover schema</a>
       <a href="players.html">4. Extract player data</a>
       <a href="relay-cache.html">5. relay-cache joins</a>
-      <a href="troubleshoot.html">6. If it fails</a>
+      <a href="inventory-ws.html">6. Live inventory WS</a>
+      <a href="troubleshoot.html">7. If it fails</a>
     </nav>
   </aside>
 
@@ -293,13 +294,14 @@ curl -OJ https://relay.bitcraftsync.app/proto/relay_cache.proto</code></pre>
       Use <code>relay-cache</code> HTTP when you want claim/player/deposit
       views without re-implementing the joins — and when a shared in-memory
       cache on the relay host is acceptable (read-only, eventually consistent
-      with each region’s mirror). Stuck? See
-      <a href="troubleshoot.html">If it fails</a>.
+      with each region’s mirror). For live inventory on a web page, prefer
+      the <a href="inventory-ws.html">multiplexed inventory WebSocket</a>.
+      Stuck? See <a href="troubleshoot.html">If it fails</a>.
     </div>
 
     <div class="next">
       <a href="players.html">← Extract player data</a>
-      <a href="troubleshoot.html">Next: If it fails <span class="muted">/health checks &amp; common errors</span></a>
+      <a href="inventory-ws.html">Next: Live inventory WS <span class="muted">one socket for bags / houses / claims</span></a>
     </div>
   </main>
 </div>

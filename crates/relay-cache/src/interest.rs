@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Interest hub for live inventory WebSocket streams.
+//! Interest hub for live inventory / crafts WebSocket streams.
 //!
 //! Keys are `(Topic, entity_id)`. Shard apply paths call [`InterestHub::notify`]
 //! after mutating rows; WS tasks hold a [`watch::Receiver`] and rebuild
@@ -13,12 +13,14 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::watch;
 
-/// Inventory stream topic — mirrors mats' three HTTP sources.
+/// Stream topic — mirrors HTTP inventory / housing / crafts sources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Topic {
     PlayerInventory,
     PlayerHousing,
     ClaimInventory,
+    PlayerCrafts,
+    ClaimCrafts,
 }
 
 impl Topic {
@@ -27,6 +29,8 @@ impl Topic {
             Topic::PlayerInventory => "player_inventory",
             Topic::PlayerHousing => "player_housing",
             Topic::ClaimInventory => "claim_inventory",
+            Topic::PlayerCrafts => "player_crafts",
+            Topic::ClaimCrafts => "claim_crafts",
         }
     }
 }
@@ -146,6 +150,8 @@ pub struct TouchBatch {
     player_inv: Vec<u64>,
     player_housing: Vec<u64>,
     claim_inv: Vec<u64>,
+    player_crafts: Vec<u64>,
+    claim_crafts: Vec<u64>,
 }
 
 impl TouchBatch {
@@ -167,8 +173,24 @@ impl TouchBatch {
         }
     }
 
+    pub fn player_crafts(&mut self, id: u64) {
+        if id != 0 {
+            self.player_crafts.push(id);
+        }
+    }
+
+    pub fn claim_crafts(&mut self, id: u64) {
+        if id != 0 {
+            self.claim_crafts.push(id);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.player_inv.is_empty() && self.player_housing.is_empty() && self.claim_inv.is_empty()
+        self.player_inv.is_empty()
+            && self.player_housing.is_empty()
+            && self.claim_inv.is_empty()
+            && self.player_crafts.is_empty()
+            && self.claim_crafts.is_empty()
     }
 
     /// Sort+dedup then notify the hub.
@@ -179,6 +201,8 @@ impl TouchBatch {
         dedup_ids(&mut self.player_inv);
         dedup_ids(&mut self.player_housing);
         dedup_ids(&mut self.claim_inv);
+        dedup_ids(&mut self.player_crafts);
+        dedup_ids(&mut self.claim_crafts);
         for id in self.player_inv {
             hub.notify(Topic::PlayerInventory, id);
         }
@@ -187,6 +211,12 @@ impl TouchBatch {
         }
         for id in self.claim_inv {
             hub.notify(Topic::ClaimInventory, id);
+        }
+        for id in self.player_crafts {
+            hub.notify(Topic::PlayerCrafts, id);
+        }
+        for id in self.claim_crafts {
+            hub.notify(Topic::ClaimCrafts, id);
         }
     }
 }

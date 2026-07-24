@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live inventory WebSocket — relay tutorial</title>
+<link rel="stylesheet" href="css/tutorial.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/">&larr; relay.bitcraftsync.app</a>
+    <h1>Tutorial</h1>
+    <div class="nav-group">Tools</div>
+    <nav>
+      <a href="/explorer/">Data explorer</a>
+    </nav>
+    <div class="nav-group">Guide</div>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="connect.html">1. Connect</a>
+      <a href="subscribe.html">2. Subscribe</a>
+      <a href="schema.html">3. Discover schema</a>
+      <a href="players.html">4. Extract player data</a>
+      <a href="relay-cache.html">5. relay-cache joins</a>
+      <a href="inventory-ws.html" class="active">6. Live inventory WS</a>
+      <a href="troubleshoot.html">7. If it fails</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <h1>6. Live inventory WebSocket</h1>
+    <p class="lede">
+      One multiplexed socket streams personal bags, housing interiors, claim
+      shared storage, and crafts as they change — without polling HTTP or
+      opening dozens of connections. Built on the same in-memory joins as the
+      <a href="relay-cache.html">relay-cache HTTP API</a>.
+    </p>
+
+    <div class="banner warn">
+      <b>Preferred endpoint.</b>
+      Use <code>wss://relay.bitcraftsync.app/inventory/ws</code> for pages.
+      Per-entity URLs (<code>/player/&lt;id&gt;/inventory/ws</code>,
+      <code>…/housing/ws</code>, <code>/claim/&lt;id&gt;/inventory/ws</code>)
+      still work but are meant for single-key debugging.
+    </div>
+
+    <h2>Endpoint</h2>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>URL</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">wss://relay.bitcraftsync.app/inventory/ws</td>
+            <td>Public multiplexed stream (JSON text frames).</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Browser <code>WebSocket</code> always upgrades with GET — there is no
+      POST body on connect. Send the subscription as the
+      <strong>first text frame</strong> after <code>onopen</code>.
+    </p>
+
+    <h2>Subscribe (client → server)</h2>
+    <div class="code-panel active">
+<pre><code>{
+  "players": ["1297036692699996362"],
+  "houses":  ["1297036692699996362"],
+  "claims":  ["576460752317570321"],
+  "player_crafts": ["1297036692699996362"],
+  "claim_crafts":  ["576460752317570321"]
+}</code></pre>
+    </div>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Field</th><th>Meaning</th><th>HTTP equivalent</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>players</code></td>
+            <td>Player entity ids → personal bags (pockets, bank, wagon, mounts, …)</td>
+            <td class="mono">GET /player/&lt;id&gt;/inventory</td>
+          </tr>
+          <tr>
+            <td><code>houses</code></td>
+            <td>Player entity ids → housing interiors</td>
+            <td class="mono">GET /player/&lt;id&gt;/housing</td>
+          </tr>
+          <tr>
+            <td><code>claims</code></td>
+            <td>Claim entity ids → shared claim storage (no Town Banks)</td>
+            <td class="mono">GET /claim/&lt;id&gt;/inventory</td>
+          </tr>
+          <tr>
+            <td><code>player_crafts</code></td>
+            <td>Player entity ids → progressive + passive crafts</td>
+            <td class="mono">GET /player/&lt;id&gt;/crafts</td>
+          </tr>
+          <tr>
+            <td><code>claim_crafts</code></td>
+            <td>Claim entity ids → crafts on claim buildings</td>
+            <td class="mono">GET /claim/&lt;id&gt;/crafts</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <ul>
+      <li>Entity ids are <code>u64</code>. Prefer <strong>strings</strong> in JSON (JS <code>Number</code> is unsafe above 2<sup>53</sup>).</li>
+      <li>At least one non-empty list required.</li>
+      <li>Max <strong>64</strong> distinct keys total after dedupe.</li>
+      <li>A later subscribe frame <strong>replaces</strong> the set and re-sends snapshots.</li>
+    </ul>
+    <p>
+      Resolve ids via HTTP first when needed:
+      <code>GET /player?name=…</code>, claim search, or
+      <code>claim_entity_id</code> on player inventory bags.
+    </p>
+
+    <h2>Server → client frames</h2>
+
+    <h3>Initial burst, then ack</h3>
+    <p>One tagged snapshot per subscribed key, then:</p>
+    <div class="code-panel active">
+<pre><code>{ "type": "subscribed", "count": 4 }</code></pre>
+    </div>
+
+    <h3>Snapshot / live update</h3>
+    <div class="code-panel active">
+<pre><code>{
+  "type": "player_inventory",
+  "entity_id": "1297036692699996362",
+  "data": { /* identical to the matching GET JSON */ }
+}</code></pre>
+    </div>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th><code>type</code></th><th><code>data</code> matches</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="mono">player_inventory</td><td class="mono">GET /player/&lt;id&gt;/inventory</td></tr>
+          <tr><td class="mono">player_housing</td><td class="mono">GET /player/&lt;id&gt;/housing</td></tr>
+          <tr><td class="mono">claim_inventory</td><td class="mono">GET /claim/&lt;id&gt;/inventory</td></tr>
+          <tr><td class="mono">player_crafts</td><td class="mono">GET /player/&lt;id&gt;/crafts</td></tr>
+          <tr><td class="mono">claim_crafts</td><td class="mono">GET /claim/&lt;id&gt;/crafts</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Missing entity (still subscribed):
+      <code>{ "type", "entity_id", "error": "player not found" }</code>
+      (or <code>claim not found</code>).
+      After <code>subscribed</code>, further frames are live updates for
+      keys that changed — <strong>full snapshots</strong>, not diffs
+      (coalesced ~75&nbsp;ms server-side).
+    </p>
+
+    <h3>Heartbeat (connectivity)</h3>
+    <p>Every <strong>5 seconds</strong> after subscribe completes:</p>
+    <div class="code-panel active">
+<pre><code>{ "ts": 1753296000123 }</code></pre>
+    </div>
+    <p>
+      Unix time in milliseconds (UTC). No <code>type</code> field —
+      distinguish from inventory frames by <code>ts</code> alone
+      (snapshots always have <code>type</code> + <code>entity_id</code>).
+      Treat ~15&nbsp;s without a heartbeat as a dead connection and reconnect.
+    </p>
+
+    <h3>Errors</h3>
+    <div class="code-panel active">
+<pre><code>{ "error": "…" }</code></pre>
+    </div>
+    <p>Bad JSON, empty subscribe, oversize set, etc. The socket may close afterward.</p>
+
+    <h2>Browser example</h2>
+    <div class="code-panel active" data-lang="js">
+<pre><code>const PLAYER = "1297036692699996362"; // from GET /player?name=…
+const CLAIM = "576460752317570321";
+
+const ws = new WebSocket("wss://relay.bitcraftsync.app/inventory/ws");
+let lastBeat = Date.now();
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({
+    players: [PLAYER],
+    houses: [PLAYER],
+    claims: [CLAIM],
+    player_crafts: [PLAYER],
+    claim_crafts: [CLAIM],
+  }));
+};
+
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.ts != null &amp;&amp; msg.type == null) {
+    lastBeat = Date.now(); // or msg.ts
+    return;
+  }
+  if (msg.type === "subscribed") return; // initial burst done
+  if (msg.error &amp;&amp; !msg.data) {
+    console.error("inventory ws", msg.error);
+    return;
+  }
+  switch (msg.type) {
+    case "player_inventory": /* msg.entity_id, msg.data */ break;
+    case "player_housing": break;
+    case "claim_inventory": break;
+    case "player_crafts": break;
+    case "claim_crafts": break;
+  }
+};
+
+setInterval(() => {
+  if (ws.readyState === WebSocket.OPEN &amp;&amp; Date.now() - lastBeat &gt; 15_000) {
+    ws.close(); // reopen…
+  }
+}, 5_000);</code></pre>
+    </div>
+
+    <h2>UI semantics</h2>
+    <ul>
+      <li>
+        <strong>Player inventory</strong> categories include
+        <code>pockets</code>, <code>toolbelt</code>, <code>wallet</code>,
+        <code>bank</code>, <code>wagon</code>, <code>cache</code>,
+        <code>boat</code>, <code>recovery</code>,
+        <code>deployable</code> (goats / birds / mounts).
+      </li>
+      <li>
+        <strong>Housing</strong> is separate
+        (<code>status</code>: <code>ok</code> | <code>noHouse</code>).
+      </li>
+      <li>
+        <strong>Claim inventory</strong> is shared storage only
+        (no Town Banks), grouped by dimension.
+      </li>
+      <li>
+        <strong>Crafts</strong> unify progressive + passive actions with
+        recipe outputs. The WS always returns both completed and
+        in-progress (filter client-side with <code>completed</code>).
+      </li>
+      <li>
+        Updates can fire with the same aggregate stack counts (internal bag
+        churn); treat each frame as authoritative for that
+        <code>type</code>+<code>entity_id</code>.
+      </li>
+    </ul>
+
+    <h2>Ops</h2>
+    <ul>
+      <li>Soft cap ~512 interest leases fleet-wide; one page with ≤64 keys is fine.</li>
+      <li>
+        <a href="/cache-health"><code>/cache-health</code></a> →
+        <code>streams.{active,lifetime_notifies,lifetime_pushes}</code>.
+      </li>
+      <li>Same public trust model as the HTTP cache (no auth). JSON only on the WS.</li>
+    </ul>
+
+    <div class="next">
+      <a href="relay-cache.html">← relay-cache joins</a>
+      <a href="troubleshoot.html">Next: If it fails <span class="muted">/health checks &amp; common errors</span></a>
+    </div>
+  </main>
+</div>
+<script src="js/tutorial.js"></script>
+</body>
+</html>

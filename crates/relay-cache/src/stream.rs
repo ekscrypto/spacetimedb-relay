@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Live inventory WebSocket streams.
+//! Live inventory / crafts WebSocket streams.
 //!
 //! Per-entity endpoints (still supported):
 //! - `GET /player/:id/inventory/ws`
@@ -10,7 +10,8 @@
 //! Multiplexed page stream (preferred for mats):
 //! - `GET /inventory/ws` — after connect, client sends a subscribe frame:
 //!   ```json
-//!   { "players": ["…"], "houses": ["…"], "claims": ["…"] }
+//!   { "players": ["…"], "houses": ["…"], "claims": ["…"],
+//!     "player_crafts": ["…"], "claim_crafts": ["…"] }
 //!   ```
 //!   Server replies with one tagged snapshot per entity, then pushes
 //!   further tagged snapshots when any subscribed key changes. A later
@@ -19,7 +20,8 @@
 //!
 //! Tagged frame shape:
 //! ```json
-//! { "type": "player_inventory"|"player_housing"|"claim_inventory",
+//! { "type": "player_inventory"|"player_housing"|"claim_inventory"
+//!            |"player_crafts"|"claim_crafts",
 //!   "entity_id": "<u64 string>",
 //!   "data": { …same as HTTP… } }
 //! ```
@@ -41,14 +43,15 @@ use tokio::task::JoinHandle;
 
 use crate::interest::{InterestHub, Subscription, Topic};
 use crate::serve::{
-    build_claim_inventory, build_player_housing, build_player_inventory, claim_inventory_to_json,
+    build_claim_crafts, build_claim_inventory, build_player_crafts, build_player_housing,
+    build_player_inventory, claim_crafts_to_json, claim_inventory_to_json, player_crafts_to_json,
     player_housing_to_json, player_inventory_to_json, Fleet,
 };
 
 const COALESCE: Duration = Duration::from_millis(75);
 /// Soft cap on concurrent interest leases (single-key + multiplexed).
 const MAX_STREAMS: u64 = 512;
-/// Max entities in one multiplexed subscribe (players + houses + claims).
+/// Max entities in one multiplexed subscribe (all topic lists combined).
 const MAX_BUNDLE_KEYS: usize = 64;
 /// Wait for the first subscribe frame on `/inventory/ws`.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -79,7 +82,7 @@ pub async fn claim_inventory_ws(
     upgrade_or_reject(ws, fleet, entity_id, Topic::ClaimInventory).await
 }
 
-/// Multiplexed inventory stream — one WS for many players / houses / claims.
+/// Multiplexed inventory + crafts stream — one WS for many entities.
 pub async fn inventory_bundle_ws(
     ws: WebSocketUpgrade,
     State(fleet): State<Fleet>,
@@ -122,10 +125,14 @@ async fn upgrade_or_reject(
         Topic::PlayerInventory => build_player_inventory(&fleet, pk).map(Snapshot::PlayerInv),
         Topic::PlayerHousing => build_player_housing(&fleet, pk).map(Snapshot::PlayerHousing),
         Topic::ClaimInventory => build_claim_inventory(&fleet, pk).map(Snapshot::ClaimInv),
+        Topic::PlayerCrafts | Topic::ClaimCrafts => {
+            // Per-entity crafts WS not exposed; multiplexed path only.
+            None
+        }
     };
     let Some(initial) = initial else {
         let msg = match topic {
-            Topic::ClaimInventory => "claim not found",
+            Topic::ClaimInventory | Topic::ClaimCrafts => "claim not found",
             _ => "player not found",
         };
         return (StatusCode::NOT_FOUND, axum::Json(json!({"error": msg}))).into_response();
@@ -145,6 +152,12 @@ struct SubscribeMsg {
     /// Claim entity ids for shared claim storage.
     #[serde(default)]
     claims: Vec<EntityId>,
+    /// Player entity ids for crafts (progressive + passive).
+    #[serde(default)]
+    player_crafts: Vec<EntityId>,
+    /// Claim entity ids for crafts at claim buildings.
+    #[serde(default)]
+    claim_crafts: Vec<EntityId>,
 }
 
 /// Accept string or number u64 (JS number is unsafe above 2^53; prefer string).
@@ -168,6 +181,8 @@ enum Snapshot {
     PlayerInv(crate::serve::PlayerInventory),
     PlayerHousing(crate::serve::PlayerHousing),
     ClaimInv(crate::serve::ClaimInventory),
+    PlayerCrafts(crate::serve::PlayerCrafts),
+    ClaimCrafts(crate::serve::ClaimCrafts),
 }
 
 impl Snapshot {
@@ -176,6 +191,8 @@ impl Snapshot {
             Snapshot::PlayerInv(v) => player_inventory_to_json(v),
             Snapshot::PlayerHousing(v) => player_housing_to_json(v),
             Snapshot::ClaimInv(v) => claim_inventory_to_json(v),
+            Snapshot::PlayerCrafts(v) => player_crafts_to_json(v),
+            Snapshot::ClaimCrafts(v) => claim_crafts_to_json(v),
         }
     }
 
@@ -184,6 +201,10 @@ impl Snapshot {
             Topic::PlayerInventory => build_player_inventory(fleet, pk).map(Snapshot::PlayerInv),
             Topic::PlayerHousing => build_player_housing(fleet, pk).map(Snapshot::PlayerHousing),
             Topic::ClaimInventory => build_claim_inventory(fleet, pk).map(Snapshot::ClaimInv),
+            Topic::PlayerCrafts => {
+                build_player_crafts(fleet, pk, None).map(Snapshot::PlayerCrafts)
+            }
+            Topic::ClaimCrafts => build_claim_crafts(fleet, pk, None).map(Snapshot::ClaimCrafts),
         }
     }
 }
@@ -197,7 +218,7 @@ fn tagged_frame(topic: Topic, pk: u64, snap: Option<&Snapshot>) -> serde_json::V
         }),
         None => {
             let err = match topic {
-                Topic::ClaimInventory => "claim not found",
+                Topic::ClaimInventory | Topic::ClaimCrafts => "claim not found",
                 _ => "player not found",
             };
             json!({
@@ -481,10 +502,29 @@ fn parse_subscribe(text: &str) -> Result<Vec<(Topic, u64)>, String> {
             keys.push((Topic::ClaimInventory, pk));
         }
     }
+    for id in &msg.player_crafts {
+        let pk = id
+            .parse()
+            .map_err(|_| "player_crafts entries must be u64 (prefer string)".to_owned())?;
+        if pk != 0 {
+            keys.push((Topic::PlayerCrafts, pk));
+        }
+    }
+    for id in &msg.claim_crafts {
+        let pk = id
+            .parse()
+            .map_err(|_| "claim_crafts entries must be u64 (prefer string)".to_owned())?;
+        if pk != 0 {
+            keys.push((Topic::ClaimCrafts, pk));
+        }
+    }
     keys.sort_unstable_by_key(|(t, id)| (*t as u8, *id));
     keys.dedup();
     if keys.is_empty() {
-        return Err("subscribe requires at least one of players/houses/claims".into());
+        return Err(
+            "subscribe requires at least one of players/houses/claims/player_crafts/claim_crafts"
+                .into(),
+        );
     }
     if keys.len() > MAX_BUNDLE_KEYS {
         return Err(format!(
@@ -574,20 +614,34 @@ mod tests {
 
     #[test]
     fn parse_subscribe_accepts_string_and_number_ids() {
-        let keys = parse_subscribe(r#"{"players":["1","2"],"houses":[1],"claims":["9"]}"#).unwrap();
-        // player 1 appears as both PlayerInventory and PlayerHousing.
+        let keys = parse_subscribe(
+            r#"{"players":["1","2"],"houses":[1],"claims":["9"],"player_crafts":["1"],"claim_crafts":[9]}"#,
+        )
+        .unwrap();
+        // player 1 appears as both PlayerInventory, PlayerHousing, and PlayerCrafts.
         assert!(keys.contains(&(Topic::PlayerInventory, 1)));
         assert!(keys.contains(&(Topic::PlayerInventory, 2)));
         assert!(keys.contains(&(Topic::PlayerHousing, 1)));
         assert!(keys.contains(&(Topic::ClaimInventory, 9)));
-        assert_eq!(keys.len(), 4);
+        assert!(keys.contains(&(Topic::PlayerCrafts, 1)));
+        assert!(keys.contains(&(Topic::ClaimCrafts, 9)));
+        assert_eq!(keys.len(), 6);
+    }
+
+    #[test]
+    fn parse_subscribe_crafts_only() {
+        let keys = parse_subscribe(r#"{"player_crafts":["42"],"claim_crafts":["7"]}"#).unwrap();
+        assert_eq!(
+            keys,
+            vec![(Topic::PlayerCrafts, 42), (Topic::ClaimCrafts, 7)]
+        );
     }
 
     #[test]
     fn parse_subscribe_rejects_empty_and_oversize() {
         assert!(parse_subscribe(r#"{"players":[]}"#).is_err());
         let many: Vec<String> = (1..=65).map(|i| i.to_string()).collect();
-        let body = serde_json::json!({ "players": many });
-        assert!(parse_subscribe(&body.to_string()).is_err());
+        let oversized = format!(r#"{{"players":{}}}"#, serde_json::to_string(&many).unwrap());
+        assert!(parse_subscribe(&oversized).is_err());
     }
 }

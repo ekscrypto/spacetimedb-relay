@@ -1,6 +1,8 @@
 # Inventory WebSocket — agent handoff
 
-Minimal contract for wiring a frontend to live inventory updates via **relay-cache**. Prefer the multiplexed endpoint (one socket per page).
+Minimal contract for wiring a frontend to live inventory **and crafts**
+updates via **relay-cache**. Prefer the multiplexed endpoint (one socket
+per page).
 
 ## Endpoint
 
@@ -10,7 +12,8 @@ wss://relay.bitcraftsync.app/inventory/ws
 
 (Local loopback: `ws://127.0.0.1:8089/inventory/ws`.)
 
-Browser `WebSocket` always uses GET Upgrade — there is no POST body on connect. Send the subscription as the **first text frame** after `onopen`.
+Browser `WebSocket` always uses GET Upgrade — there is no POST body on
+connect. Send the subscription as the **first text frame** after `onopen`.
 
 ## Subscribe (client → server)
 
@@ -18,7 +21,9 @@ Browser `WebSocket` always uses GET Upgrade — there is no POST body on connect
 {
   "players": ["1297036692699996362"],
   "houses":  ["1297036692699996362"],
-  "claims":  ["576460752317570321"]
+  "claims":  ["576460752317570321"],
+  "player_crafts": ["1297036692699996362"],
+  "claim_crafts":  ["576460752317570321"]
 }
 ```
 
@@ -27,12 +32,14 @@ Browser `WebSocket` always uses GET Upgrade — there is no POST body on connect
 | `players` | Player entity ids → personal bags (pockets, bank, wagon, mounts, …) — same payload as `GET /player/:id/inventory` |
 | `houses` | Player entity ids → housing interiors — same as `GET /player/:id/housing` |
 | `claims` | Claim entity ids → shared claim storage — same as `GET /claim/:id/inventory` |
+| `player_crafts` | Player entity ids → progressive + passive crafts — same as `GET /player/:id/crafts` (no `completed` filter; client filters) |
+| `claim_crafts` | Claim entity ids → crafts on claim buildings — same as `GET /claim/:id/crafts` |
 
 Rules:
 
 - Entity ids are **u64**. Prefer **strings** in JSON (JS `Number` is unsafe above 2^53). Numbers are accepted but not recommended.
 - At least one non-empty list required.
-- Max **64** distinct `(type, id)` keys total (player+house+claim combined after dedupe).
+- Max **64** distinct `(type, id)` keys total (all lists combined after dedupe).
 - Sending another subscribe frame **replaces** the previous set (full resync of snapshots for the new set).
 
 Resolve ids first via HTTP if needed:
@@ -65,6 +72,8 @@ One frame per subscribed key, then:
 | `player_inventory` | `GET /player/:id/inventory` |
 | `player_housing` | `GET /player/:id/housing` |
 | `claim_inventory` | `GET /claim/:id/inventory` |
+| `player_crafts` | `GET /player/:id/crafts` (both completed + in-progress) |
+| `claim_crafts` | `GET /claim/:id/crafts` (both completed + in-progress) |
 
 Missing entity (still subscribed):
 
@@ -100,6 +109,7 @@ Protocol / validation errors (e.g. bad JSON, empty subscribe):
 
 ```js
 const PLAYER = "1297036692699996362"; // from /player?name=…
+const CLAIM = "576460752317570321";
 
 const ws = new WebSocket("wss://relay.bitcraftsync.app/inventory/ws");
 let lastBeat = Date.now();
@@ -108,7 +118,9 @@ ws.onopen = () => {
   ws.send(JSON.stringify({
     players: [PLAYER],
     houses: [PLAYER],
-    claims: [/* claim entity ids for this page */],
+    claims: [CLAIM],
+    player_crafts: [PLAYER],
+    claim_crafts: [CLAIM],
   }));
 };
 
@@ -134,6 +146,11 @@ ws.onmessage = (ev) => {
       break;
     case "claim_inventory":
       break;
+    case "player_crafts":
+      // msg.data.crafts — same shape as GET /player/:id/crafts
+      break;
+    case "claim_crafts":
+      break;
   }
 };
 
@@ -151,16 +168,17 @@ setInterval(() => {
 - **Player inventory** categories include `pockets`, `toolbelt`, `wallet`, `bank`, `wagon`, `cache`, `boat`, `recovery`, `deployable` (goats/birds/mounts are `deployable`).
 - **Housing** is separate from player inventory (`status`: `ok` | `noHouse`).
 - **Claim inventory** is shared storage only (no Town Banks); grouped by dimension.
+- **Crafts** unify `progressive_action_state` + `passive_craft_state` with recipe outputs; WS always returns both completed and in-progress (filter client-side with `completed`).
 - Updates can fire with the same aggregate item-stack counts (internal bag churn); treat each frame as authoritative for that `type`+`entity_id`.
 
 ## Caps / ops
 
 - Soft cap ~512 interest leases fleet-wide; one page with ≤64 keys is fine.
 - `/cache-health` → `streams.{active,lifetime_notifies,lifetime_pushes}` for sanity checks.
-- Per-entity URLs still exist (`/player/:id/inventory/ws`, `/housing/ws`, `/claim/:id/inventory/ws`) but prefer `/inventory/ws` for multi-source pages.
+- Per-entity URLs still exist (`/player/:id/inventory/ws`, `/housing/ws`, `/claim/:id/inventory/ws`) but prefer `/inventory/ws` for multi-source pages. There is no per-entity `/crafts/ws`.
 
 ## Out of scope
 
 - Auth (same public trust model as the HTTP cache).
 - Protobuf on the WS (JSON text frames only).
-- Skills / crafts / citizens live streams.
+- Skills / citizens live streams.

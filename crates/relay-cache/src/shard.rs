@@ -1280,6 +1280,14 @@ fn apply_rows(
                     meta.cols.progressive_action,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_craft(
+                        store,
+                        decoded.owner_entity_id,
+                        decoded.building_entity_id,
+                        t,
+                    );
+                }
                 store.progressive_action.delete(decoded.entity_id);
             }
             for row in inserts {
@@ -1289,6 +1297,23 @@ fn apply_rows(
                     meta.cols.progressive_action,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    if let Some(slot) = store.progressive_action.find(decoded.entity_id) {
+                        let i = slot as usize;
+                        touch_craft(
+                            store,
+                            store.progressive_action.owner_entity_id[i],
+                            store.progressive_action.building_entity_id[i],
+                            t,
+                        );
+                    }
+                    touch_craft(
+                        store,
+                        decoded.owner_entity_id,
+                        decoded.building_entity_id,
+                        t,
+                    );
+                }
                 store.progressive_action.upsert(decoded);
             }
         }
@@ -1300,6 +1325,14 @@ fn apply_rows(
                     meta.cols.passive_craft,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    touch_craft(
+                        store,
+                        decoded.owner_entity_id,
+                        decoded.building_entity_id,
+                        t,
+                    );
+                }
                 store.passive_craft.delete(decoded.entity_id);
             }
             for row in inserts {
@@ -1309,6 +1342,23 @@ fn apply_rows(
                     meta.cols.passive_craft,
                     schema,
                 )?;
+                if let Some(t) = touches.as_deref_mut() {
+                    if let Some(slot) = store.passive_craft.find(decoded.entity_id) {
+                        let i = slot as usize;
+                        touch_craft(
+                            store,
+                            store.passive_craft.owner_entity_id[i],
+                            store.passive_craft.building_entity_id[i],
+                            t,
+                        );
+                    }
+                    touch_craft(
+                        store,
+                        decoded.owner_entity_id,
+                        decoded.building_entity_id,
+                        t,
+                    );
+                }
                 store.passive_craft.upsert(decoded);
             }
         }
@@ -1453,8 +1503,21 @@ fn touch_building(
 ) {
     if claim_entity_id != 0 {
         touches.claim_inv(claim_entity_id);
+        touches.claim_crafts(claim_entity_id);
     }
     touch_housing_for_entity(store, building_entity_id, touches);
+}
+
+fn touch_craft(
+    store: &RegionStore,
+    owner_entity_id: u64,
+    building_entity_id: u64,
+    touches: &mut TouchBatch,
+) {
+    touches.player_crafts(owner_entity_id);
+    if let Some(b_slot) = store.building.find(building_entity_id) {
+        touches.claim_crafts(store.building.claim_entity_id[b_slot as usize]);
+    }
 }
 
 fn touch_building_entity(store: &RegionStore, building_entity_id: u64, touches: &mut TouchBatch) {
