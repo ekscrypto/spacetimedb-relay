@@ -545,13 +545,24 @@
         <tr>
           <td><span class="ep">wss://relay.bitcraftsync.app/inventory/ws</span></td>
           <td>
-            Tagged JSON snapshots matching the HTTP inventory / housing /
-            crafts shapes (<code>type</code> + <code>entity_id</code> +
+            Tagged JSON snapshots (<code>type</code> + <code>entity_id</code> +
             <code>data</code>), then
             <code>{ "type": "subscribed", "count": N }</code>, then live
             full snapshots on change (~75&nbsp;ms coalesce). Heartbeat every
             5s: <code>{ "ts": &lt;unix ms&gt; }</code> (no
             <code>type</code>). Soft cap ~512 interest leases.
+            Snapshot <code>type</code> → HTTP equivalent:
+            <code>player_inventory</code> →
+            <code>/player/&lt;id&gt;/inventory</code>;
+            <code>player_housing</code> →
+            <code>…/housing</code>;
+            <code>claim_inventory</code> →
+            <code>/claim/&lt;id&gt;/inventory</code>;
+            <code>player_crafts</code> →
+            <code>/player/&lt;id&gt;/crafts</code>;
+            <code>claim_crafts</code> →
+            <code>/claim/&lt;id&gt;/crafts</code>
+            (crafts always include completed + in-progress; filter client-side).
             <div class="curl"><span class="prompt">$</span> wss://relay.bitcraftsync.app/inventory/ws</div>
           </td>
           <td>
