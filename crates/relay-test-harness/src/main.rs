@@ -403,13 +403,29 @@ async fn run_subscribe_only_v1(
                 );
             }
             v1::ServerMessage::TransactionUpdate(tu) => {
+                let tables: Vec<&str> = match &tu.status {
+                    v1::UpdateStatus::Committed(db) => {
+                        db.tables.iter().map(|t| t.table_name.as_ref()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let n_tables = tables.len();
                 tracing::info!(
                     target: "harness::subscribe-only-v1",
                     reducer = %tu.reducer_call.reducer_name,
                     request_id = tu.reducer_call.request_id,
                     caller_id = %hex::encode(tu.caller_identity.to_byte_array()),
                     args_len = tu.reducer_call.args.len(),
+                    n_tables,
+                    ?tables,
                     "★ FULL v1 TransactionUpdate (rewrite path lit up)"
+                );
+                println!(
+                    "TU reducer={} request_id={} n_tables={} tables={:?}",
+                    tu.reducer_call.reducer_name.as_ref(),
+                    tu.reducer_call.request_id,
+                    n_tables,
+                    tables,
                 );
             }
             v1::ServerMessage::TransactionUpdateLight(tul) => {
