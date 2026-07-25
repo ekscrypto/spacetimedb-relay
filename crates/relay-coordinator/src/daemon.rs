@@ -65,7 +65,8 @@ pub async fn run(
         let health = HealthState::new(unit_dir.clone(), sys.clone());
 
         // Spawn the sources poller (drives the `sources` map) and the
-        // host metrics sampler (drives `system.cpu` / `system.network`).
+        // host metrics sampler (drives `system.cpu` / `system.memory` /
+        // `system.network`).
         // Each task owns its own shutdown future — they exit when the
         // coordinator does.
         {

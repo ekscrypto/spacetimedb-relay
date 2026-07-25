@@ -13,7 +13,7 @@
 //!     "bitcraft-live-14": { ... }
 //!   },
 //!   "schema_count": 14,
-//!   "system": { "cpu": {...}, "network": {...} }
+//!   "system": { "cpu": {...}, "memory": {...}, "network": {...} }
 //! }
 //! ```
 //!
@@ -565,7 +565,8 @@ mod tests {
     #[test]
     fn snapshot_json_shape_matches_index_html_contract() {
         // The page's required fields: top-level sources (object),
-        // system.cpu.load_average.{one,five,fifteen}, and
+        // system.cpu.load_average.{one,five,fifteen},
+        // system.memory.{total,free,available}_bytes, and
         // system.network.bytes_per_sec_{in,out}.
         let sys = SysState::new();
         let state = HealthState::new("/nonexistent", sys);
@@ -576,6 +577,10 @@ mod tests {
         let la = &cpu["load_average"];
         for k in ["one", "five", "fifteen"] {
             assert!(la.get(k).is_some(), "load_average.{k} must be present");
+        }
+        let mem = &snap["system"]["memory"];
+        for k in ["total_bytes", "free_bytes", "available_bytes"] {
+            assert!(mem.get(k).is_some(), "memory.{k} must be present");
         }
         let net = &snap["system"]["network"];
         assert!(net.get("bytes_per_sec_in").is_some());

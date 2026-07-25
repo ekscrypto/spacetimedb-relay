@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: MIT
 
-//! Host-level metrics for the `/health` endpoint: CPU load average and a
-//! rolling network throughput rate.
+//! Host-level metrics for the `/health` endpoint: CPU load average, RAM,
+//! and a rolling network throughput rate.
 //!
-//! Two independent samplers feed [`SysState`]:
+//! Three independent samplers feed [`SysState`]:
 //! - Load average + CPU count: read on each tick from `sysinfo` (the
 //!   kernel keeps the EWMA; we just read it).
+//! - Memory: total / free / available RAM from `sysinfo` each tick.
+//!   `available` is MemAvailable on Linux (reclaimable without swap) —
+//!   the figure operators mean by "free".
 //! - Network rate: a 5-minute sliding-window mean of per-interface byte
 //!   deltas, sampled every `SAMPLE_INTERVAL_SECS` (15s). Loopback and
 //!   virtual bridges are excluded so local relay↔stdb traffic doesn't
 //!   inflate the number.
 //!
 //! This mirrors what the retired BitCraft-Relay's `sys_metrics` module
-//! surfaced. Only Linux is deployed; the code compiles on macOS for
-//! dev but network counters may be empty there.
+//! surfaced (plus memory). Only Linux is deployed; the code compiles on
+//! macOS for dev but network counters may be empty there.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,13 +33,24 @@ pub const WINDOW_SECS: u64 = 300;
 /// How many buckets fit in the window (WINDOW / SAMPLE).
 pub const WINDOW_BUCKETS: usize = (WINDOW_SECS / SAMPLE_INTERVAL_SECS) as usize;
 
-/// Latest observed host CPU + network snapshot, served verbatim under
-/// `/health.system`. All fields are optional-ish: the page degrades
-/// gracefully if any is zero/missing.
+/// Latest observed host CPU + memory + network snapshot, served
+/// verbatim under `/health.system`. All fields are optional-ish: the
+/// page degrades gracefully if any is zero/missing.
 #[derive(Clone, Default, Serialize)]
 pub struct SysSnapshot {
     pub cpu: CpuSnapshot,
+    pub memory: MemSnapshot,
     pub network: NetSnapshot,
+}
+
+/// Host RAM snapshot. Bytes are raw (not KiB); `available_bytes` is the
+/// reclaimable figure (Linux MemAvailable) that the health page shows
+/// as "free".
+#[derive(Clone, Default, Serialize)]
+pub struct MemSnapshot {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub available_bytes: u64,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -85,6 +99,7 @@ impl SysState {
         // "5-min avg" only when window_seconds == 0.
         let initial = SysSnapshot {
             cpu: CpuSnapshot::default(),
+            memory: MemSnapshot::default(),
             network: NetSnapshot {
                 bytes_per_sec_in: 0,
                 bytes_per_sec_out: 0,
@@ -108,7 +123,7 @@ impl SysState {
     }
 
     /// Run the sampler loop until `shutdown` resolves. Samples load
-    /// average + CPU count + NIC byte deltas every
+    /// average + CPU count + RAM + NIC byte deltas every
     /// [`SAMPLE_INTERVAL_SECS`] seconds. Cheap to run; a single
     /// task is enough.
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) {
@@ -134,6 +149,7 @@ impl SysState {
                 _ = &mut shutdown => break,
                 _ = tick.tick() => {
                     sys.refresh_cpu_all();
+                    sys.refresh_memory();
                     nets.refresh(true);
 
                     // Sum byte deltas across all non-loopback interfaces.
@@ -188,8 +204,14 @@ impl SysState {
                         },
                         num_cpus: sys.cpus().len(),
                     };
+                    let memory = MemSnapshot {
+                        total_bytes: sys.total_memory(),
+                        free_bytes: sys.free_memory(),
+                        available_bytes: sys.available_memory(),
+                    };
                     let mut latest = self.inner.latest.lock();
                     latest.cpu = cpu;
+                    latest.memory = memory;
                     latest.network = net;
                 }
             }
@@ -225,6 +247,9 @@ mod tests {
         let snap = s.snapshot();
         assert_eq!(snap.cpu.num_cpus, 0);
         assert_eq!(snap.cpu.load_average.one, 0.0);
+        assert_eq!(snap.memory.total_bytes, 0);
+        assert_eq!(snap.memory.free_bytes, 0);
+        assert_eq!(snap.memory.available_bytes, 0);
         assert_eq!(snap.network.bytes_per_sec_in, 0);
         assert_eq!(snap.network.window_seconds, WINDOW_SECS);
         assert_eq!(snap.network.sample_interval_seconds, SAMPLE_INTERVAL_SECS);
