@@ -80,16 +80,21 @@ class ApplyReducerToleranceTests(unittest.TestCase):
         }
         return codegen.Codegen(schema).run()
 
+    def _apply_rows_helper_body(self, src: str) -> str:
+        start = src.index("fn apply_widget_rows")
+        # helper body ends at the line starting with "}" at col 0.
+        end = src.index("\n}\n", start) + 3
+        return src[start:end]
+
     def _apply_reducer_body(self, src: str) -> str:
         start = src.index("pub fn relay_apply_widget")
-        # reducer body ends at the line starting with "}" at col 0.
         end = src.index("\n}\n", start) + 3
         return src[start:end]
 
     def test_apply_reducer_does_not_call_update(self):
-        """No .update() in the apply reducer — it panics on missing rows."""
-        body = self._apply_reducer_body(self._generate())
-        self.assertNotIn(".update(", body, "relay_apply must not use .update()")
+        """No .update() in the apply helper — it panics on missing rows."""
+        body = self._apply_rows_helper_body(self._generate())
+        self.assertNotIn(".update(", body, "apply_*_rows must not use .update()")
 
     def test_apply_reducer_insert_is_always_delete_plus_insert(self):
         """Every insert must be delete()+insert() — there is a single,
@@ -97,7 +102,7 @@ class ApplyReducerToleranceTests(unittest.TestCase):
         rows. This is panic-proof for any PK type: delete() returns
         bool and never panics whether or not the row existed, and
         insert() then sees a free slot (no errno 12 duplicate)."""
-        body = self._apply_reducer_body(self._generate())
+        body = self._apply_rows_helper_body(self._generate())
         # The insert path: delete immediately followed by insert.
         self.assertIn(
             "ctx.db.widget().id().delete(&new.id);\n"
@@ -118,7 +123,7 @@ class ApplyReducerToleranceTests(unittest.TestCase):
         ~223x/day on relay-global for ability_state / attack_outcome_state
         / action_bar_state etc., which looped the self-healing republish
         path and surfaced downstream as 'no such reducer'."""
-        body = self._apply_reducer_body(self._generate())
+        body = self._apply_rows_helper_body(self._generate())
         # The buggy form was an `else { insert(new) }` with no delete.
         # There must be no insert() reachable without a delete() above it
         # in the same block. Concretely: no `else` insert arm.
@@ -130,9 +135,14 @@ class ApplyReducerToleranceTests(unittest.TestCase):
         cannot panic, so no guard is wanted. Regression guard against
         someone over-correcting by adding a find() (which would break
         on custom/inline PK types lacking FilterableValue)."""
-        body = self._apply_reducer_body(self._generate())
+        body = self._apply_rows_helper_body(self._generate())
         self.assertIn(".delete(&old.id);", body)
         self.assertNotIn(".find(", body)
+
+    def test_apply_reducer_delegates_to_rows_helper(self):
+        """Per-table relay_apply_* is a thin writer-gated wrapper."""
+        body = self._apply_reducer_body(self._generate())
+        self.assertIn("apply_widget_rows(ctx, deletes, inserts)", body)
 
 
 class ReducerNameManglingTests(unittest.TestCase):
@@ -238,20 +248,79 @@ class InsertOnlyApplyReducerTests(unittest.TestCase):
         self.assertIn("pub fn relay_apply_tag(", src)
 
     def test_no_pk_apply_reducer_is_insert_only(self):
-        """The insert-only apply reducer must insert all inserts and
+        """The insert-only apply helper must insert all inserts and
         drop deletes (no safe delete path without a PK index)."""
-        start = self._generate_no_pk().index("pub fn relay_apply_tag")
-        body = self._generate_no_pk()[start:start + 600]
-        # accepts the same (upstream, deletes, inserts) signature as PK tables
+        src = self._generate_no_pk()
+        start = src.index("fn apply_tag_rows")
+        body = src[start:start + 600]
         self.assertIn("deletes: Vec<Vec<u8>>", body)
         self.assertIn("inserts: Vec<Vec<u8>>", body)
-        # inserts everything, drops deletes
         self.assertIn("for b in &inserts", body)
         self.assertIn("ctx.db.tag().insert(r);", body)
-        self.assertIn("let _ = (upstream, deletes);", body)
-        # no update/delete-by-pk (none possible without PK index)
+        self.assertIn("let _ = deletes;", body)
         self.assertNotIn(".update(", body)
         self.assertNotIn(".delete(&", body)
+
+
+class ApplyTxReducerTests(unittest.TestCase):
+    """Live multi-table TransactionUpdates go through relay_apply_tx."""
+
+    def _generate_two_tables(self) -> str:
+        elements_a = [
+            {"name": {"some": "id"}, "algebraic_type": {"U64": []}},
+        ]
+        elements_b = [
+            {"name": {"some": "label"}, "algebraic_type": {"String": []}},
+        ]
+        # Two product types so each table has its own row layout.
+        typespace = {
+            "types": [
+                {"Product": {"elements": elements_a}},
+                {"Product": {"elements": elements_b}},
+            ]
+        }
+        schema = {
+            "typespace": typespace,
+            "tables": [
+                _table("sell_order_state", elements_a, pk_cols=[0], product_ref=0),
+                _table("closed_listing_state", elements_b, pk_cols=[], product_ref=1),
+            ],
+            "reducers": [],
+            "types": [],
+            "misc_exports": [],
+            "row_level_security": [],
+        }
+        return codegen.Codegen(schema).run()
+
+    def test_emits_table_op_struct(self):
+        src = self._generate_two_tables()
+        self.assertIn("pub struct TableOp {", src)
+        self.assertIn("pub table: String,", src)
+        self.assertIn("pub deletes: Vec<Vec<u8>>,", src)
+        self.assertIn("pub inserts: Vec<Vec<u8>>,", src)
+
+    def test_emits_relay_apply_tx(self):
+        src = self._generate_two_tables()
+        self.assertIn(
+            '#[spacetimedb::reducer(name = "relay_apply_tx")]',
+            src,
+        )
+        self.assertIn("pub fn relay_apply_tx(", src)
+        self.assertIn("ops: Vec<TableOp>,", src)
+
+    def test_apply_tx_match_arms_cover_all_tables(self):
+        src = self._generate_two_tables()
+        start = src.index("pub fn relay_apply_tx")
+        body = src[start:]
+        self.assertIn(
+            '"sell_order_state" => apply_sell_order_state_rows(ctx, op.deletes, op.inserts)?,',
+            body,
+        )
+        self.assertIn(
+            '"closed_listing_state" => apply_closed_listing_state_rows(ctx, op.deletes, op.inserts)?,',
+            body,
+        )
+        self.assertIn("relay_apply_tx: unknown table", body)
 
 
 if __name__ == "__main__":

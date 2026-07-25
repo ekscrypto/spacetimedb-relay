@@ -84,6 +84,16 @@ pub struct UpstreamReducerInfo {
     pub request_id: u32,
     pub args: Vec<u8>,
 }
+
+/// One table's deletes+inserts inside a multi-table `relay_apply_tx`.
+/// Structurally identical to `relay_protocol::TableOp` so the driver
+/// and wasm module share a BSATN layout.
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct TableOp {
+    pub table: String,
+    pub deletes: Vec<Vec<u8>>,
+    pub inserts: Vec<Vec<u8>>,
+}
 """
 
 RUST_KEYWORDS = {
@@ -138,6 +148,9 @@ class Codegen:
         self.inline_src: list[str] = []
         # Per-table struct + reducer source.
         self.table_src: list[str] = []
+        # (upstream_name, rust_name) for every successfully emitted table —
+        # drives the match arms in `relay_apply_tx`.
+        self.apply_tables: list[tuple[str, str]] = []
         # Track whether a table's primary_key indices reference fields that
         # we successfully mapped (otherwise drop the #[primary_key] attr).
         self.warnings: list[str] = []
@@ -382,21 +395,17 @@ class Codegen:
                 f"    Ok(())",
                 f"}}",
                 "",
-                # Batched apply: pairs deletes and inserts by primary key
-                # in a single transaction, so downstream subscribers see one
-                # atomic notification per upstream TableUpdate. Linear scan
-                # over deletes is fine here — TableUpdates are typically
-                # small (initial subscribe-applied is pure-insert, no
-                # pairing work).
-                f"#[spacetimedb::reducer(name = \"relay_apply_{rust_name}\")]",
-                f"pub fn relay_apply_{rust_name}(",
+                # Shared row-apply helper used by both relay_apply_<table>
+                # (SubscribeApplied / oversized fallback) and relay_apply_tx
+                # (live multi-table TransactionUpdate). Pairs deletes and
+                # inserts by primary key so subscribers see one atomic
+                # notification per TableUpdate. Linear scan over deletes is
+                # fine — TableUpdates are typically small.
+                f"fn apply_{rust_name}_rows(",
                 f"    ctx: &ReducerContext,",
-                f"    upstream: Option<UpstreamReducerInfo>,",
                 f"    deletes: Vec<Vec<u8>>,",
                 f"    inserts: Vec<Vec<u8>>,",
                 f") -> Result<(), Box<str>> {{",
-                f"    let _ = upstream;",
-                f"    assert_writer(ctx)?;",
                 f"    let mut old_rows: Vec<{struct_name}> = Vec::with_capacity(deletes.len());",
                 f"    for b in &deletes {{",
                 f"        old_rows.push(",
@@ -439,6 +448,18 @@ class Codegen:
                 f"        ctx.db.{rust_name}().{pk_field_name}().delete(&old.{pk_field_name});",
                 f"    }}",
                 f"    Ok(())",
+                f"}}",
+                "",
+                f"#[spacetimedb::reducer(name = \"relay_apply_{rust_name}\")]",
+                f"pub fn relay_apply_{rust_name}(",
+                f"    ctx: &ReducerContext,",
+                f"    upstream: Option<UpstreamReducerInfo>,",
+                f"    deletes: Vec<Vec<u8>>,",
+                f"    inserts: Vec<Vec<u8>>,",
+                f") -> Result<(), Box<str>> {{",
+                f"    let _ = upstream;",
+                f"    assert_writer(ctx)?;",
+                f"    apply_{rust_name}_rows(ctx, deletes, inserts)",
                 f"}}\n",
             ])
         else:
@@ -456,6 +477,20 @@ class Codegen:
             # typically low-churn descriptors/state.
             delete_update_apply += "\n".join([
                 "",
+                f"fn apply_{rust_name}_rows(",
+                f"    ctx: &ReducerContext,",
+                f"    deletes: Vec<Vec<u8>>,",
+                f"    inserts: Vec<Vec<u8>>,",
+                f") -> Result<(), Box<str>> {{",
+                f"    let _ = deletes;",
+                f"    for b in &inserts {{",
+                f"        let r: {struct_name} = spacetimedb::sats::bsatn::from_slice(b)",
+                f"            .map_err(|e| format!(\"bsatn decode {rust_name} insert: {{e}}\").into_boxed_str())?;",
+                f"        ctx.db.{rust_name}().insert(r);",
+                f"    }}",
+                f"    Ok(())",
+                f"}}",
+                "",
                 f"#[spacetimedb::reducer(name = \"relay_apply_{rust_name}\")]",
                 f"pub fn relay_apply_{rust_name}(",
                 f"    ctx: &ReducerContext,",
@@ -463,18 +498,49 @@ class Codegen:
                 f"    deletes: Vec<Vec<u8>>,",
                 f"    inserts: Vec<Vec<u8>>,",
                 f") -> Result<(), Box<str>> {{",
-                f"    let _ = (upstream, deletes);",
+                f"    let _ = upstream;",
                 f"    assert_writer(ctx)?;",
-                f"    for b in &inserts {{",
-                f"        let r: {struct_name} = spacetimedb::sats::bsatn::from_slice(b)",
-                f"            .map_err(|e| format!(\"bsatn decode {rust_name} insert: {{e}}\").into_boxed_str())?;",
-                f"        ctx.db.{rust_name}().insert(r);",
-                f"    }}",
-                f"    Ok(())",
+                f"    apply_{rust_name}_rows(ctx, deletes, inserts)",
                 f"}}\n",
             ])
 
+        self.apply_tables.append((upstream_name, rust_name))
         return "\n".join(lines) + "\n" + insert_reducer + delete_update_apply
+
+    def _emit_apply_tx(self) -> str:
+        """One CallReducer that applies every table from a live upstream TU."""
+        if not self.apply_tables:
+            return ""
+        arms = []
+        for upstream_name, rust_name in self.apply_tables:
+            arms.append(
+                f'            "{upstream_name}" => apply_{rust_name}_rows(ctx, op.deletes, op.inserts)?,'
+            )
+        arms.append(
+            '            other => {\n'
+            '                return Err(\n'
+            '                    format!("relay_apply_tx: unknown table {other}").into_boxed_str()\n'
+            '                );\n'
+            '            }'
+        )
+        return "\n".join([
+            "",
+            "#[spacetimedb::reducer(name = \"relay_apply_tx\")]",
+            "pub fn relay_apply_tx(",
+            "    ctx: &ReducerContext,",
+            "    upstream: Option<UpstreamReducerInfo>,",
+            "    ops: Vec<TableOp>,",
+            ") -> Result<(), Box<str>> {",
+            "    let _ = upstream;",
+            "    assert_writer(ctx)?;",
+            "    for op in ops {",
+            "        match op.table.as_str() {",
+            *arms,
+            "        }",
+            "    }",
+            "    Ok(())",
+            "}\n",
+        ])
 
     def run(self, only: list[str] | None = None) -> str:
         wanted = set(only) if only else None
@@ -504,6 +570,7 @@ class Codegen:
         out.extend(self.inline_src)
         # Tables + reducers.
         out.extend(self.table_src)
+        out.append(self._emit_apply_tx())
         return "\n".join(out)
 
 

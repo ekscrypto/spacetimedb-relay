@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 
 //! Replays upstream-decoded TableUpdates onto a local SpacetimeDB by
-//! invoking the codegen'd `relay_apply_<table>(deletes, inserts)` reducers.
+//! invoking the codegen'd `relay_apply_<table>(deletes, inserts)` reducers
+//! (SubscribeApplied / oversized fallback) or `relay_apply_tx(ops)` for
+//! live multi-table TransactionUpdates.
 //!
 //! Pairing of deletes with inserts (i.e. emitting an atomic update when
 //! the same primary key appears in both) is performed inside the wasm
-//! module — the driver just hands over the row lists. That keeps the
-//! wire shape symmetric (one `relay_apply` per table per call) and
-//! preserves single-transaction atomicity from the perspective of
-//! downstream subscribers reading the local SpacetimeDB.
+//! module — the driver just hands over the row lists. Live TUs that fit
+//! the size budget go through one `relay_apply_tx` CallReducer so
+//! downstream subscribers see a single multi-table transaction.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use bytes::Bytes;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use http::header::{HeaderName, HeaderValue, AUTHORIZATION};
-pub use relay_protocol::UpstreamReducerMeta;
+pub use relay_protocol::{TableOp, UpstreamReducerMeta};
 use spacetimedb_client_api_messages::websocket::v2::{
     CallReducer, CallReducerFlags, ClientMessage, ReducerOutcome, ServerMessage,
 };
@@ -268,6 +269,66 @@ impl MirrorDriver {
             stats.inserts += inserts_chunk.len() as u64;
             self.send_call_with_meta(&reducer, &args, upstream).await?;
         }
+        Ok(stats)
+    }
+
+    /// Apply every table from one live upstream `TransactionUpdate` in a
+    /// single local transaction via `relay_apply_tx`.
+    ///
+    /// When the total row count or payload bytes exceed the driver's
+    /// budgets, falls back to per-table [`Self::apply`] (non-atomic across
+    /// tables) and logs a warning — oversized live TUs are rare compared
+    /// to the SubscribeApplied firehose.
+    pub async fn apply_tx(
+        &mut self,
+        upstream: Option<&UpstreamReducerMeta>,
+        ops: Vec<(String, Vec<Bytes>, Vec<Bytes>)>,
+    ) -> Result<ApplyStats, DriverError> {
+        if ops.is_empty() {
+            return Ok(ApplyStats::default());
+        }
+
+        let mut total_rows = 0usize;
+        let mut total_bytes = 0usize;
+        for (_, deletes, inserts) in &ops {
+            total_rows += deletes.len() + inserts.len();
+            total_bytes += deletes.iter().map(|b| b.len()).sum::<usize>();
+            total_bytes += inserts.iter().map(|b| b.len()).sum::<usize>();
+        }
+
+        if total_rows > self.max_rows_per_apply || total_bytes > self.max_bytes_per_apply {
+            tracing::warn!(
+                target: "relay::mirror_driver",
+                n_tables = ops.len(),
+                total_rows,
+                total_bytes,
+                max_rows = self.max_rows_per_apply,
+                max_bytes = self.max_bytes_per_apply,
+                "relay_apply_tx_fallback: live TU exceeds budget; applying per-table"
+            );
+            let mut stats = ApplyStats::default();
+            for (table, deletes, inserts) in ops {
+                let s = self.apply(&table, upstream, deletes, inserts).await?;
+                stats.calls += s.calls;
+                stats.bytes_sent += s.bytes_sent;
+                stats.deletes += s.deletes;
+                stats.inserts += s.inserts;
+            }
+            return Ok(stats);
+        }
+
+        let args = encode_apply_tx_args(upstream, &ops);
+        let mut stats = ApplyStats {
+            calls: 1,
+            bytes_sent: args.len() as u64,
+            ..ApplyStats::default()
+        };
+        for (_, deletes, inserts) in &ops {
+            stats.deletes += deletes.len() as u64;
+            stats.inserts += inserts.len() as u64;
+        }
+        self.send_call_with_meta("relay_apply_tx", &args, upstream)
+            .await?;
         Ok(stats)
     }
 
@@ -616,6 +677,41 @@ fn push_vec_vec_u8(buf: &mut Vec<u8>, rows: &[Bytes]) {
     }
 }
 
+/// Encode the BSATN body for
+/// `relay_apply_tx(upstream: Option<UpstreamReducerInfo>, ops: Vec<TableOp>)`.
+///
+/// Leading `Option<meta>` matches [`encode_apply_args`] so the frontend's
+/// `extract_upstream_meta` can still read provenance from a full local TU.
+fn encode_apply_tx_args(
+    upstream: Option<&UpstreamReducerMeta>,
+    ops: &[(String, Vec<Bytes>, Vec<Bytes>)],
+) -> Vec<u8> {
+    let table_ops: Vec<TableOp> = ops
+        .iter()
+        .map(|(table, deletes, inserts)| TableOp {
+            table: table.clone(),
+            deletes: deletes.iter().map(|b| b.to_vec()).collect(),
+            inserts: inserts.iter().map(|b| b.to_vec()).collect(),
+        })
+        .collect();
+
+    let mut buf = Vec::new();
+    match upstream {
+        Some(meta) => {
+            buf.push(0);
+            let meta_bytes =
+                bsatn::to_vec(meta).expect("UpstreamReducerMeta BSATN encode is infallible");
+            buf.extend_from_slice(&meta_bytes);
+        }
+        None => {
+            buf.push(1);
+        }
+    }
+    let ops_bytes = bsatn::to_vec(&table_ops).expect("TableOp Vec BSATN encode is infallible");
+    buf.extend_from_slice(&ops_bytes);
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,5 +907,56 @@ mod tests {
         let args_len = u32::from_le_bytes(input[p..p + 4].try_into().unwrap()) as usize;
         p += 4 + args_len;
         p
+    }
+
+    #[test]
+    fn encode_apply_tx_args_none_round_trips_ops() {
+        let ops = vec![
+            (
+                "sell_order_state".to_string(),
+                vec![Bytes::from_static(&[0x01])],
+                vec![Bytes::from_static(&[0x02, 0x03])],
+            ),
+            (
+                "closed_listing_state".to_string(),
+                Vec::new(),
+                vec![Bytes::from_static(&[0x04])],
+            ),
+        ];
+        let buf = encode_apply_tx_args(None, &ops);
+        assert_eq!(buf[0], 0x01); // None
+        let decoded: Vec<TableOp> = bsatn::from_slice(&buf[1..]).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].table, "sell_order_state");
+        assert_eq!(decoded[0].deletes, vec![vec![0x01]]);
+        assert_eq!(decoded[0].inserts, vec![vec![0x02, 0x03]]);
+        assert_eq!(decoded[1].table, "closed_listing_state");
+        assert!(decoded[1].deletes.is_empty());
+        assert_eq!(decoded[1].inserts, vec![vec![0x04]]);
+    }
+
+    #[test]
+    fn encode_apply_tx_args_some_meta_prefix_matches_apply() {
+        let meta = UpstreamReducerMeta {
+            reducer_name: "place_sell".into(),
+            caller_identity: relay_protocol::lib::Identity::ZERO,
+            caller_connection_id: relay_protocol::lib::ConnectionId::ZERO,
+            timestamp: relay_protocol::lib::Timestamp::UNIX_EPOCH,
+            request_id: 99,
+            args: b"args".to_vec(),
+        };
+        let ops = vec![(
+            "t".to_string(),
+            Vec::new(),
+            vec![Bytes::from_static(&[0xAA])],
+        )];
+        let buf = encode_apply_tx_args(Some(&meta), &ops);
+        assert_eq!(buf[0], 0x00);
+        let (decoded, consumed) = bsatn_decode_meta(&buf[1..]);
+        assert_eq!(decoded.reducer_name, "place_sell");
+        assert_eq!(decoded.request_id, 99);
+        let table_ops: Vec<TableOp> = bsatn::from_slice(&buf[1 + consumed..]).unwrap();
+        assert_eq!(table_ops.len(), 1);
+        assert_eq!(table_ops[0].table, "t");
     }
 }

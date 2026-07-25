@@ -54,6 +54,19 @@ pub struct UpstreamReducerMeta {
     pub args: Vec<u8>,
 }
 
+/// One table's deletes+inserts inside a multi-table `relay_apply_tx`.
+///
+/// Structurally identical to the wasm-side `TableOp` emitted by
+/// `tools/codegen.py` so BSATN layouts match across the driver and
+/// mirror module.
+#[derive(Clone, Debug, sats::SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct TableOp {
+    pub table: String,
+    pub deletes: Vec<Vec<u8>>,
+    pub inserts: Vec<Vec<u8>>,
+}
+
 pub mod tags {
     pub const CLIENT_SUBSCRIBE: u8 = 0x00;
     pub const CLIENT_UNSUBSCRIBE: u8 = 0x01;

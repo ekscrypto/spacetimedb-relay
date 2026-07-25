@@ -11,8 +11,8 @@
 //!   caller_connection_id = <relay's local-stdb conn id>,
 //!   timestamp            = <when the local reducer ran>,
 //!   reducer_call = ReducerCallInfo {
-//!     reducer_name = "relay_apply_<table>",
-//!     args = BSATN([ Some(UpstreamReducerMeta), deletes, inserts ]),
+//!     reducer_name = "relay_apply_<table>" | "relay_apply_tx",
+//!     args = BSATN([ Some(UpstreamReducerMeta), ... ]),
 //!     ...
 //!   },
 //!   status: Committed(DatabaseUpdate { tables: [...] }),
@@ -33,13 +33,14 @@
 //!     request_id   = meta.request_id,
 //!     reducer_id   = unchanged (we don't have the upstream's id),
 //!   },
-//!   status: <unchanged: still the rows from upstream>,
+//!   status: <unchanged: rows from the local apply — one or more tables>,
 //!   ...
 //! }
 //! ```
 //!
 //! so a downstream v1 client sees a TransactionUpdate effectively
-//! identical to the one the upstream would have sent.
+//! identical to the one the upstream would have sent (including
+//! multi-table query sets when the live path used `relay_apply_tx`).
 //!
 //! The rewrite is a no-op for any other message tag, for non-Committed
 //! transactions, and for `reducer_name`s that aren't `relay_apply_*`
@@ -54,10 +55,10 @@ use thiserror::Error;
 
 use crate::codec::{self, FrameError};
 
-/// Reducer-name prefix the relay-mirror-driver uses for every per-table
-/// apply. We rewrite only frames whose reducer matches this prefix —
-/// other reducer calls (e.g. `relay_bind_writer`) on the local stdb are
-/// internal and pass through untouched.
+/// Reducer-name prefix for mirror apply CallReducers (`relay_apply_<table>`
+/// and `relay_apply_tx`). We rewrite only frames whose reducer matches
+/// this prefix — other reducer calls (e.g. `relay_bind_writer`) on the
+/// local stdb are internal and pass through untouched.
 const APPLY_PREFIX: &str = "relay_apply_";
 
 #[derive(Debug, Error)]
@@ -82,7 +83,7 @@ pub enum Rewritten {
 }
 
 /// Inspect a v1 frame coming from local stdb and rewrite it if it's a
-/// `relay_apply_<table>` `TransactionUpdate(Committed)`.
+/// `relay_apply_*` `TransactionUpdate(Committed)`.
 pub fn rewrite_local_to_v1_client(frame: &[u8]) -> Result<Rewritten, RewriteError> {
     let body = codec::body(frame)?;
 
@@ -127,18 +128,12 @@ fn apply_meta(tu: &mut v1::TransactionUpdate<v1::BsatnFormat>, meta: UpstreamRed
 }
 
 /// Decode the leading `Option<UpstreamReducerMeta>` from a
-/// `relay_apply_<table>` reducer's args. The trailing
-/// `Vec<Vec<u8>>` deletes + inserts are left untouched (we don't need
-/// them for the rewrite). Returns `None` when the leading `Option` is
-/// `None`.
+/// `relay_apply_*` reducer's args. Trailing payload (`deletes`/`inserts`
+/// or `Vec<TableOp>`) is left untouched. Returns `None` when the leading
+/// `Option` is `None`.
 ///
-/// Wire shape, per `relay-mirror-driver::encode_apply_args`:
-/// ```text
-/// [u8 0=Some, 1=None]
-/// (if Some) BSATN(UpstreamReducerMeta)
-/// [u32 deletes_count][per-delete: u32 len, bytes]
-/// [u32 inserts_count][per-insert: u32 len, bytes]
-/// ```
+/// Both `relay_apply_<table>` and `relay_apply_tx` start with the same
+/// Option tag so this helper works for either shape.
 pub fn extract_upstream_meta(args: &[u8]) -> Result<Option<UpstreamReducerMeta>, RewriteError> {
     let tag = *args.first().ok_or_else(|| {
         RewriteError::Decode("relay_apply args empty (missing Option tag)".into())
@@ -299,6 +294,42 @@ mod synthesis_tests {
         assert_eq!(db.tables.len(), 1);
         assert_eq!(db.tables[0].table_name.as_ref(), "chat_message_state");
     }
+
+    #[test]
+    fn synthesizes_multi_table_tu_from_tul() {
+        // relay_apply_tx produces one TUL whose DatabaseUpdate already
+        // carries every table from the upstream TU — synthesis must
+        // preserve that set while restoring upstream reducer provenance.
+        let mut multi = tul();
+        multi.update.tables.push(TableUpdate {
+            table_id: 1.into(),
+            table_name: "closed_listing_state".to_string().into_boxed_str(),
+            num_rows: 1,
+            updates: smallvec::smallvec![CompressableQueryUpdate::Uncompressed(QueryUpdate {
+                deletes: BsatnRowList::new(RowSizeHint::FixedSize(0), Default::default()),
+                inserts: BsatnRowList::new(
+                    RowSizeHint::RowOffsets(vec![0].into()),
+                    bytes::Bytes::from_static(b"closed"),
+                ),
+            })],
+        });
+        multi.update.tables[0].table_name = "sell_order_state".to_string().into_boxed_str();
+
+        let frame = synthesize_v1_tu_from_tul(multi, meta());
+        let body = codec::body(&frame).unwrap();
+        let decoded: v1::ServerMessage<v1::BsatnFormat> = v1_bsatn::from_slice(body).unwrap();
+        let v1::ServerMessage::TransactionUpdate(tu) = decoded else {
+            panic!("expected TransactionUpdate");
+        };
+        assert_eq!(tu.reducer_call.reducer_name.as_ref(), "send_chat");
+        assert_eq!(tu.reducer_call.request_id, 555);
+        let v1::UpdateStatus::Committed(db) = tu.status else {
+            panic!("expected Committed");
+        };
+        assert_eq!(db.tables.len(), 2);
+        assert_eq!(db.tables[0].table_name.as_ref(), "sell_order_state");
+        assert_eq!(db.tables[1].table_name.as_ref(), "closed_listing_state");
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +394,44 @@ mod tests {
         });
         let body = v1_bsatn::to_vec(&msg).expect("encode v1 TU");
         codec::wrap_uncompressed(body)
+    }
+
+    #[test]
+    fn extract_meta_from_apply_tx_args_shape() {
+        // relay_apply_tx args: Option<meta> then Vec<TableOp>. The
+        // extractor only needs the leading Option.
+        use relay_protocol::TableOp;
+        let meta = sample_meta();
+        let mut args = Vec::new();
+        args.push(0);
+        args.extend_from_slice(&sats_bsatn::to_vec(&meta).unwrap());
+        let ops = vec![TableOp {
+            table: "sell_order_state".into(),
+            deletes: vec![],
+            inserts: vec![vec![1, 2, 3]],
+        }];
+        args.extend_from_slice(&sats_bsatn::to_vec(&ops).unwrap());
+        let extracted = extract_upstream_meta(&args).unwrap().unwrap();
+        assert_eq!(extracted.reducer_name, "send_message");
+        assert_eq!(extracted.request_id, 99);
+    }
+
+    #[test]
+    fn rewrite_recognizes_relay_apply_tx_prefix() {
+        let meta = sample_meta();
+        let args = build_apply_args(Some(&meta), &[], &[]);
+        let frame = build_v1_tu_frame("relay_apply_tx", args);
+        let out = rewrite_local_to_v1_client(&frame).unwrap();
+        let bytes = match out {
+            Rewritten::Owned(v) => v,
+            Rewritten::Passthrough => panic!("expected rewrite for relay_apply_tx"),
+        };
+        let body = codec::body(&bytes).unwrap();
+        let decoded: v1::ServerMessage<v1::BsatnFormat> = v1_bsatn::from_slice(body).unwrap();
+        let v1::ServerMessage::TransactionUpdate(tu) = decoded else {
+            panic!("expected TransactionUpdate");
+        };
+        assert_eq!(tu.reducer_call.reducer_name.as_ref(), "send_message");
     }
 
     #[test]

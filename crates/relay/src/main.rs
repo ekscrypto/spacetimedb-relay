@@ -176,8 +176,9 @@ struct Args {
     /// Public-facing WebSocket bind address for the frontend proxy.
     /// Downstream clients connect here; the proxy forwards each
     /// connection to `--stdb-url` (loopback) and — for v1 clients —
-    /// rewrites `relay_apply_<table>` `TransactionUpdate`s so they
-    /// look like upstream's. Empty string disables the frontend; in
+    /// rewrites `relay_apply_*` `TransactionUpdate`s so they look
+    /// like upstream's (including multi-table live TUs from
+    /// `relay_apply_tx`). Empty string disables the frontend; in
     /// that case downstream clients must connect directly to the
     /// local SpacetimeDB.
     #[arg(

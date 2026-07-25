@@ -7,7 +7,10 @@
 //! tracks per-client metrics, and — for `v1.bsatn.spacetimedb` clients —
 //! rewrites local-stdb v1 `TransactionUpdate`s so they look like the
 //! original upstream's TransactionUpdate (reducer name, args, caller
-//! identity, timestamp all lifted out of `relay_apply_<table>`'s args).
+//! identity, timestamp all lifted via MetaRegistry / apply args from
+//! `relay_apply_*`). Live multi-table upstream TUs arrive as one local
+//! `relay_apply_tx` commit, so synthesised v1 TUs keep multi-table
+//! `DatabaseUpdate.tables` intact.
 //!
 //! For `v2.bsatn.spacetimedb` clients the proxy is pure passthrough plus
 //! metrics — v2's wire strips reducer info from broadcasts, so there is

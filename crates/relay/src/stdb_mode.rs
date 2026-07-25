@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 //! Mirrors upstream tables into a sibling SpacetimeDB by calling
-//! per-table `relay_apply_<table>` reducers on a generated mirror
-//! module.
+//! `relay_apply_<table>` (SubscribeApplied / oversized fallback) or
+//! `relay_apply_tx` (live multi-table TransactionUpdates) on a generated
+//! mirror module.
 //!
 //! Three components wired together:
 //! * [`relay_publisher::Publisher`] — codegen + cargo build + spacetime
@@ -10,14 +11,15 @@
 //!   *whole* local database is wiped (`--delete-data`); we never trust
 //!   a partial preservation across schema changes (invariant #4).
 //! * [`relay_mirror_driver::MirrorDriver`] — v2 WebSocket client that
-//!   pushes `relay_apply_<table>(upstream, deletes, inserts)` calls to
-//!   the local stdb with bounded in-flight backpressure.
+//!   pushes apply calls to the local stdb with bounded in-flight
+//!   backpressure. Live TUs use one `relay_apply_tx` CallReducer so
+//!   downstream subscribers see multi-table atomicity.
 //! * Upstream subscribe loop — opens one upstream WS, sends either a
 //!   single set-replace `Subscribe` (default) OR a sequential
 //!   `SubscribeMulti` per table (`--subscribe-chunk-size 1`, v1
 //!   only — see CLAUDE.md "Subscribing at scale" for why this is
 //!   required against BitCraft). Routes `SubscribeApplied` and
-//!   `TransactionUpdate` rows into `driver.apply()`. Reconnects with
+//!   `TransactionUpdate` rows into the driver. Reconnects with
 //!   exponential backoff on disconnect.
 
 use std::path::PathBuf;
@@ -338,10 +340,19 @@ pub async fn run(
                 let Some(job) = apply_rx.recv().await else {
                     break;
                 };
-                let stats = match apply_driver
-                    .apply(&job.table, job.meta.as_ref(), job.deletes, job.inserts)
-                    .await
-                {
+                let label = job.log_label();
+                let stats = match job {
+                    ApplyJob::Table {
+                        table,
+                        meta,
+                        deletes,
+                        inserts,
+                    } => apply_driver.apply(&table, meta.as_ref(), deletes, inserts).await,
+                    ApplyJob::Tx { meta, ops } => {
+                        apply_driver.apply_tx(meta.as_ref(), ops).await
+                    }
+                };
+                let stats = match stats {
                     Ok(stats) => stats,
                     Err(e) => {
                         // Distinguish connection-fatal errors (the WS sink
@@ -358,7 +369,7 @@ pub async fn run(
                         if is_connection_fatal {
                             tracing::error!(
                                 target: "relay::stdb_mode",
-                                table = %job.table,
+                                tables = %label,
                                 error = %e,
                                 "local-stdb apply connection-fatal — signalling reconnect"
                             );
@@ -372,9 +383,9 @@ pub async fn run(
                         // subscription for all other tables.
                         tracing::warn!(
                             target: "relay::stdb_mode",
-                            table = %job.table,
+                            tables = %label,
                             error = %e,
-                            "apply failed for table — skipping, connection stays up"
+                            "apply failed — skipping, connection stays up"
                         );
                         continue;
                     }
@@ -897,14 +908,35 @@ struct SequentialState {
     all_applied: bool,
 }
 
-/// One unit of work for the applier task: apply a batch of row changes
-/// for a single table to the local stdb. Produced by the reader task
-/// from decoded `SubscribeApplied` and `TransactionUpdate` frames.
-struct ApplyJob {
-    table: String,
-    meta: Option<UpstreamReducerMeta>,
-    deletes: Vec<Bytes>,
-    inserts: Vec<Bytes>,
+/// One unit of work for the applier task. Produced by the reader task
+/// from decoded `SubscribeApplied` (per-table) and `TransactionUpdate`
+/// (multi-table atomic) frames.
+enum ApplyJob {
+    /// Initial subscribe rows — one CallReducer per table.
+    Table {
+        table: String,
+        meta: Option<UpstreamReducerMeta>,
+        deletes: Vec<Bytes>,
+        inserts: Vec<Bytes>,
+    },
+    /// Live upstream TransactionUpdate — one `relay_apply_tx` for all
+    /// tables in the TU (falls back to per-table if oversized).
+    Tx {
+        meta: Option<UpstreamReducerMeta>,
+        ops: Vec<(String, Vec<Bytes>, Vec<Bytes>)>,
+    },
+}
+
+impl ApplyJob {
+    fn log_label(&self) -> String {
+        match self {
+            ApplyJob::Table { table, .. } => table.clone(),
+            ApplyJob::Tx { ops, .. } => {
+                let names: Vec<&str> = ops.iter().map(|(t, _, _)| t.as_str()).collect();
+                names.join(",")
+            }
+        }
+    }
 }
 
 fn load_identity_token(path: &std::path::Path) -> Option<String> {
@@ -1033,7 +1065,7 @@ async fn dispatch_message(
                     rows = inserts.len(),
                     "queuing initial subscribe rows"
                 );
-                let _ = apply_tx.send(ApplyJob {
+                let _ = apply_tx.send(ApplyJob::Table {
                     table: upstream_name.to_string(),
                     meta: None,
                     deletes: Vec::new(),
@@ -1074,7 +1106,8 @@ async fn dispatch_message(
             }
         }
         ServerMessage::TransactionUpdate(tu) => {
-            // Extract per-table row changes into apply jobs.
+            // Collect all tables from this TU into one atomic apply_tx job.
+            let mut ops: Vec<(String, Vec<Bytes>, Vec<Bytes>)> = Vec::new();
             for set in tu.query_sets.iter() {
                 for table in set.tables.iter() {
                     let upstream_name: &str = table.table_name.as_ref();
@@ -1094,13 +1127,11 @@ async fn dispatch_message(
                     if deletes.is_empty() && inserts.is_empty() {
                         continue;
                     }
-                    let _ = apply_tx.send(ApplyJob {
-                        table: upstream_name.to_string(),
-                        meta: meta.clone(),
-                        deletes,
-                        inserts,
-                    });
+                    ops.push((upstream_name.to_string(), deletes, inserts));
                 }
+            }
+            if !ops.is_empty() {
+                let _ = apply_tx.send(ApplyJob::Tx { meta, ops });
             }
             false
         }
