@@ -48,8 +48,8 @@ struct Args {
 
     /// Optional prefix stripped from the unit stem before substitution
     /// into `--source-name-template`. Example: with `stem_prefix =
-    /// relay-bc` and `template = live-{stem}`, `relay-bc14` becomes
-    /// `live-14`. Ignored when `--source-name-template` is unset.
+    /// relay-region` and `template = live-{stem}`, `relay-region14`
+    /// becomes `live-14`. Ignored when `--source-name-template` is unset.
     /// If the prefix is set but doesn't match a given unit, the full
     /// stem flows into the template.
     #[arg(long, env = "RELAY_SOURCE_NAME_STEM_PREFIX")]

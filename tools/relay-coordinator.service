@@ -8,7 +8,7 @@
 #   2. A /health + / (dashboard) HTTP endpoint on 127.0.0.1:8082 that
 #      aggregates each instance's loopback /metrics. nginx proxies the
 #      public 80/443 listener to this address — drop-in replacement for
-#      the retired BitCraft-Relay.
+#      a standalone fleet-health service.
 #
 # Start before (or alongside) the relay instances. Both jobs are independent
 # inside the process: a failure in one cannot wedge the other.

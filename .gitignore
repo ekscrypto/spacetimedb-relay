@@ -18,8 +18,8 @@ Cargo.lock.bak
 # Local-only Claude notes (host names, account specifics, etc.)
 CLAUDE.local.md
 
-# BitCraft auth token (long-lived bearer credential)
-.bitcraft-token
+# Upstream auth token (long-lived bearer credential)
+.upstream-token
 
 # Generated mirror module body — Cargo.toml is committed, src/lib.rs is regenerated.
 spike/mirror/src/lib.rs

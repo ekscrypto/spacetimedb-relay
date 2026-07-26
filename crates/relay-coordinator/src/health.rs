@@ -20,8 +20,8 @@
 //! The source name shown in `sources` is **deployment-configured**, not
 //! hardcoded: by default the systemd unit stem passes through verbatim
 //! (`relay-region14` → `relay-region14`). A deployment can supply a
-//! `NamingSpec` (e.g. `template = "live-{stem}", stem_prefix = "relay-"`)
-//! to project `relay-bc14` → `live-bc14` for its dashboard. See
+//! `NamingSpec` (e.g. `template = "live-{stem}", stem_prefix = "relay-region"`)
+//! to project `relay-region14` → `live-14` for its dashboard. See
 //! [`NamingSpec`].
 //!
 //! `sources[*].metrics` is the **raw relay `/metrics` body** plus three
@@ -85,8 +85,8 @@ pub struct DiscoveredSource {
 ///
 /// A deployment with a naming convention supplies a template:
 ///
-/// - `template = "live-{stem}"`, `stem_prefix = "relay-bc"`
-///   → `relay-bc14` becomes `live-14`.
+/// - `template = "live-{stem}"`, `stem_prefix = "relay-region"`
+///   → `relay-region14` becomes `live-14`.
 /// - `template = "live-{stem}"`, `stem_prefix = "relay-"`
 ///   → `relay-region14` becomes `live-region14`.
 ///
@@ -501,15 +501,15 @@ mod tests {
 
     #[test]
     fn parse_unit_file_projects_name_via_naming_spec() {
-        // A deployment convention: `relay-bc14` → `live-14`.
+        // A deployment convention: `relay-region14` → `live-14`.
         let naming = NamingSpec {
             template: Some("live-{stem}".into()),
-            stem_prefix: Some("relay-bc".into()),
+            stem_prefix: Some("relay-region".into()),
         };
-        let body = unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-bc14");
-        let src = parse_unit(&body, "relay-bc14", &naming).expect("parsed");
+        let body = unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14");
+        let src = parse_unit(&body, "relay-region14", &naming).expect("parsed");
         assert_eq!(src.name, "live-14");
-        assert_eq!(src.database, "relay-mirror-bc14");
+        assert_eq!(src.database, "relay-mirror-region14");
     }
 
     #[test]
@@ -518,9 +518,9 @@ mod tests {
         // inside the template rather than mis-projecting.
         let naming = NamingSpec {
             template: Some("live-{stem}".into()),
-            stem_prefix: Some("relay-bc".into()),
+            stem_prefix: Some("relay-region".into()),
         };
-        assert_eq!(naming.project("relay-region14"), "live-relay-region14");
+        assert_eq!(naming.project("relay-other14"), "live-relay-other14");
     }
 
     #[test]
@@ -614,27 +614,27 @@ mod tests {
 
     #[test]
     fn discover_applies_naming_spec_when_projecting() {
-        // A deployment convention like BitCraft's: `relay-bc14` → `live-14`.
+        // A deployment convention: `relay-region14` → `live-14`.
         let dir = tempdir().expect("tempdir");
         fs::write(
-            dir.path().join("relay-bc14.service"),
-            unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-bc14"),
+            dir.path().join("relay-region14.service"),
+            unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14"),
         )
         .unwrap();
         fs::write(
             dir.path().join("relay-global.service"),
-            unit_body("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-bc-global"),
+            unit_body("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-global"),
         )
         .unwrap();
         let naming = NamingSpec {
             template: Some("live-{stem}".into()),
-            stem_prefix: Some("relay-bc".into()),
+            stem_prefix: Some("relay-region".into()),
         };
         let found = discover(dir.path(), &naming);
         let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
-        // relay-bc14 → live-14; relay-global → the prefix matches so the
-        // remainder after "relay-bc" is "global"... no, it doesn't match.
-        // "relay-global".starts_with("relay-bc") is false, so the full
+        // relay-region14 → live-14; relay-global → the prefix matches so the
+        // remainder after "relay-region" is "global"... no, it doesn't match.
+        // "relay-global".starts_with("relay-region") is false, so the full
         // stem flows into the template as {stem}.
         assert_eq!(names, vec!["live-14", "live-relay-global"]);
     }

@@ -475,8 +475,8 @@ configurable [`NamingSpec`] (`--source-name-template` /
 `--source-name-stem-prefix`). Default is passthrough (the unit stem is
 the source name verbatim, e.g. `relay-region14` → `relay-region14`); a
 deployment with a convention supplies a template like
-`bitcraft-live-{stem}` with prefix `relay-bc` to get `relay-bc14` →
-`bitcraft-live-14`.
+`live-{stem}` with prefix `relay-region` to project `relay-region14` →
+`live-14`.
 
 Three fields the dashboard reads are **derived** from the raw `/metrics`
 body (the per-instance relay doesn't emit them itself):
@@ -495,12 +495,6 @@ maps cleanly. It's `sources.len()`.
 Source: `crates/relay-coordinator/src/{health,sys_metrics}.rs` +
 `daemon.rs` (HTTP wiring). See the unit file
 `tools/relay-coordinator.service` for production flags.
-
-## Historical / superseded docs
-
-- `MEMORY-MIGRATION.md` — describes an abandoned in-process memstore
-  plan that was replaced by the SpacetimeDB-mirror architecture
-  documented here. Kept for reference only; do not treat as current.
 
 ## Reference: live test database
 

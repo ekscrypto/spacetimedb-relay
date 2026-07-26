@@ -172,9 +172,9 @@ async fn health_json(State(state): State<HealthState>) -> impl IntoResponse {
 
 async fn index() -> impl IntoResponse {
     // Minimal landing page. A deployment that wants a rich fleet
-    // dashboard ships its own page (the BitCraft deployment, for
-    // example, serves a custom index.html via nginx in front of this
-    // endpoint). The raw fleet JSON is always at /health.
+    // dashboard ships its own page (e.g. a custom index.html served
+    // via nginx in front of this endpoint). The raw fleet JSON is
+    // always at /health.
     Html(
         "<!doctype html>\n\
          <html><head><title>relay-coordinator</title></head>\n\
