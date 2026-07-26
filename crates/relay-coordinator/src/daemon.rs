@@ -171,13 +171,17 @@ async fn health_json(State(state): State<HealthState>) -> impl IntoResponse {
 }
 
 async fn index() -> impl IntoResponse {
-    // The dashboard page is baked into the binary at build time. Path
-    // is relative to this source file: crates/relay-coordinator/src/
-    // → ../../www/index.html.
-    Html(INDEX_HTML)
+    // Minimal landing page. A deployment that wants a rich fleet
+    // dashboard ships its own page (the BitCraft deployment, for
+    // example, serves a custom index.html via nginx in front of this
+    // endpoint). The raw fleet JSON is always at /health.
+    Html(
+        "<!doctype html>\n\
+         <html><head><title>relay-coordinator</title></head>\n\
+         <body><p>relay-coordinator /health aggregator. \
+         See <a href=\"/health\">/health</a> for the fleet JSON.</p></body></html>\n",
+    )
 }
-
-const INDEX_HTML: &str = include_str!("../../../www/index.html");
 
 /// Independent shutdown future for spawned background tasks. Resolves
 /// on SIGINT/SIGTERM just like the main `shutdown` arg, but each task
