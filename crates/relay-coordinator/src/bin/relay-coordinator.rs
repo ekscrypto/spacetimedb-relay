@@ -54,6 +54,13 @@ struct Args {
     /// stem flows into the template.
     #[arg(long, env = "RELAY_SOURCE_NAME_STEM_PREFIX")]
     source_name_stem_prefix: Option<String>,
+
+    /// Path to an HTML file served as the `/` dashboard page. If unset
+    /// the coordinator serves a minimal stub that links to `/health`.
+    /// The file is read once at startup; restart the coordinator to
+    /// pick up edits.
+    #[arg(long, env = "RELAY_INDEX_HTML")]
+    index_html: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -93,6 +100,22 @@ async fn main() -> Result<()> {
         }
     };
 
+    let index_html = match args.index_html {
+        Some(ref path) => match std::fs::read_to_string(path) {
+            Ok(content) => Some(content),
+            Err(e) => {
+                tracing::warn!(
+                    target: "relay_coordinator",
+                    path = %path.display(),
+                    error = %e,
+                    "--index-html file unreadable; serving stub page instead"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     relay_coordinator::daemon::run(
         args.socket,
         args.max_concurrent,
@@ -102,6 +125,7 @@ async fn main() -> Result<()> {
             template: args.source_name_template,
             stem_prefix: args.source_name_stem_prefix,
         },
+        index_html,
         shutdown,
     )
     .await

@@ -25,7 +25,8 @@ ExecStart=/srv/relay/spacetimedb-relay/target/release/relay-coordinator \
     --socket /run/relay/coordinator.sock \
     --max-concurrent 1 \
     --health-bind 127.0.0.1:8082 \
-    --unit-dir /etc/systemd/system
+    --unit-dir /etc/systemd/system \
+    --index-html /srv/relay/bitcraft-relay/www/index.html
 RuntimeDirectory=relay
 RuntimeDirectoryMode=0750
 WorkingDirectory=/srv/relay/spacetimedb-relay

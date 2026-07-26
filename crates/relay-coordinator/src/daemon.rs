@@ -12,6 +12,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const INDEX_STUB: &str = "<!doctype html>\
+<html><head><title>relay-coordinator</title></head>\
+<body><p>relay-coordinator. \
+See <a href=\"/health\">/health</a> for fleet JSON. \
+Pass <code>--index-html &lt;path&gt;</code> to serve a custom dashboard.</p>\
+</body></html>";
+
 use anyhow::Result;
 use axum::extract::State;
 use axum::response::{Html, IntoResponse};
@@ -36,12 +43,18 @@ use crate::sys_metrics::SysState;
 /// `naming` controls how the discovered units' stems are projected into
 /// the `sources[*]` keys shown in `/health`. Pass
 /// [`NamingSpec::passthrough`] for default behaviour (unit stem verbatim).
+///
+/// `index_html` is the content served at `GET /`. When `None` a minimal
+/// stub page is served instead. Load it from a deployment-specific file
+/// via `--index-html` so the generic coordinator crate carries no
+/// deployment-specific UI.
 pub async fn run(
     socket_path: PathBuf,
     max_concurrent: usize,
     health_bind: Option<SocketAddr>,
     unit_dir: PathBuf,
     naming: NamingSpec,
+    index_html: Option<String>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     // Remove a stale socket from a previous run.
@@ -89,8 +102,15 @@ pub async fn run(
             });
         }
 
+        let page: Arc<str> = index_html
+            .as_deref()
+            .unwrap_or(INDEX_STUB)
+            .into();
         let app = Router::new()
-            .route("/", get(index))
+            .route("/", get({
+                let page = page.clone();
+                move || async move { Html(page.to_string()) }
+            }))
             .route("/health", get(health_json))
             .layer(CorsLayer::permissive())
             .with_state(health);
@@ -170,18 +190,6 @@ async fn health_json(State(state): State<HealthState>) -> impl IntoResponse {
     )
 }
 
-async fn index() -> impl IntoResponse {
-    // Minimal landing page. A deployment that wants a rich fleet
-    // dashboard ships its own page (e.g. a custom index.html served
-    // via nginx in front of this endpoint). The raw fleet JSON is
-    // always at /health.
-    Html(
-        "<!doctype html>\n\
-         <html><head><title>relay-coordinator</title></head>\n\
-         <body><p>relay-coordinator /health aggregator. \
-         See <a href=\"/health\">/health</a> for the fleet JSON.</p></body></html>\n",
-    )
-}
 
 /// Independent shutdown future for spawned background tasks. Resolves
 /// on SIGINT/SIGTERM just like the main `shutdown` arg, but each task

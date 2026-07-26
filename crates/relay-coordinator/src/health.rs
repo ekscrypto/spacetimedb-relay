@@ -24,8 +24,14 @@
 //! to project `relay-region14` → `live-14` for its dashboard. See
 //! [`NamingSpec`].
 //!
-//! `sources[*].metrics` is the **raw relay `/metrics` body** plus three
-//! derived fields the page reads but the relay doesn't emit:
+//! `sources[*].metrics` is the relay `/metrics` body, lightly prepared
+//! for public consumption: three derived fields the page reads but the
+//! relay doesn't emit are injected, and internal debug state that was
+//! never meant to leave the loopback per-instance dashboard is stripped
+//! (currently: the entire `frontend.clients` array — per-connection
+//! detail including remote addresses and SQL strings).
+//!
+//! Derived fields:
 //!
 //! - `process_uptime_seconds = now - started_at`
 //! - `upstream.uptime_seconds = now - last_up_at` (only when state=="up"
@@ -221,9 +227,10 @@ impl HealthState {
                     .unwrap_or(false),
                 None => false,
             };
-            // If we derived uptime fields this cycle, embed them into a
-            // fresh copy so the page sees consistent `uptime_seconds`.
-            let metrics = metrics.map(|m| derive_uptime_fields(&m));
+            // Lightly prepare the metrics body for the public fleet
+            // view: strip internal debug state and inject the derived
+            // uptime fields the page reads.
+            let metrics = metrics.map(|m| prepare_metrics(&m));
             next.insert(
                 src.name.clone(),
                 SourceSnapshot {
@@ -297,14 +304,41 @@ async fn fetch_metrics(http: &Client, timeout: Duration, dashboard_port: u16) ->
     resp.json::<Value>().await.ok()
 }
 
-/// Walk the raw `/metrics` JSON and inject the derived uptime fields
-/// the page reads. Returns a fresh `Value` (does not mutate input).
+/// Prepare the raw per-instance `/metrics` JSON for the public
+/// fleet view: strip internal debug state, then inject the derived
+/// uptime fields the page reads. Returns a fresh `Value` (does not
+/// mutate input).
 ///
-/// See module docs for the derivation rules.
-fn derive_uptime_fields(metrics: &Value) -> Value {
+/// See module docs for what's stripped and how the uptime fields
+/// derive.
+fn prepare_metrics(metrics: &Value) -> Value {
     let mut out = metrics.clone();
-    let Some(obj) = out.as_object_mut() else {
-        return out;
+    strip_internal_debug_fields(&mut out);
+    inject_uptime_fields(&mut out);
+    out
+}
+
+/// Remove internal debug state that's useful on the per-instance
+/// loopback dashboard but shouldn't leave the host. Removes the entire
+/// `frontend.clients` array — per-client detail (remote addresses,
+/// per-connection counters, SQL strings) is operator-local state, not
+/// part of the fleet health contract. Operates in place; tolerates any
+/// shape.
+fn strip_internal_debug_fields(metrics: &mut Value) {
+    let Some(fe) = metrics.get_mut("frontend") else {
+        return;
+    };
+    let Some(obj) = fe.as_object_mut() else {
+        return;
+    };
+    obj.remove("clients");
+}
+
+/// Walk the metrics JSON and inject the derived uptime fields the page
+/// reads. See module docs for the derivation rules.
+fn inject_uptime_fields(metrics: &mut Value) {
+    let Some(obj) = metrics.as_object_mut() else {
+        return;
     };
     let now = obj.get("now").and_then(|v| v.as_u64()).unwrap_or(0);
     let started_at = obj.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -322,7 +356,6 @@ fn derive_uptime_fields(metrics: &Value) -> Value {
             inject_link_uptime(link, now);
         }
     }
-    out
 }
 
 /// Derive `uptime_seconds` for one link (`upstream` or `local_stdb`).
@@ -642,57 +675,90 @@ mod tests {
     #[test]
     fn derive_uptime_seconds_when_up() {
         // state="up", last_up_at=N, now=N+100 → uptime_seconds=100.
-        let m = json!({
+        let mut m = json!({
             "now": 1_000_100,
             "started_at": 1_000_000,
             "upstream": { "state": "up", "last_up_at": 1_000_000 },
             "local_stdb": { "state": "up", "last_up_at": 1_000_050 }
         });
-        let out = derive_uptime_fields(&m);
-        assert_eq!(out["process_uptime_seconds"].as_u64(), Some(100));
-        assert_eq!(out["upstream"]["uptime_seconds"].as_u64(), Some(100));
-        assert_eq!(out["local_stdb"]["uptime_seconds"].as_u64(), Some(50));
+        inject_uptime_fields(&mut m);
+        assert_eq!(m["process_uptime_seconds"].as_u64(), Some(100));
+        assert_eq!(m["upstream"]["uptime_seconds"].as_u64(), Some(100));
+        assert_eq!(m["local_stdb"]["uptime_seconds"].as_u64(), Some(50));
     }
 
     #[test]
     fn derive_uptime_seconds_null_when_down() {
         // state="down" with a stale last_up_at must NOT report uptime.
-        let m = json!({
+        let mut m = json!({
             "now": 2_000_000,
             "started_at": 1_000_000,
             "upstream": { "state": "down", "last_up_at": 1_500_000 },
             "local_stdb": { "state": "initial" }
         });
-        let out = derive_uptime_fields(&m);
-        assert_eq!(out["process_uptime_seconds"].as_u64(), Some(1_000_000));
-        assert!(out["upstream"]["uptime_seconds"].is_null());
-        assert!(out["local_stdb"]["uptime_seconds"].is_null());
+        inject_uptime_fields(&mut m);
+        assert_eq!(m["process_uptime_seconds"].as_u64(), Some(1_000_000));
+        assert!(m["upstream"]["uptime_seconds"].is_null());
+        assert!(m["local_stdb"]["uptime_seconds"].is_null());
     }
 
     #[test]
     fn derive_uptime_seconds_null_when_timestamp_missing() {
         // state="up" but last_up_at==0 (never set) → null, not 0.
-        let m = json!({
+        let mut m = json!({
             "now": 1_000,
             "started_at": 0,
             "upstream": { "state": "up", "last_up_at": 0 }
         });
-        let out = derive_uptime_fields(&m);
-        assert!(out["upstream"]["uptime_seconds"].is_null());
-        assert_eq!(out["process_uptime_seconds"].as_u64(), Some(0));
+        inject_uptime_fields(&mut m);
+        assert!(m["upstream"]["uptime_seconds"].is_null());
+        assert_eq!(m["process_uptime_seconds"].as_u64(), Some(0));
     }
 
     #[test]
     fn derive_uptime_handles_missing_link_objects() {
         // Older /metrics shape without local_stdb must not panic.
-        let m = json!({
+        let mut m = json!({
             "now": 1_000,
             "started_at": 500,
             "upstream": { "state": "up", "last_up_at": 900 }
         });
-        let out = derive_uptime_fields(&m);
-        assert_eq!(out["upstream"]["uptime_seconds"].as_u64(), Some(100));
-        assert!(out.get("local_stdb").is_none());
+        inject_uptime_fields(&mut m);
+        assert_eq!(m["upstream"]["uptime_seconds"].as_u64(), Some(100));
+        assert!(m.get("local_stdb").is_none());
+    }
+
+    #[test]
+    fn prepare_metrics_strips_clients_array() {
+        // The per-client detail array is operator-local state; strip it
+        // entirely from the public fleet /health response.
+        let m = json!({
+            "now": 1_000,
+            "started_at": 900,
+            "frontend": {
+                "active_clients": 2,
+                "clients": [
+                    { "id": "a", "remote": "1.2.3.4:5", "subscriptions": ["SELECT * FROM secrets"] },
+                    { "id": "b", "remote": "1.2.3.4:6", "subscriptions": ["SELECT * FROM t1", "SELECT * FROM t2"] }
+                ]
+            }
+        });
+        let out = prepare_metrics(&m);
+        // clients array gone; aggregate counter preserved.
+        assert!(out["frontend"].get("clients").is_none());
+        assert_eq!(out["frontend"]["active_clients"].as_u64(), Some(2));
+        // uptime derivation still ran end-to-end.
+        assert_eq!(out["process_uptime_seconds"].as_u64(), Some(100));
+    }
+
+    #[test]
+    fn prepare_metrics_tolerates_missing_frontend() {
+        // An /metrics body without a frontend object (e.g. a relay that
+        // has --frontend-bind disabled) must not panic.
+        let m = json!({ "now": 100, "started_at": 50 });
+        let out = prepare_metrics(&m);
+        assert_eq!(out["process_uptime_seconds"].as_u64(), Some(50));
+        assert!(out.get("frontend").is_none());
     }
 
     #[test]
