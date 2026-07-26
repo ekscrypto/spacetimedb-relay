@@ -22,7 +22,7 @@ use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tower_http::cors::CorsLayer;
 
-use crate::health::HealthState;
+use crate::health::{HealthState, NamingSpec};
 use crate::sys_metrics::SysState;
 
 /// Run the coordinator daemon.
@@ -32,11 +32,16 @@ use crate::sys_metrics::SysState;
 /// (the public dashboard) on that loopback address, with the sources
 /// poller and host sampler running in the background. Blocks until
 /// `shutdown` resolves.
+///
+/// `naming` controls how the discovered units' stems are projected into
+/// the `sources[*]` keys shown in `/health`. Pass
+/// [`NamingSpec::passthrough`] for default behaviour (unit stem verbatim).
 pub async fn run(
     socket_path: PathBuf,
     max_concurrent: usize,
     health_bind: Option<SocketAddr>,
     unit_dir: PathBuf,
+    naming: NamingSpec,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     // Remove a stale socket from a previous run.
@@ -62,7 +67,7 @@ pub async fn run(
     // populated within seconds of process start, then every 30s.
     let health_task = if let Some(bind) = health_bind {
         let sys = SysState::new();
-        let health = HealthState::new(unit_dir.clone(), sys.clone());
+        let health = HealthState::with_naming(unit_dir.clone(), sys.clone(), naming.clone());
 
         // Spawn the sources poller (drives the `sources` map) and the
         // host metrics sampler (drives `system.cpu` / `system.memory` /

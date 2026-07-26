@@ -25,12 +25,12 @@ upstream side can speak either of those too (default `v2`, opt into
 
 ## Why
 
-Public SpacetimeDB games (BitCraft, etc.) are rate-limited: studios
-restrict how many third-party tools can hold subscriptions, because
-every extra subscriber costs CPU on the live server. The relay holds
+Public SpacetimeDB games are often rate-limited: studios restrict
+how many third-party tools can hold subscriptions, because every
+extra subscriber costs CPU on the live server. The relay holds
 **one** subscription upstream and serves any number of downstream
-clients from a sibling SpacetimeDB, so community tools (BitCraftMap,
-BitCraftSync, BitJita, …) can share a single upstream cost.
+clients from a sibling SpacetimeDB, so community tools and dashboards
+can share a single upstream cost.
 
 Memory-wise this scales much better than the previous
 in-process-mirror approach: SpacetimeDB stores rows ~3× their raw
@@ -117,9 +117,9 @@ Logs you should see, in order:
    `relay_apply_<table>` calls into the local SpacetimeDB
 
 Downstream clients connect to the **frontend proxy**. In production on
-`relay.bitcraftsync.app`, nginx terminates TLS in front of each loopback
+`relay.example.com`, nginx terminates TLS in front of each loopback
 relay, so the public address is
-`wss://relay.bitcraftsync.app:<port>/v1/database/<mirror-database>/subscribe`
+`wss://relay.example.com:<port>/v1/database/<mirror-database>/subscribe`
 where `<port>` is `3000` (global) or `3000 + regionID`. See the next
 section for v1 and v2 examples, and `PORTS.md` for the full exposure
 scheme.
@@ -139,13 +139,13 @@ reducer info, regardless of what's upstream).
 
 ```
 GET /v1/database/<mirror-database>/subscribe?compression=None HTTP/1.1
-Host: relay.bitcraftsync.app:<port>
+Host: relay.example.com:<port>
 Upgrade: websocket
 Sec-WebSocket-Protocol: v2.bsatn.spacetimedb
 ```
 
 Drop-in replacement for the official SpacetimeDB Rust/TS/C# SDK
-configured against `wss://relay.bitcraftsync.app:<port>`. No code
+configured against `wss://relay.example.com:<port>`. No code
 changes.
 
 ### v1.bsatn.spacetimedb (full upstream-flavored TransactionUpdates)
@@ -165,7 +165,7 @@ when the upstream is v1; against a v2 upstream the registry stores
 
 ```
 GET /v1/database/<mirror-database>/subscribe?compression=None HTTP/1.1
-Host: relay.bitcraftsync.app:<port>
+Host: relay.example.com:<port>
 Upgrade: websocket
 Sec-WebSocket-Protocol: v1.bsatn.spacetimedb
 ```
@@ -196,10 +196,10 @@ cargo run -p relay-test-harness --release -- \
 
 # v1 subscriber against a real v1 upstream — observes synthesised TUs
 # carrying the upstream's actual reducer_name + caller_identity.
-RELAY_UPSTREAM_TOKEN=$(cat .bitcraft-token) \
+RELAY_UPSTREAM_TOKEN=$UPSTREAM_TOKEN \
 cargo run -p relay-test-harness --release -- \
-  --upstream wss://bitcraft-early-access.spacetimedb.com \
-  --database bitcraft-live-14 \
+  --upstream wss://upstream.example.com \
+  --database upstream-db \
   --via-frontend ws://127.0.0.1:3009 \
   --subscriber-protocol v1 \
   --subscribe-only \
@@ -207,7 +207,7 @@ cargo run -p relay-test-harness --release -- \
   --timeout-secs 180
 ```
 
-The last command, against BitCraft's live v1 server, prints frames
+The last command, against a live v1 upstream, prints frames
 like:
 
 ```
@@ -217,7 +217,7 @@ like:
 ```
 
 — which is the upstream player's actual chat reducer, surfaced to a
-v1 subscriber as if it had been talking to BitCraft directly.
+v1 subscriber as if it had been talking to the upstream directly.
 
 ## Schema endpoint
 
@@ -230,7 +230,7 @@ GET /v1/database/<mirror-database>/schema?version=9
 ```
 
 ```sh
-curl http://relay.bitcraftsync.app:<port>/v1/database/<mirror-database>/schema?version=9
+curl http://relay.example.com:<port>/v1/database/<mirror-database>/schema?version=9
 ```
 
 The bytes returned are the **exact schema the relay used to codegen and
@@ -260,7 +260,7 @@ requests. Responses carry a 60-second `Cache-Control` hint.
 | `--upstream-token`         | `RELAY_UPSTREAM_TOKEN`             | none                                         | Bearer token for upstream auth |
 | `--upstream-protocol`      | `RELAY_UPSTREAM_PROTOCOL`          | `v2`                                         | `v1` for pre-2.0 SpacetimeDB |
 | `--subscribe-table`        | `RELAY_SUBSCRIBE_TABLES`           | all user-public tables                       | Repeatable; comma-separated via env |
-| `--subscribe-chunk-size`   | `RELAY_SUBSCRIBE_CHUNK_SIZE`       | `0`                                          | `0` = single set-replace `Subscribe` for all tables. `1` (v1 only) = sequential `SubscribeMulti` per table — required for large schemas like BitCraft, see ["Large databases"](#large-databases) below |
+| `--subscribe-chunk-size`   | `RELAY_SUBSCRIBE_CHUNK_SIZE`       | `0`                                          | `0` = single set-replace `Subscribe` for all tables. `1` (v1 only) = sequential `SubscribeMulti` per table — required for large schemas, see ["Large databases"](#large-databases) below |
 | `--frame-limit`            | `RELAY_FRAME_LIMIT`                | unlimited                                    | Stop after N upstream frames (smoke tests) |
 | `--data-dir`               | `RELAY_DATA_DIR`                   | `data`                                       | Working directory; the publisher's mirror crate workdir lives under here |
 | `--stdb-url`               | `RELAY_STDB_URL`                   | `ws://127.0.0.1:3000`                        | Local SpacetimeDB URL the relay publishes to and connects to |
@@ -290,7 +290,6 @@ requests. Responses carry a 60-second `Cache-Control` hint.
 | `relay-frontend`       | Public-facing WS proxy: subprotocol negotiation, per-client metrics, hides `_relay_meta` traffic, synthesises full v1 `TransactionUpdate`s from local stdb's `TransactionUpdateLight` broadcasts via the mirror-driver's meta registry, and serves the cached upstream schema over plain HTTP on the same port (`GET /v1/database/<db>/schema`). |
 | `relay`                | Binary. Args, schema fetch, dashboard, dispatches to `stdb_mode`. |
 | `relay-test-harness`   | Standalone v2 client; useful for end-to-end testing against either the local SpacetimeDB or a remote upstream. |
-| `bc14-sdk-test`        | Standalone bin (excluded from the workspace) that vendors the v1.12.0 SpacetimeDB Rust SDK's WebSocket layer verbatim. Used to confirm large-scale subscribe issues against BitCraft are server/middlebox behavior, not relay-side regressions. See `crates/bc14-sdk-test/README.md`. |
 | `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table, each taking an `Option<UpstreamReducerInfo>` arg. |
 | `tools/mirror-template/` | `Cargo.toml` + `rust-toolchain.toml` copied into the publisher's workdir. |
 | `tools/fleet-status.sh` | Ops script for multi-instance hosts: auto-discovers every `relay-*` systemd unit, reads its dashboard port, and prints a per-instance sync-status table (upstream/stdb state, 1-min throughput). Run on the host: `./tools/fleet-status.sh` (one-shot) or `-w` to watch. |
@@ -302,20 +301,20 @@ For small schemas the default mode (`--subscribe-chunk-size 0`)
 works: the relay sends one set-replace `Subscribe` covering every
 table and the upstream replies with a single `InitialSubscription`.
 
-For large v1 schemas — concretely BitCraft's 250 public-user tables,
-about 1 GB of initial state — that single `InitialSubscription`
-becomes a single multi-hundred-MB WebSocket message that the
-upstream's edge consistently RSTs at ~90 s, before any client can
-finish receiving it. We verified this against the official
+For large v1 schemas — concretely a large upstream with 250 public-user
+tables and about 1 GB of initial state — that single
+`InitialSubscription` becomes a single multi-hundred-MB WebSocket
+message that the upstream's edge consistently RSTs at ~90 s, before any
+client can finish receiving it. We verified this against the official
 SpacetimeDB Rust SDK; same TCP reset at the same byte mark.
 
 Pass `--subscribe-chunk-size 1` to switch to **sequential
 SubscribeMulti**: the relay subscribes to one table at a time, waits
 for the per-table `SubscribeMultiApplied` (and applies its rows),
 then advances. Each per-table dump fits comfortably under the 90 s
-window even for the worst-case table (BitCraft's
-`footprint_tile_state` is ~644 MB on its own and still completes
-fine). Total time to ingest BitCraft 14's full 1 GB: ~8.5 minutes.
+window even for the worst-case table (the largest single table is
+~644 MB on its own and still completes fine). Total time to ingest the
+full ~1 GB: ~8.5 minutes.
 
 This mode is currently v1-only (the path that needs it). Use it
 together with `--upstream-protocol v1`.
@@ -335,7 +334,7 @@ We never trust partial preservation across schema changes — the
 upstream's migration semantics aren't visible to us, so any "looks
 compatible" diff could leave stale rows mixed with fresh ones.
 Downstream clients see a brief disconnect at the moment of republish
-and a re-fill window of ~5–10 minutes on BitCraft-scale databases.
+and a re-fill window of ~5–10 minutes on large-scale databases.
 
 ## Development
 

@@ -66,54 +66,54 @@ cp tools/mirror-template/{Cargo.toml,rust-toolchain.toml} /tmp/mirror/
 (cd /tmp/mirror && cargo build --release --target wasm32-unknown-unknown)
 (cd /tmp/mirror && spacetime publish -s relay-local -y --delete-data relay-mirror)
 
-# Run the relay against the live BitCraft test region.
-# `--subscribe-chunk-size 1` is REQUIRED for BitCraft (or any v1
-# upstream with a large schema) — see "Subscribing at scale" below.
+# Run the relay against a v1 upstream with a large schema.
+# `--subscribe-chunk-size 1` is REQUIRED for any v1 upstream with a
+# large schema — see "Subscribing at scale" below.
 # `--stdb-spawn` starts a private SpacetimeDB instance inside the relay
 # process using the `spacetime` binary. Each relay gets its own stdb
 # with data in `<data-dir>/stdb/`. This is the recommended mode for
 # production deployments with multiple relay instances.
 # Without `--stdb-spawn`, the relay uses an external stdb pointed at by
 # `--stdb-url` / `--stdb-server-alias` (the older shared-stdb mode).
-RELAY_UPSTREAM_TOKEN=$(cat .bitcraft-token) \
+RELAY_UPSTREAM_TOKEN=$UPSTREAM_TOKEN \
 cargo run -p relay --release -- \
-  --upstream wss://bitcraft-early-access.spacetimedb.com \
-  --database bitcraft-live-14 \
+  --upstream wss://upstream.example.com \
+  --database upstream-db \
   --upstream-protocol v1 \
   --subscribe-chunk-size 1 \
   --stdb-spawn \
-  --mirror-database relay-mirror-bc14 \
-  --data-dir /var/lib/relay-bc14 \
+  --mirror-database relay-mirror-example \
+  --data-dir /var/lib/relay-example \
   --frontend-bind 0.0.0.0:3009
 
 # Legacy mode (shared external stdb):
-# RELAY_UPSTREAM_TOKEN=$(cat .bitcraft-token) \
+# RELAY_UPSTREAM_TOKEN=$UPSTREAM_TOKEN \
 # cargo run -p relay --release -- \
-#   --upstream wss://bitcraft-early-access.spacetimedb.com \
-#   --database bitcraft-live-14 \
+#   --upstream wss://upstream.example.com \
+#   --database upstream-db \
 #   --upstream-protocol v1 \
 #   --subscribe-chunk-size 1 \
 #   --stdb-url ws://127.0.0.1:3010 \
 #   --stdb-server-alias relay-local \
-#   --mirror-database relay-mirror-bc14 \
-#   --data-dir /var/lib/relay-bc14 \
+#   --mirror-database relay-mirror-example \
+#   --data-dir /var/lib/relay-example \
 #   --frontend-bind 0.0.0.0:3009
 
 # Smoke-test the frontend's v1 path against a running relay (above):
-# subscribes to chat_message_state and prints any synthesised v1 TU.
+# subscribes to <table> and prints any synthesised v1 TU.
 cargo run -p relay-test-harness --release -- \
-  --upstream wss://bitcraft-early-access.spacetimedb.com \
-  --database bitcraft-live-14 \
+  --upstream wss://upstream.example.com \
+  --database upstream-db \
   --via-frontend ws://127.0.0.1:3009 \
   --subscriber-protocol v1 \
   --subscribe-only \
-  --table chat_message_state \
+  --table <table> \
   --timeout-secs 180
 
-# Same against maincloud (v2 upstream, v2 subscriber — pure
-# passthrough, end-to-end set_name propagation):
+# Same against a v2 upstream (v2 subscriber — pure passthrough,
+# end-to-end reducer propagation):
 cargo run -p relay-test-harness --release -- \
-  --upstream wss://maincloud.spacetimedb.com \
+  --upstream wss://upstream.example.com \
   --database <upstream-db> \
   --via-frontend ws://127.0.0.1:3009 \
   --subscriber-protocol v2 \
@@ -260,21 +260,20 @@ sends a single set-replace `Subscribe` with all tables and the
 upstream replies with one `InitialSubscription` covering the entire
 working set. Simple, fast.
 
-For large v1 schemas (e.g. BitCraft's 250 public-user tables — about
-1 GB of initial state today), that single `InitialSubscription`
-becomes a single multi-hundred-MB WS message that BitCraft's edge
-RSTs at ~90 s — well before any client (verified including the
-official SpacetimeDB Rust SDK at v1.12.0; see `crates/bc14-sdk-test/`)
-can finish receiving it. We confirmed this empirically: every variant
-of our client and the SDK itself hit the same TCP RST at the same
-byte mark.
+For large v1 schemas (e.g. an upstream with 250 public-user tables —
+about 1 GB of initial state), that single `InitialSubscription`
+becomes a single multi-hundred-MB WS message that an aggressive
+middlebox along the path RSTs at ~90 s — well before any client can
+finish receiving it. We confirmed this empirically: every client
+variant we tried hit the same TCP RST at the same byte mark.
 
 The fix: `--subscribe-chunk-size 1` activates **sequential
 SubscribeMulti** mode. The relay sends one `SubscribeMulti` per
 table, waits for `SubscribeMultiApplied`, applies the rows, then
 moves to the next. Each per-table InitialSubscription fits
 comfortably under the 90 s window even for the worst behemoth
-(`footprint_tile_state` is ~644 MB on its own — still completes).
+(the largest table on a big upstream can be ~644 MB on its own —
+still completes).
 
 State machine lives in `stdb_mode.rs::SequentialState`; advances on
 each `SubscribeApplied` and emits `"all sequential subscriptions
@@ -377,9 +376,8 @@ Source of truth: `clockworklabs/SpacetimeDB`,
 | `relay-mirror-driver`  | v2 WS client to local SpacetimeDB. Sends `relay_apply_<table>(upstream, deletes, inserts)` calls with semaphore backpressure (≤8 K in-flight) and chunking by row count + payload bytes. Hosts `MetaRegistry` (`registry.rs`) — a shared `DashMap<request_id, Option<UpstreamReducerMeta>>` the driver writes to on every CallReducer and the frontend reads to synthesise full v1 TUs. |
 | `relay-frontend`       | Public-facing WS proxy. `listener.rs` accepts connections, negotiates v1/v2 subprotocol; `client.rs` runs the per-connection un-split-socket select loop pairing downstream ↔ local-stdb; `rewrite.rs` synthesises full v1 `TransactionUpdate`s from local stdb's `TransactionUpdateLight` via the meta registry; `metrics.rs` + `state.rs` track per-client and aggregate counters surfaced on the dashboard. v2 path is pure passthrough plus metrics. |
 | `relay`                | Binary. Args, schema fetch, dashboard, dispatches to `stdb_mode`. The `stdb_mode.rs` run loop drives publisher → driver → `relay_bind_writer` → upstream subscribe (set-replace OR sequential SubscribeMulti) → routes `SubscribeApplied` + `TransactionUpdate` into `driver.apply()`. Wires the shared `MetaRegistry` into both the driver and the frontend, plus a periodic sweep task. |
-| `relay-coordinator`    | Host-scoped daemon (one per host, not per region). Two independent jobs in one process: (1) a bounded reconnect-permit semaphore over `/run/relay/coordinator.sock` — each relay with `--coordinator-socket` set acquires a permit before its initial sequential subscribe, serialising the post-restart stdb flood; (2) a `/health` + `/` HTTP aggregator on `127.0.0.1:8082` (configurable via `--health-bind`) that discovers `relay-*.service` units, polls each instance's loopback `/metrics` every 30 s, samples host CPU + NIC rate every 15 s, and serves the fleet-wide JSON that `www/index.html` renders. nginx proxies the public 80/443 listener to 8082 — this is the drop-in replacement for the retired BitCraft-Relay. The two jobs share no state; a failure in one cannot wedge the other. |
+| `relay-coordinator`    | Host-scoped daemon (one per host, not per region). Two independent jobs in one process: (1) a bounded reconnect-permit semaphore over `/run/relay/coordinator.sock` — each relay with `--coordinator-socket` set acquires a permit before its initial sequential subscribe, serialising the post-restart stdb flood; (2) a `/health` + `/` HTTP aggregator on `127.0.0.1:8082` (configurable via `--health-bind`) that discovers `relay-*.service` units, polls each instance's loopback `/metrics` every 30 s, samples host CPU + NIC rate every 15 s, and serves the fleet-wide JSON the dashboard renders. Source-name projection is configurable via `--source-name-template` / `--source-name-stem-prefix` (default: unit stem passthrough). The two jobs share no state; a failure in one cannot wedge the other. |
 | `relay-test-harness`   | Standalone binary that plays the C/D role. Default v2; pass `--subscriber-protocol v1` to exercise the frontend's TUL→TU synthesis path, and `--via-frontend ws://host:3009` to route through the proxy instead of hitting local stdb directly. |
-| `bc14-sdk-test`        | Standalone bin (excluded from the workspace). Vendors v1.12.0 SDK's `websocket.rs` + `compression.rs` verbatim with `pub` accessors, no codegen. Used to prove that BitCraft's 90 s RST on a 250-table set-replace is server/middlebox behavior, not a client-side bug. See `crates/bc14-sdk-test/README.md`. |
 | `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table (`relay_insert/delete/update/apply_<table>`), each taking an `Option<UpstreamReducerInfo>` arg that downstream subscribers see in `ctx.event.reducer.args`. |
 | `tools/mirror-template/` | Cargo.toml + rust-toolchain.toml copied into the runtime workdir before each codegen run. |
 
@@ -451,7 +449,7 @@ Panels:
   that respects its own `EnvFilter::new("relay=debug")` so the
   dashboard always shows debug-level relay events without restarting
   with verbose `RUST_LOG`. Ring buffer holds the last 50 000 events
-  (~12 minutes of BitCraft traffic at ~64 events/s); browser polls
+  (~12 minutes of high-volume live traffic at ~64 events/s); browser polls
   `/events?since=N&max=200` every 1 s.
 
 Source: `crates/relay/src/dashboard.rs` + `dashboard.html`.
@@ -459,21 +457,28 @@ Source: `crates/relay/src/dashboard.rs` + `dashboard.html`.
 ## Fleet `/health` (relay-coordinator)
 
 The per-instance dashboard above is loopback-only and shows one relay.
-The public `https://relay.bitcraftsync.app/health` endpoint (and the
-`www/index.html` page that renders it) is served by **relay-coordinator**
-on `127.0.0.1:8082`, with nginx proxying the public 80/443 listener to
-it. This replaced the retired standalone BitCraft-Relay process.
+The public `/health` endpoint (and whatever dashboard page renders it)
+is served by **relay-coordinator** on `127.0.0.1:8082`, with nginx (or
+equivalent) proxying the public 80/443 listener to it.
 
 The coordinator discovers the fleet by walking
 `/etc/systemd/system/relay-*.service` (`--unit-dir`), parsing each
 unit's `--frontend-bind` / `--dashboard-bind` / `--mirror-database`
-flags — no hardcoded region list, same shape as `tools/fleet-status.sh`.
-It then polls every instance's loopback `/metrics` every 30 s (4 s
-timeout each, concurrent) and folds the results into the JSON the page
-expects: `sources[name].{port, database, schema_cached, metrics}`,
+flags — no hardcoded region list. It then polls every instance's
+loopback `/metrics` every 30 s (4 s timeout each, concurrent) and folds
+the results into the JSON a dashboard expects:
+`sources[name].{port, database, schema_cached, metrics}`,
 `schema_count`, and `system.{cpu, network}`.
 
-Three fields the page reads are **derived** from the raw `/metrics`
+The `sources[*]` keys come from projecting each unit's stem through a
+configurable [`NamingSpec`] (`--source-name-template` /
+`--source-name-stem-prefix`). Default is passthrough (the unit stem is
+the source name verbatim, e.g. `relay-region14` → `relay-region14`); a
+deployment with a convention supplies a template like
+`bitcraft-live-{stem}` with prefix `relay-bc` to get `relay-bc14` →
+`bitcraft-live-14`.
+
+Three fields the dashboard reads are **derived** from the raw `/metrics`
 body (the per-instance relay doesn't emit them itself):
 
 - `metrics.process_uptime_seconds = now - started_at` (0 if either is 0)
@@ -481,14 +486,11 @@ body (the per-instance relay doesn't emit them itself):
   `state == "up"` and `last_up_at != 0`, else `null`
 - `metrics.local_stdb.uptime_seconds` — same rule on the local_stdb link
 
-This mirrors what BitCraft-Relay's `mirror_metrics::to_json` used to do
-and what `tools/fleet-status.sh` does for its UPTIME column. Derivation
-lives in `relay_coordinator::health::derive_uptime_fields`.
+Derivation lives in `relay_coordinator::health::derive_uptime_fields`.
 
-`schema_count` is **not** the upstream's ~280-table count anymore —
-each relay has its own stdb since `--stdb-spawn`, so a host-wide
-table count no longer maps cleanly. It's `sources.len()`, which
-`index.html` already accepts as the default.
+`schema_count` is **not** the upstream's table count — each relay has
+its own stdb since `--stdb-spawn`, so a host-wide table count no longer
+maps cleanly. It's `sources.len()`.
 
 Source: `crates/relay-coordinator/src/{health,sys_metrics}.rs` +
 `daemon.rs` (HTTP wiring). See the unit file
@@ -505,11 +507,6 @@ Source: `crates/relay-coordinator/src/{health,sys_metrics}.rs` +
 Identity, schema, reducers, and republish command live in
 **`CLAUDE.local.md`** (gitignored). Test module source is in
 `test-module/` (excluded from the workspace).
-
-## Reference: BitCraft live game server (EA2)
-
-Fan-research lives in **`BITCRAFT.md`**: meta host, region routing,
-`api.bitcraftonline.com` auth flow, JWT extraction, etc.
 
 ## Reference: Swift SDK
 
@@ -561,19 +558,17 @@ cross-checking encoding decisions.
 6. **Schema fingerprint = SHA-256 of the upstream schema JSON.**
    Stored in `<workdir>/fingerprint.json`. Mismatch triggers a full
    `--delete-data` republish; the wipe is the correctness guarantee.
-7. **BitCraft's ~90 s RST on big set-replace `Subscribe`s.** Subscribing
-   to all 250 BitCraft tables in one shot triggers a single >1 GB
-   `InitialSubscription` WS message. Some middlebox along
-   BitCraft's edge resets the connection at ~90 s before any client
-   can finish receiving it. Confirmed against the official SpacetimeDB
-   Rust SDK (see `crates/bc14-sdk-test/`); same RST at the same byte
-   mark. Workaround is `--subscribe-chunk-size 1` (sequential
+7. **~90 s RST on big set-replace `Subscribe`s.** Subscribing
+   to all of a large upstream's tables in one shot triggers a single
+   >1 GB `InitialSubscription` WS message. Some middlebox along the
+   path resets the connection at ~90 s before any client can finish
+   receiving it. Workaround is `--subscribe-chunk-size 1` (sequential
    `SubscribeMulti`); see "Subscribing at scale".
 8. **Allocator pressure on multi-hundred-MB fragmented frames.**
    `mimalloc` was previously the default global allocator but burns
    3-4× the RSS while tungstenite accumulates a giant fragmented
    Binary message. Removed in favor of the system allocator. Don't
-   re-enable mimalloc without retesting against a BitCraft-scale
+   re-enable mimalloc without retesting against a large-scale
    subscribe.
 9. **`tokio::select!` over a split `WebSocketStream`.** Don't.
    `WebSocketStream::split` returns a `BiLock`-shared sink/stream
@@ -653,10 +648,7 @@ SDK).
   for parser implementations.
 - For SpacetimeDB Rust SDK behavior, the v1.12.0 source is at
   `https://github.com/clockworklabs/SpacetimeDB/tree/v1.12.0/sdks/rust`.
-  The crate's WS handling lives in `src/websocket.rs` and is
-  vendored verbatim by `crates/bc14-sdk-test/` for empirical
-  testing — run that bin to confirm any large-scale subscribe issue
-  isn't caused by something we did vs the SDK.
+  The crate's WS handling lives in `src/websocket.rs`.
 - The spike under `spike/` (codegen Python + sample mirror crate +
   `spike-replay` standalone driver) was the original validation.
   Useful as a reference when refactoring codegen or driver internals.

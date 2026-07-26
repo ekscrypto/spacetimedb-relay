@@ -126,7 +126,7 @@ async fn handle_accept(
     // Disable tungstenite's 64 MiB default message/frame size cap. The
     // downstream-facing server is the WS reader for frames the local stdb
     // emits, and a single `SubscribeApplied` for a large public table
-    // (BitCraft's `location_state` snapshot is ~1 GB as one WS message) can
+    // (a large table's snapshot can be ~1 GB as one WS message) can
     // exceed the default — observed downstream as `Connection reset without
     // closing handshake` after 0 rows. Every WS *client* path in this repo
     // already sets None/None (see relay-upstream client.rs and

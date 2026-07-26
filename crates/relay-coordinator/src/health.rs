@@ -4,18 +4,25 @@
 //!
 //! Discovers the relay-* systemd units on the host, polls each
 //! instance's loopback `/metrics` JSON dashboard, and folds the
-//! results into the shape `www/index.html` consumes:
+//! results into the shape a dashboard page consumes:
 //!
 //! ```jsonc
 //! {
 //!   "sources": {
-//!     "global":           { "port": 3000, "database": "...", "schema_cached": true, "metrics": {...} },
-//!     "bitcraft-live-14": { ... }
+//!     "global":   { "port": 3000, "database": "...", "schema_cached": true, "metrics": {...} },
+//!     "region14": { ... }
 //!   },
-//!   "schema_count": 14,
+//!   "schema_count": 2,
 //!   "system": { "cpu": {...}, "memory": {...}, "network": {...} }
 //! }
 //! ```
+//!
+//! The source name shown in `sources` is **deployment-configured**, not
+//! hardcoded: by default the systemd unit stem passes through verbatim
+//! (`relay-region14` → `relay-region14`). A deployment can supply a
+//! `NamingSpec` (e.g. `template = "live-{stem}", stem_prefix = "relay-"`)
+//! to project `relay-bc14` → `live-bc14` for its dashboard. See
+//! [`NamingSpec`].
 //!
 //! `sources[*].metrics` is the **raw relay `/metrics` body** plus three
 //! derived fields the page reads but the relay doesn't emit:
@@ -25,9 +32,6 @@
 //!   and `last_up_at != 0`; otherwise `null` so a stale timestamp can't
 //!   masquerade as live uptime)
 //! - `local_stdb.uptime_seconds` — same rule on the local_stdb link
-//!
-//! Same derivation BitCraft-Relay used to do in its `mirror_metrics::to_json`,
-//! and the same one `tools/fleet-status.sh` does for its UPTIME column.
 //!
 //! Failures are graceful: a single instance's `/metrics` timing out
 //! doesn't blank the whole fleet — that source keeps its prior snapshot
@@ -46,10 +50,9 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::sys_metrics::SysState;
 
-/// How often the sources poller refreshes the fleet map. Matches the
-/// cadence BitCraft-Relay's `mirror_metrics::start` used (30s).
+/// How often the sources poller refreshes the fleet map.
 pub const SOURCES_POLL_INTERVAL: Duration = Duration::from_secs(30);
-/// Per-instance `/metrics` fetch timeout. Matches `fleet-status.sh`.
+/// Per-instance `/metrics` fetch timeout.
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// One row of the `sources` map. `metrics` is `None` when the last
@@ -66,7 +69,8 @@ pub struct SourceSnapshot {
 /// Per-instance facts parsed from the systemd unit file.
 #[derive(Clone, Debug)]
 pub struct DiscoveredSource {
-    /// Source name as shown to the UI: `global` or `bitcraft-live-<N>`.
+    /// Source name as shown to the UI. Derived from the unit stem via
+    /// the deployment's [`NamingSpec`] (default: passthrough).
     pub name: String,
     /// Mirror database name (`--mirror-database`).
     pub database: String,
@@ -74,6 +78,52 @@ pub struct DiscoveredSource {
     pub frontend_port: u16,
     /// Loopback dashboard port (`--dashboard-bind`).
     pub dashboard_port: u16,
+}
+
+/// How a unit stem is projected into the `sources[*]` key shown in
+/// `/health`. Defaults to passthrough: the unit stem is used verbatim.
+///
+/// A deployment with a naming convention supplies a template:
+///
+/// - `template = "live-{stem}"`, `stem_prefix = "relay-bc"`
+///   → `relay-bc14` becomes `live-14`.
+/// - `template = "live-{stem}"`, `stem_prefix = "relay-"`
+///   → `relay-region14` becomes `live-region14`.
+///
+/// `{stem}` is the unit stem after stripping `stem_prefix` (or the full
+/// stem if no prefix matches). If the prefix is set but doesn't match,
+/// the full stem is used (so a stray `relay-coordinator.service` won't
+/// be mis-projected). `template` without a `{stem}` placeholder is
+/// returned literally — usually a mistake, but allowed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NamingSpec {
+    /// `format!`-style template with a single `{stem}` placeholder.
+    /// Empty/`None` → use the (possibly prefix-stripped) stem verbatim.
+    pub template: Option<String>,
+    /// Prefix to strip from the unit stem before substitution. Empty/
+    /// `None` → no stripping.
+    pub stem_prefix: Option<String>,
+}
+
+impl NamingSpec {
+    /// Passthrough naming — the unit stem is the source name as-is.
+    pub fn passthrough() -> Self {
+        Self::default()
+    }
+
+    /// Project a unit stem through this spec.
+    pub fn project(&self, stem: &str) -> String {
+        let trimmed = match &self.stem_prefix {
+            Some(prefix) if !prefix.is_empty() && stem.starts_with(prefix) => {
+                &stem[prefix.len()..]
+            }
+            _ => stem,
+        };
+        match &self.template {
+            Some(tpl) => tpl.replace("{stem}", trimmed),
+            None => trimmed.to_string(),
+        }
+    }
 }
 
 /// Shared state for the `/health` handler. Cheap to clone.
@@ -84,6 +134,7 @@ pub struct HealthState {
 
 struct Inner {
     unit_dir: PathBuf,
+    naming: NamingSpec,
     fetch_timeout: Duration,
     http: Client,
     sources: RwLock<BTreeMap<String, SourceSnapshot>>,
@@ -97,6 +148,16 @@ struct Inner {
 
 impl HealthState {
     pub fn new(unit_dir: impl Into<PathBuf>, sys: SysState) -> Self {
+        Self::with_naming(unit_dir, sys, NamingSpec::passthrough())
+    }
+
+    /// Like [`HealthState::new`] but with a custom [`NamingSpec`] for
+    /// projecting unit stems into source names.
+    pub fn with_naming(
+        unit_dir: impl Into<PathBuf>,
+        sys: SysState,
+        naming: NamingSpec,
+    ) -> Self {
         let http = Client::builder()
             .timeout(DEFAULT_FETCH_TIMEOUT)
             .build()
@@ -104,6 +165,7 @@ impl HealthState {
         Self {
             inner: Arc::new(Inner {
                 unit_dir: unit_dir.into(),
+                naming,
                 fetch_timeout: DEFAULT_FETCH_TIMEOUT,
                 http,
                 sources: RwLock::new(BTreeMap::new()),
@@ -121,7 +183,7 @@ impl HealthState {
         // caller, but a manual trigger shouldn't race it.
         let _guard = self.inner.refresh_lock.lock().await;
 
-        let discovered = discover(&self.inner.unit_dir);
+        let discovered = discover(&self.inner.unit_dir, &self.inner.naming);
         if discovered.is_empty() {
             // Nothing to poll; clear the map so a config wipe shows up.
             self.inner.sources.write().clear();
@@ -211,7 +273,7 @@ impl HealthState {
         let sys = self.inner.sys.snapshot();
         // schema_count: we don't have a host-wide table count anymore
         // (each relay has its own stdb now). Fall back to sources.len(),
-        // which index.html already accepts as the default.
+        // which the dashboard already accepts as the default.
         json!({
             "sources": sources,
             "schema_count": sources.len(),
@@ -247,9 +309,8 @@ fn derive_uptime_fields(metrics: &Value) -> Value {
     let now = obj.get("now").and_then(|v| v.as_u64()).unwrap_or(0);
     let started_at = obj.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
     // process_uptime_seconds = now - started_at. Collapses to 0 if
-    // either timestamp is missing/zero (matches BitCraft-Relay) —
-    // saturating_sub alone would return `now` when started_at is 0,
-    // which is not what we want.
+    // either timestamp is missing/zero — saturating_sub alone would
+    // return `now` when started_at is 0, which is not what we want.
     let process_uptime = if now == 0 || started_at == 0 {
         0
     } else {
@@ -279,18 +340,19 @@ fn inject_link_uptime(link: &mut Map<String, Value>, now: u64) {
     link.insert("uptime_seconds".to_string(), uptime);
 }
 
-/// Discover all mirror relay units in `unit_dir`, sorted global first
-/// then ascending by region ID. Excludes the shared stdb, coordinator,
-/// fleet-sequencer, and staleness-monitor units (they carry no mirror).
+/// Discover all mirror relay units in `unit_dir`, sorted by unit stem.
+/// Recognises any `relay-<stem>.service` unit (where `<stem>` is non-empty
+/// and the unit is not a known non-mirror relay utility — the coordinator,
+/// fleet sequencer, staleness monitor, or shared stdb).
 ///
-/// Mirrors the discovery in `tools/fleet-status.sh:29-40` but in pure
-/// Rust so the coordinator doesn't shell out.
-pub fn discover(unit_dir: &Path) -> Vec<DiscoveredSource> {
+/// `naming` controls how the unit stem is projected into the source name
+/// shown in `/health.sources` (default [`NamingSpec::passthrough`]).
+pub fn discover(unit_dir: &Path, naming: &NamingSpec) -> Vec<DiscoveredSource> {
     let entries = match std::fs::read_dir(unit_dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
-    let mut found: Vec<(u32, DiscoveredSource)> = Vec::new();
+    let mut found: Vec<(String, DiscoveredSource)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -299,32 +361,48 @@ pub fn discover(unit_dir: &Path) -> Vec<DiscoveredSource> {
         let Some(stem) = name.strip_suffix(".service") else {
             continue;
         };
-        // Only relay-global and relay-bc<N> host mirrors. Skip everything
-        // else (stdb is gone since --stdb-spawn but stay defensive).
-        let sort_key: u32 = match stem {
-            "relay-global" => 0,
-            "relay-stdb"
-            | "relay-coordinator"
-            | "relay-fleet-sequencer"
-            | "relay-staleness-monitor" => {
-                continue;
-            }
-            s if s.starts_with("relay-bc") => match s[8..].parse::<u32>() {
-                Ok(n) => n,
-                Err(_) => continue,
-            },
-            _ => continue,
-        };
+        // Recognise any `relay-*` unit that hosts a mirror. Skip the
+        // known fleet-utility units (they carry no mirror to poll).
+        if !is_mirror_unit(stem) {
+            continue;
+        }
         let body = match std::fs::read_to_string(&path) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        if let Some(src) = parse_unit(&body, stem) {
-            found.push((sort_key, src));
+        if let Some(src) = parse_unit(&body, stem, naming) {
+            // Sort by the projected name so the dashboard sees a stable
+            // ordering regardless of readdir sequence.
+            found.push((src.name.clone(), src));
         }
     }
-    found.sort_by_key(|(k, _)| *k);
+    found.sort_by(|a, b| a.0.cmp(&b.0));
     found.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Does this unit stem host a relay mirror we should poll?
+///
+/// True for any `relay-<stem>.service` where `<stem>` is non-empty and
+/// not one of the known fleet-utility units. The shared stdb unit
+/// (`relay-stdb`) is included defensively even though `--stdb-spawn`
+/// made it obsolete — a leftover unit shouldn't crash discovery.
+fn is_mirror_unit(stem: &str) -> bool {
+    // Strip the conventional `relay-` prefix; the remainder is the
+    // per-deployment stem (`global`, `region14`, `bc14`, …).
+    let Some(rest) = stem.strip_prefix("relay-") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    !matches!(
+        stem,
+        "relay-stdb"
+            | "relay-coordinator"
+            | "relay-fleet-sequencer"
+            | "relay-fleet-start"
+            | "relay-staleness-monitor"
+    )
 }
 
 /// Parse a systemd unit file body into a [`DiscoveredSource`].
@@ -334,32 +412,18 @@ pub fn discover(unit_dir: &Path) -> Vec<DiscoveredSource> {
 /// - `--dashboard-bind 127.0.0.1:PORT` → dashboard port
 /// - `--mirror-database NAME` or `--mirror-database=NAME` → database
 ///
-/// Source name: `global` for `relay-global`, else `bitcraft-live-<N>`
-/// for `relay-bc<N>` (matches how the page's FALLBACK_SOURCES list
-/// names them).
-pub fn parse_unit(body: &str, unit_stem: &str) -> Option<DiscoveredSource> {
+/// The source name comes from `naming.project(unit_stem)`.
+pub fn parse_unit(body: &str, unit_stem: &str, naming: &NamingSpec) -> Option<DiscoveredSource> {
     let frontend_port = parse_bind_port(body, "--frontend-bind")?;
     let dashboard_port = parse_bind_port(body, "--dashboard-bind")?;
     let database = parse_flag_value(body, "--mirror-database")?;
-    let name = source_name_from_unit(unit_stem);
+    let name = naming.project(unit_stem);
     Some(DiscoveredSource {
         name,
         database,
         frontend_port,
         dashboard_port,
     })
-}
-
-/// Derive the source name shown in `/health.sources` from the unit stem.
-/// `relay-global` → `global`; `relay-bc14` → `bitcraft-live-14`.
-fn source_name_from_unit(stem: &str) -> String {
-    if stem == "relay-global" {
-        "global".to_string()
-    } else if let Some(rest) = stem.strip_prefix("relay-bc") {
-        format!("bitcraft-live-{rest}")
-    } else {
-        stem.to_string()
-    }
 }
 
 /// Parse `--<flag> 127.0.0.1:PORT` (or `0.0.0.0:PORT`) and return PORT.
@@ -414,9 +478,9 @@ mod tests {
     fn unit_body(frontend: &str, dashboard: &str, mirror_db: &str) -> String {
         format!(
             "[Service]\n\
-             ExecStart=/srv/relay/spacetimedb-relay/target/release/relay \\\n\
-             --upstream wss://bitcraft-early-access.spacetimedb.com \\\n\
-             --database bitcraft-live-14 \\\n\
+             ExecStart=/srv/relay/target/release/relay \\\n\
+             --upstream wss://upstream.example.com \\\n\
+             --database upstream-db \\\n\
              --mirror-database {mirror_db} \\\n\
              --frontend-bind {frontend} \\\n\
              --dashboard-bind {dashboard} \\\n\
@@ -426,21 +490,55 @@ mod tests {
 
     #[test]
     fn parse_unit_file_extracts_ports_and_database() {
-        let body = unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-bc14");
-        let src = parse_unit(&body, "relay-bc14").expect("parsed");
-        assert_eq!(src.name, "bitcraft-live-14");
-        assert_eq!(src.database, "relay-mirror-bc14");
+        // Default naming = passthrough: the unit stem is the source name.
+        let body = unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14");
+        let src = parse_unit(&body, "relay-region14", &NamingSpec::passthrough()).expect("parsed");
+        assert_eq!(src.name, "relay-region14");
+        assert_eq!(src.database, "relay-mirror-region14");
         assert_eq!(src.frontend_port, 3014);
         assert_eq!(src.dashboard_port, 3114);
+    }
+
+    #[test]
+    fn parse_unit_file_projects_name_via_naming_spec() {
+        // A deployment convention: `relay-bc14` → `live-14`.
+        let naming = NamingSpec {
+            template: Some("live-{stem}".into()),
+            stem_prefix: Some("relay-bc".into()),
+        };
+        let body = unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-bc14");
+        let src = parse_unit(&body, "relay-bc14", &naming).expect("parsed");
+        assert_eq!(src.name, "live-14");
+        assert_eq!(src.database, "relay-mirror-bc14");
+    }
+
+    #[test]
+    fn naming_spec_prefix_mismatch_falls_back_to_full_stem() {
+        // If the configured prefix doesn't match, use the stem verbatim
+        // inside the template rather than mis-projecting.
+        let naming = NamingSpec {
+            template: Some("live-{stem}".into()),
+            stem_prefix: Some("relay-bc".into()),
+        };
+        assert_eq!(naming.project("relay-region14"), "live-relay-region14");
+    }
+
+    #[test]
+    fn naming_spec_template_without_placeholder_is_literal() {
+        let naming = NamingSpec {
+            template: Some("static".into()),
+            stem_prefix: None,
+        };
+        assert_eq!(naming.project("relay-region14"), "static");
     }
 
     #[test]
     fn parse_unit_file_accepts_0000_frontend_bind() {
         // Legacy public-facing binds used 0.0.0.0. The parser must
         // still extract the port (only the host part differs).
-        let body = unit_body("0.0.0.0:3000", "127.0.0.1:3100", "relay-mirror-bc-global");
-        let src = parse_unit(&body, "relay-global").expect("parsed");
-        assert_eq!(src.name, "global");
+        let body = unit_body("0.0.0.0:3000", "127.0.0.1:3100", "relay-mirror-global");
+        let src = parse_unit(&body, "relay-global", &NamingSpec::passthrough()).expect("parsed");
+        assert_eq!(src.name, "relay-global");
         assert_eq!(src.frontend_port, 3000);
         assert_eq!(src.dashboard_port, 3100);
     }
@@ -448,10 +546,10 @@ mod tests {
     #[test]
     fn parse_unit_file_accepts_equals_form() {
         // Some deployments use `--flag=value` instead of `--flag value`.
-        let body = "[Service]\nExecStart=relay --mirror-database=relay-mirror-bc7 \
+        let body = "[Service]\nExecStart=relay --mirror-database=relay-mirror-region7 \
              --frontend-bind=127.0.0.1:3007 --dashboard-bind=127.0.0.1:3107\n";
-        let src = parse_unit(body, "relay-bc7").expect("parsed");
-        assert_eq!(src.database, "relay-mirror-bc7");
+        let src = parse_unit(body, "relay-region7", &NamingSpec::passthrough()).expect("parsed");
+        assert_eq!(src.database, "relay-mirror-region7");
         assert_eq!(src.frontend_port, 3007);
         assert_eq!(src.dashboard_port, 3107);
     }
@@ -459,8 +557,8 @@ mod tests {
     #[test]
     fn parse_unit_file_returns_none_when_flags_missing() {
         // Without --frontend-bind the unit isn't usable for /health.
-        let body = "[Service]\nExecStart=relay --database bitcraft-live-14\n";
-        assert!(parse_unit(body, "relay-bc14").is_none());
+        let body = "[Service]\nExecStart=relay --database upstream-db\n";
+        assert!(parse_unit(body, "relay-region14", &NamingSpec::passthrough()).is_none());
     }
 
     #[test]
@@ -471,15 +569,15 @@ mod tests {
         };
         mk(
             "relay-global",
-            &unit_body("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-bc-global"),
+            &unit_body("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-global"),
         );
         mk(
-            "relay-bc14",
-            &unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-bc14"),
+            "relay-region14",
+            &unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14"),
         );
         mk(
-            "relay-bc7",
-            &unit_body("127.0.0.1:3007", "127.0.0.1:3107", "relay-mirror-bc7"),
+            "relay-region7",
+            &unit_body("127.0.0.1:3007", "127.0.0.1:3107", "relay-mirror-region7"),
         );
         // These should all be skipped:
         mk(
@@ -495,15 +593,50 @@ mod tests {
             "[Service]\nExecStart=relay-fleet-start.sh\n",
         );
         mk(
+            "relay-fleet-start",
+            "[Service]\nExecStart=relay-fleet-start.sh\n",
+        );
+        mk(
             "relay-staleness-monitor",
             "[Service]\nExecStart=relay-staleness-monitor.sh\n",
         );
         // Non-relay-prefixed files ignored.
         mk("nginx", "[Service]\nExecStart=nginx\n");
 
-        let found = discover(dir.path());
+        // Default passthrough naming: source names equal the unit stems.
+        let found = discover(dir.path(), &NamingSpec::passthrough());
         let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["global", "bitcraft-live-7", "bitcraft-live-14"]);
+        assert_eq!(
+            names,
+            vec!["relay-global", "relay-region14", "relay-region7"]
+        );
+    }
+
+    #[test]
+    fn discover_applies_naming_spec_when_projecting() {
+        // A deployment convention like BitCraft's: `relay-bc14` → `live-14`.
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("relay-bc14.service"),
+            unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-bc14"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("relay-global.service"),
+            unit_body("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-bc-global"),
+        )
+        .unwrap();
+        let naming = NamingSpec {
+            template: Some("live-{stem}".into()),
+            stem_prefix: Some("relay-bc".into()),
+        };
+        let found = discover(dir.path(), &naming);
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        // relay-bc14 → live-14; relay-global → the prefix matches so the
+        // remainder after "relay-bc" is "global"... no, it doesn't match.
+        // "relay-global".starts_with("relay-bc") is false, so the full
+        // stem flows into the template as {stem}.
+        assert_eq!(names, vec!["live-14", "live-relay-global"]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
-// Smoke-test the Publisher against the cached BitCraft 14 schema.
+// Smoke-test the Publisher against a cached upstream schema.
 // Requires a running local SpacetimeDB and a server alias `spike-local`.
 //
-//   cargo run -p relay-publisher --example smoke -- /tmp/bitcraft-14-schema.json
+//   cargo run -p relay-publisher --example smoke -- /tmp/upstream-schema.json
 
 use std::path::PathBuf;
 
@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         workdir: PathBuf::from("/tmp/relay-publisher-smoke-workdir"),
         template_dir: repo_root.join("tools/mirror-template"),
         codegen_script: repo_root.join("tools/codegen.py"),
-        spacetime_bin: PathBuf::from("/Users/ekscrypto/.local/bin/spacetime"),
+        spacetime_bin: PathBuf::from("spacetime"),
         stdb_server: "spike-local".to_string(),
         database_name: "relay-mirror-smoke".to_string(),
     };

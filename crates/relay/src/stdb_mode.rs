@@ -18,7 +18,7 @@
 //!   single set-replace `Subscribe` (default) OR a sequential
 //!   `SubscribeMulti` per table (`--subscribe-chunk-size 1`, v1
 //!   only — see CLAUDE.md "Subscribing at scale" for why this is
-//!   required against BitCraft). Routes `SubscribeApplied` and
+//!   required against a large v1 upstream). Routes `SubscribeApplied` and
 //!   `TransactionUpdate` rows into the driver. Reconnects with
 //!   exponential backoff on disconnect.
 
@@ -57,12 +57,13 @@ pub struct StdbModeConfig {
     /// `ceil(n_tables / chunk_size)` WS connections in parallel; each
     /// runs its own reconnect loop and applies frames into the shared
     /// `MirrorDriver`. This avoids the multi-hundred-MB single-message
-    /// initial subscription that BitCraft's middlebox kills at ~90 s.
+    /// initial subscription that a large v1 upstream's middlebox
+    /// kills at ~90 s.
     pub subscribe_chunk_size: usize,
 
     /// Local SpacetimeDB target (e.g. `ws://127.0.0.1:3000`).
     pub stdb_url: Url,
-    /// Database name to publish under (e.g. `relay-mirror-bitcraft-14`).
+    /// Database name to publish under (e.g. `relay-mirror-example`).
     pub mirror_database: String,
     /// Optional explicit Bearer token for the local-stdb connection.
     /// Usually `None` — the relay reads/writes
@@ -191,8 +192,8 @@ pub async fn run(
     // 4. Reconnect loop. Single upstream connection. When
     //    `subscribe_chunk_size == 1` and the upstream is v1, we use
     //    sequential SubscribeMulti (one query at a time, additive)
-    //    instead of one big set-replace Subscribe — avoiding
-    //    BitCraft's ~90 s middlebox kill on multi-hundred-MB initial
+    //    instead of one big set-replace Subscribe — avoiding a large
+    //    v1 upstream's ~90 s middlebox kill on multi-hundred-MB initial
     //    subscriptions.
     let upstream_cfg = UpstreamConfig {
         host: cfg.upstream_host.clone(),
@@ -259,8 +260,9 @@ pub async fn run(
 
     // Sequential-mode state. Outside the reconnect loop so it persists
     // across reconnects — though re-subscribing from scratch on each
-    // reconnect is the conservative behavior (BitCraft's per-table
-    // initial dumps are inexpensive once we're past the 90 s wall).
+    // reconnect is the conservative behavior (a large v1 upstream's
+    // per-table initial dumps are inexpensive once we're past the
+    // 90 s wall).
     let mut sequential_progress = SequentialState {
         next_idx: 0,
         in_flight_query_id: None,

@@ -224,7 +224,7 @@ async fn main() -> Result<()> {
     // dashboard's in-process ring buffer. The dashboard view exists
     // precisely so we can see debug-level events without re-running
     // with a louder `RUST_LOG`.
-    // 50K capacity is enough to hold ~12 minutes of BitCraft live
+    // 50K capacity is enough to hold ~12 minutes of high-volume live
     // traffic at the observed ~64 events/sec frame rate without
     // evicting earlier milestones (Subscribe, SubscribeApplied, etc.).
     let event_ring = dashboard::EventRing::new(50_000);

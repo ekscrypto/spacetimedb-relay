@@ -968,7 +968,7 @@ async fn connect_local(
     // Disable tungstenite's 64 MiB default message/frame size cap. The local
     // stdb emits the full snapshot for a subscribed table as a single
     // `InitialSubscription` / `SubscribeApplied` WS message, and for large
-    // public tables (BitCraft's `location_state` is ~1 GB) that one message
+    // public tables (a large table can be ~1 GB) that one message
     // exceeds the default — observed as `Connection reset without closing
     // handshake` on the downstream client because this reader aborts first.
     // The sibling path used by the upstream/mirror driver already sets
@@ -1126,7 +1126,7 @@ mod tests {
         let msg = v2::ClientMessage::Subscribe(v2::Subscribe {
             request_id: 2,
             query_set_id: v2::QuerySetId::new(2),
-            query_strings: vec!["SELECT * FROM claim_local_state".into()].into(),
+            query_strings: vec!["SELECT * FROM my_table".into()].into(),
         });
         let frame = Bytes::from(sats_bsatn::to_vec(&msg).unwrap());
         assert_eq!(frame.first().copied(), Some(0x00)); // Subscribe discriminant
@@ -1362,7 +1362,7 @@ mod tests {
         let req = encode_json_client_message(v1::ClientMessage::OneOffQuery(
             v1::OneOffQuery {
                 message_id: b"\x01\x02\x03".to_vec().into_boxed_slice(),
-                query_string: "SELECT * FROM player_state".into(),
+                query_string: "SELECT * FROM my_table".into(),
             },
         ));
         let stats = fake_stats(Subprotocol::V1Json);

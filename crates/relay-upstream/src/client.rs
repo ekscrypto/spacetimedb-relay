@@ -164,7 +164,7 @@ pub enum UpstreamCommand {
     /// in `v1_compat`) carrying just that query's initial rows. v2 has
     /// a similar additive `SubscribeMulti` shape, but we currently
     /// only encode the v1 form since that's the only path that needs
-    /// it (BitCraft v1).
+    /// it (a large v1 upstream).
     SubscribeOne {
         request_id: u32,
         query_id: u32,
@@ -248,7 +248,7 @@ pub async fn connect_and_run(
 
     // SpacetimeDB v1's `InitialSubscription` carries the entire snapshot
     // for every subscribed table in a single frame. On large databases
-    // (e.g. BitCraft's `bitcraft-live-{N}` modules with 250 public-user
+    // (e.g. a large v1 upstream with 250 public-user
     // tables and tens of thousands of rows) that one frame can exceed
     // tungstenite's 64 MiB default and abort the connection. Disable
     // the cap — operators control memory pressure by choosing which
@@ -281,8 +281,8 @@ pub async fn connect_and_run(
     // creates a BiLock between the read and write halves, which means
     // tungstenite's auto-Pong replies (queued during read polls)
     // never get flushed until the write half is independently polled.
-    // For multi-hundred-MB fragmented messages from BitCraft this can
-    // never happen — the read poll monopolises the future for the
+    // For multi-hundred-MB fragmented messages from a large v1
+    // upstream this can never happen — the read poll monopolises the future for the
     // duration of message reassembly, by which point the upstream's
     // ~30 s ping-timeout fires and resets the connection. With an
     // un-split socket every read poll also flushes the write buffer
@@ -336,8 +336,9 @@ pub async fn connect_and_run(
     // Unconditional client Ping every 10 s. We tested SDK-style "only
     // ping when idle for 30 s" and it never fires during a multi-100MB
     // InitialSubscription burst (idle stays false the whole time), yet
-    // BitCraft's path RSTs the connection at ~90 s anyway — almost
-    // certainly a NAT/load-balancer dropping a half-idle TCP flow with
+    // a large v1 upstream behind an aggressive middlebox RSTs the
+    // connection at ~90 s anyway — almost certainly a
+    // NAT/load-balancer dropping a half-idle TCP flow with
     // no outbound traffic. Sending an unconditional Ping every 10 s
     // keeps something flowing outbound to satisfy the middlebox, with
     // RTT well under any reasonable middlebox idle threshold.

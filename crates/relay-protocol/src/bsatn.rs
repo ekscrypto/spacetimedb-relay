@@ -368,7 +368,7 @@ mod tests {
     use crate::schema::{MirroredField, MirroredSchema, MirroredType, MirroredVariant};
 
     fn timestamp_field(name: &str) -> MirroredField {
-        // Mirror BitCraft's `Optional<Timestamp>` shape:
+        // Mirror SpacetimeDB's `Option<Timestamp>` BSATN shape:
         // Sum<some: Product[{__timestamp_micros_since_unix_epoch__: I64}], none: Product[]>.
         MirroredField {
             name: Some(name.to_string()),

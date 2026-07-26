@@ -215,7 +215,7 @@ fn build_response(body: &[u8]) -> Vec<u8> {
 /// kernel receive buffer when we come to write the response. If we let
 /// the caller drop the stream with those bytes unread, the kernel sends
 /// an RST rather than a FIN — which discards whatever remains in the
-/// *send* buffer too. For the ~580 KB BitCraft schema that truncated
+/// *send* buffer too. For a large upstream schema that truncated
 /// every client at ~127 KB. Draining the receive buffer first lets the
 /// subsequent close deliver the full payload cleanly.
 pub async fn serve_schema(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
@@ -255,8 +255,8 @@ mod tests {
 
     #[test]
     fn schema_get_is_schema() {
-        let req = b"GET /v1/database/relay-mirror-bitcraft-14/schema?version=9 HTTP/1.1\r\n\
-                   Host: relay.bitcraftsync.app:3014\r\n\
+        let req = b"GET /v1/database/relay-mirror-example/schema?version=9 HTTP/1.1\r\n\
+                   Host: example.com:3014\r\n\
                    \r\n";
         assert_eq!(state(req), ProbeState::Schema);
         assert_eq!(classify_final(req), HttpProbe::Schema);
@@ -369,8 +369,8 @@ mod tests {
 
         // A realistic WebSocket subscribe handshake: the exact shape a
         // downstream client sends to /v1/database/<db>/subscribe.
-        let req = b"GET /v1/database/relay-mirror-bc13/subscribe HTTP/1.1\r\n\
-                    Host: relay.bitcraftsync.app:3013\r\n\
+        let req = b"GET /v1/database/relay-mirror-region13/subscribe HTTP/1.1\r\n\
+                    Host: example.com:3013\r\n\
                     Upgrade: websocket\r\n\
                     Connection: Upgrade\r\n\
                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
@@ -467,7 +467,7 @@ mod tests {
     // socket's receive buffer (probe peeks non-destructively). When the
     // caller then dropped the stream, the kernel saw unread receive data
     // at close time and sent RST instead of FIN — discarding whatever was
-    // still in the send buffer. The ~580 KB BitCraft schema truncated
+    // still in the send buffer. A large upstream schema truncated
     // every client at ~127 KB. The fix drains the receive buffer before
     // returning so the caller's drop produces a clean close. This test
     // asserts the property that broke: a body larger than a typical socket
@@ -480,11 +480,11 @@ mod tests {
 
         // Large enough to overflow the kernel send buffer (~128-256 KB on
         // most platforms) so a premature close would visibly truncate.
-        // Mirrors the real BitCraft schema (~580 KB).
+        // Mirrors a large upstream schema (~580 KB).
         let body = vec![b'{'; 600_000];
         let body_len = body.len();
 
-        let req = b"GET /v1/database/relay-mirror-bc-global/schema?version=9 \
+        let req = b"GET /v1/database/relay-mirror-global/schema?version=9 \
                     HTTP/1.1\r\nHost: x\r\n\r\n";
 
         let server = tokio::spawn(async move {

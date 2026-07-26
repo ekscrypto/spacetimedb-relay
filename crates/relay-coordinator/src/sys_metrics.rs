@@ -14,9 +14,8 @@
 //!   virtual bridges are excluded so local relay↔stdb traffic doesn't
 //!   inflate the number.
 //!
-//! This mirrors what the retired BitCraft-Relay's `sys_metrics` module
-//! surfaced (plus memory). Only Linux is deployed; the code compiles on
-//! macOS for dev but network counters may be empty there.
+//! Only Linux is deployed; the code compiles on macOS for dev but
+//! network counters may be empty there.
 
 use std::collections::HashMap;
 use std::sync::Arc;
