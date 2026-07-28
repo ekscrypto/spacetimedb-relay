@@ -52,6 +52,7 @@ pub async fn run(
     socket_path: PathBuf,
     max_concurrent: usize,
     health_bind: Option<SocketAddr>,
+    mirrors_url: Option<String>,
     unit_dir: PathBuf,
     naming: NamingSpec,
     index_html: Option<String>,
@@ -80,7 +81,25 @@ pub async fn run(
     // populated within seconds of process start, then every 30s.
     let health_task = if let Some(bind) = health_bind {
         let sys = SysState::new();
-        let health = HealthState::with_naming(unit_dir.clone(), sys.clone(), naming.clone());
+        let health = HealthState::with_options(
+            mirrors_url.clone(),
+            unit_dir.clone(),
+            sys.clone(),
+            naming.clone(),
+        );
+        if let Some(ref url) = mirrors_url {
+            tracing::info!(
+                target: "relay_coordinator",
+                %url,
+                "health sources from public-mirror /v1/mirrors"
+            );
+        } else {
+            tracing::info!(
+                target: "relay_coordinator",
+                unit_dir = %unit_dir.display(),
+                "health sources from legacy relay unit discovery"
+            );
+        }
 
         // Spawn the sources poller (drives the `sources` map) and the
         // host metrics sampler (drives `system.cpu` / `system.memory` /

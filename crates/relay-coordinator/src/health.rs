@@ -2,46 +2,38 @@
 
 //! Fleet `/health` aggregator.
 //!
-//! Discovers the relay-* systemd units on the host, polls each
-//! instance's loopback `/metrics` JSON dashboard, and folds the
-//! results into the shape a dashboard page consumes:
+//! Two discovery modes:
+//!
+//! 1. **Public-mirror (preferred):** poll once
+//!    `GET {mirrors_url}` (default `http://127.0.0.1:3000/v1/mirrors`)
+//!    and map each mirror row into `sources[*]` with public port derived
+//!    from the database name (`bitcraft-live-global` → 3000,
+//!    `bitcraft-live-N` → `3000+N`).
+//! 2. **Legacy relay units:** walk `relay-*.service` files for
+//!    `--frontend-bind` / `--dashboard-bind` / `--mirror-database` and
+//!    poll each loopback `/metrics` (kept for transition / tests).
 //!
 //! ```jsonc
 //! {
 //!   "sources": {
-//!     "global":   { "port": 3000, "database": "...", "schema_cached": true, "metrics": {...} },
-//!     "region14": { ... }
+//!     "global": {
+//!       "port": 3000,
+//!       "database": "bitcraft-live-global",
+//!       "schema_cached": true,
+//!       "connectivity": "live",
+//!       "tables_live": 12,
+//!       "tables_total": 12,
+//!       "transactions_processed": 12345,
+//!       "connected_since": "…"
+//!     }
 //!   },
-//!   "schema_count": 2,
+//!   "schema_count": 1,
 //!   "system": { "cpu": {...}, "memory": {...}, "network": {...} }
 //! }
 //! ```
 //!
-//! The source name shown in `sources` is **deployment-configured**, not
-//! hardcoded: by default the systemd unit stem passes through verbatim
-//! (`relay-region14` → `relay-region14`). A deployment can supply a
-//! `NamingSpec` (e.g. `template = "live-{stem}", stem_prefix = "relay-region"`)
-//! to project `relay-region14` → `live-14` for its dashboard. See
-//! [`NamingSpec`].
-//!
-//! `sources[*].metrics` is the relay `/metrics` body, lightly prepared
-//! for public consumption: three derived fields the page reads but the
-//! relay doesn't emit are injected, and internal debug state that was
-//! never meant to leave the loopback per-instance dashboard is stripped
-//! (currently: the entire `frontend.clients` array — per-connection
-//! detail including remote addresses and SQL strings).
-//!
-//! Derived fields:
-//!
-//! - `process_uptime_seconds = now - started_at`
-//! - `upstream.uptime_seconds = now - last_up_at` (only when state=="up"
-//!   and `last_up_at != 0`; otherwise `null` so a stale timestamp can't
-//!   masquerade as live uptime)
-//! - `local_stdb.uptime_seconds` — same rule on the local_stdb link
-//!
-//! Failures are graceful: a single instance's `/metrics` timing out
-//! doesn't blank the whole fleet — that source keeps its prior snapshot
-//! for one cycle (so a flaky curl doesn't flap a row).
+//! Failures are graceful: a failed `/v1/mirrors` (or per-instance
+//! `/metrics`) poll keeps the prior snapshot for one cycle.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,12 +54,30 @@ pub const SOURCES_POLL_INTERVAL: Duration = Duration::from_secs(30);
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// One row of the `sources` map. `metrics` is `None` when the last
-/// poll failed AND there was no prior snapshot to fall back to.
+/// legacy `/metrics` poll failed AND there was no prior snapshot.
+/// Mirror-mode rows populate the connectivity / table / tx fields and
+/// leave `metrics` unset.
 #[derive(Clone, Serialize)]
 pub struct SourceSnapshot {
     pub port: u16,
     pub database: String,
     pub schema_cached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectivity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables_live: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables_total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transactions_processed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnected_since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt_eta_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Value>,
 }
@@ -139,6 +149,9 @@ pub struct HealthState {
 }
 
 struct Inner {
+    /// When set, poll this `/v1/mirrors` URL instead of legacy unit
+    /// discovery. Empty/`None` → legacy `unit_dir` mode.
+    mirrors_url: Option<String>,
     unit_dir: PathBuf,
     naming: NamingSpec,
     fetch_timeout: Duration,
@@ -158,8 +171,20 @@ impl HealthState {
     }
 
     /// Like [`HealthState::new`] but with a custom [`NamingSpec`] for
-    /// projecting unit stems into source names.
+    /// projecting unit stems into source names (legacy unit mode only).
     pub fn with_naming(
+        unit_dir: impl Into<PathBuf>,
+        sys: SysState,
+        naming: NamingSpec,
+    ) -> Self {
+        Self::with_options(None, unit_dir, sys, naming)
+    }
+
+    /// Preferred constructor: when `mirrors_url` is `Some`, the poller
+    /// reads public-mirror status; otherwise falls back to systemd unit
+    /// discovery under `unit_dir`.
+    pub fn with_options(
+        mirrors_url: Option<String>,
         unit_dir: impl Into<PathBuf>,
         sys: SysState,
         naming: NamingSpec,
@@ -168,8 +193,17 @@ impl HealthState {
             .timeout(DEFAULT_FETCH_TIMEOUT)
             .build()
             .expect("reqwest client build");
+        let mirrors_url = mirrors_url.and_then(|u| {
+            let t = u.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
         Self {
             inner: Arc::new(Inner {
+                mirrors_url,
                 unit_dir: unit_dir.into(),
                 naming,
                 fetch_timeout: DEFAULT_FETCH_TIMEOUT,
@@ -185,20 +219,86 @@ impl HealthState {
     /// (the second caller waits on `refresh_lock`). On failure for any
     /// single instance that instance's prior snapshot is retained.
     pub async fn refresh_sources(&self) {
-        // Serialize refreshes — the poller task is the only steady-state
-        // caller, but a manual trigger shouldn't race it.
         let _guard = self.inner.refresh_lock.lock().await;
+        if let Some(url) = self.inner.mirrors_url.clone() {
+            self.refresh_from_mirrors(&url).await;
+        } else {
+            self.refresh_from_units().await;
+        }
+    }
 
+    async fn refresh_from_mirrors(&self, url: &str) {
+        let fetched = fetch_mirrors(&self.inner.http, self.inner.fetch_timeout, url).await;
+        let Some(body) = fetched else {
+            tracing::warn!(
+                target: "relay_coordinator::health",
+                %url,
+                "/v1/mirrors poll failed; keeping prior sources"
+            );
+            return;
+        };
+        let Some(arr) = body.get("mirrors").and_then(|v| v.as_array()) else {
+            tracing::warn!(
+                target: "relay_coordinator::health",
+                %url,
+                "/v1/mirrors missing mirrors[]; keeping prior sources"
+            );
+            return;
+        };
+
+        let mut next: BTreeMap<String, SourceSnapshot> = BTreeMap::new();
+        for m in arr {
+            let database = m
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if database.is_empty() {
+                continue;
+            }
+            let name = source_name_for_database(&database);
+            let connectivity = m
+                .get("connectivity")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let tables_live = m.get("tables_live").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let tables_total = m
+                .get("tables_total")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            let live = connectivity.as_deref() == Some("live")
+                && tables_live.is_some()
+                && tables_live == tables_total;
+            next.insert(
+                name,
+                SourceSnapshot {
+                    port: public_port_for_database(&database),
+                    database,
+                    schema_cached: live || tables_live.unwrap_or(0) > 0,
+                    connectivity,
+                    tables_live,
+                    tables_total,
+                    transactions_processed: m
+                        .get("transactions_processed")
+                        .and_then(|v| v.as_u64()),
+                    connected_since: opt_string(m.get("connected_since")),
+                    disconnected_since: opt_string(m.get("disconnected_since")),
+                    next_attempt_at: opt_string(m.get("next_attempt_at")),
+                    next_attempt_eta_secs: m.get("next_attempt_eta_secs").and_then(|v| v.as_u64()),
+                    metrics: None,
+                },
+            );
+        }
+        self.inner.sources.write().clone_from(&next);
+    }
+
+    async fn refresh_from_units(&self) {
         let discovered = discover(&self.inner.unit_dir, &self.inner.naming);
         if discovered.is_empty() {
-            // Nothing to poll; clear the map so a config wipe shows up.
             self.inner.sources.write().clear();
             return;
         }
 
-        // Poll every instance concurrently; each is independent and
-        // capped at fetch_timeout, so the worst-case wall-time is one
-        // timeout regardless of fleet size.
         let mut tasks = Vec::with_capacity(discovered.len());
         for src in &discovered {
             let http = self.inner.http.clone();
@@ -210,9 +310,6 @@ impl HealthState {
             }));
         }
 
-        // Collect new snapshots; keep prior data for instances whose
-        // poll failed this cycle (transient curl timeouts shouldn't
-        // blank a row). Drop instances that disappeared from discovery.
         let prior = self.inner.sources.read().clone();
         let mut next: BTreeMap<String, SourceSnapshot> = BTreeMap::new();
         for (src, task) in discovered.iter().zip(tasks) {
@@ -227,9 +324,6 @@ impl HealthState {
                     .unwrap_or(false),
                 None => false,
             };
-            // Lightly prepare the metrics body for the public fleet
-            // view: strip internal debug state and inject the derived
-            // uptime fields the page reads.
             let metrics = metrics.map(|m| prepare_metrics(&m));
             next.insert(
                 src.name.clone(),
@@ -237,13 +331,18 @@ impl HealthState {
                     port: src.frontend_port,
                     database: db,
                     schema_cached,
+                    connectivity: None,
+                    tables_live: None,
+                    tables_total: None,
+                    transactions_processed: None,
+                    connected_since: None,
+                    disconnected_since: None,
+                    next_attempt_at: None,
+                    next_attempt_eta_secs: None,
                     metrics,
                 },
             );
         }
-        // The task closure consumed `src.database`'s clone for logging;
-        // re-anchor the database name from discovery in case the fetch
-        // path lost it (it can't, but be defensive).
         for src in &discovered {
             if let Some(snap) = next.get_mut(&src.name) {
                 if snap.database.is_empty() {
@@ -286,6 +385,48 @@ impl HealthState {
             "schema_count": sources.len(),
             "system": sys,
         })
+    }
+}
+
+/// Fetch public-mirror `GET /v1/mirrors` JSON. Returns `None` on failure.
+async fn fetch_mirrors(http: &Client, timeout: Duration, url: &str) -> Option<Value> {
+    let resp = tokio::time::timeout(timeout, http.get(url).send()).await;
+    let resp = match resp {
+        Ok(Ok(r)) => r,
+        _ => return None,
+    };
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()
+}
+
+fn opt_string(v: Option<&Value>) -> Option<String> {
+    v.and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// Public frontend port for a mirrored database name.
+///
+/// `bitcraft-live-global` → 3000; `bitcraft-live-N` → 3000+N.
+pub fn public_port_for_database(database: &str) -> u16 {
+    if database == "bitcraft-live-global" || database.ends_with("-global") {
+        return 3000;
+    }
+    if let Some(n) = database.strip_prefix("bitcraft-live-") {
+        if let Ok(id) = n.parse::<u16>() {
+            return 3000 + id;
+        }
+    }
+    3000
+}
+
+/// `/health` sources key: global is shown as `"global"`, regions keep
+/// the full `bitcraft-live-N` name (matches the dashboard fallback list).
+pub fn source_name_for_database(database: &str) -> String {
+    if database == "bitcraft-live-global" {
+        "global".to_string()
+    } else {
+        database.to_string()
     }
 }
 
@@ -759,6 +900,16 @@ mod tests {
         let out = prepare_metrics(&m);
         assert_eq!(out["process_uptime_seconds"].as_u64(), Some(50));
         assert!(out.get("frontend").is_none());
+    }
+
+    #[test]
+    #[test]
+    fn public_port_and_source_name_from_database() {
+        assert_eq!(public_port_for_database("bitcraft-live-global"), 3000);
+        assert_eq!(public_port_for_database("bitcraft-live-14"), 3014);
+        assert_eq!(public_port_for_database("bitcraft-live-3"), 3003);
+        assert_eq!(source_name_for_database("bitcraft-live-global"), "global");
+        assert_eq!(source_name_for_database("bitcraft-live-14"), "bitcraft-live-14");
     }
 
     #[test]

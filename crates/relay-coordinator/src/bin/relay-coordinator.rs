@@ -33,9 +33,19 @@ struct Args {
     #[arg(long, env = "RELAY_HEALTH_BIND", default_value = "127.0.0.1:8082")]
     health_bind: String,
 
+    /// Public-mirror readiness URL (`GET /v1/mirrors`). When set (default),
+    /// `/health` aggregates from this instead of legacy `relay-*.service`
+    /// unit discovery. Empty string forces legacy unit-dir mode.
+    #[arg(
+        long,
+        env = "RELAY_MIRRORS_URL",
+        default_value = "http://127.0.0.1:3000/v1/mirrors"
+    )]
+    mirrors_url: String,
+
     /// Directory containing `relay-*.service` systemd unit files. Used
-    /// by the `/health` aggregator to discover the fleet (each unit's
-    /// `--frontend-bind` / `--dashboard-bind` / `--mirror-database`).
+    /// by the `/health` aggregator only when `--mirrors-url` is empty
+    /// (legacy per-relay fleet).
     #[arg(long, env = "RELAY_UNIT_DIR", default_value = "/etc/systemd/system")]
     unit_dir: PathBuf,
 
@@ -116,10 +126,20 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    let mirrors_url = {
+        let t = args.mirrors_url.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+
     relay_coordinator::daemon::run(
         args.socket,
         args.max_concurrent,
         health_bind,
+        mirrors_url,
         args.unit_dir,
         NamingSpec {
             template: args.source_name_template,

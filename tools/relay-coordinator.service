@@ -1,20 +1,14 @@
-# Relay reconnect coordinator + /health aggregator.
+# Fleet /health aggregator + optional reconnect-permit socket.
 #
-# Two host-scoped fleet utilities in one process:
-#   1. A bounded reconnect-permit semaphore over /run/relay/coordinator.sock
-#      (each relay that has --coordinator-socket set acquires a permit
-#      before its initial sequential subscribe, preventing a fleet-wide
-#      stdb flood after a parallel restart).
-#   2. A /health + / (dashboard) HTTP endpoint on 127.0.0.1:8082 that
-#      aggregates each instance's loopback /metrics. nginx proxies the
-#      public 80/443 listener to this address — drop-in replacement for
-#      a standalone fleet-health service.
+# Primary job today: poll public-mirror `GET /v1/mirrors` and serve the
+# aggregated fleet JSON + dashboard HTML on 127.0.0.1:8082. nginx proxies
+# the public 80/443 `/` and `/health` to this address.
 #
-# Start before (or alongside) the relay instances. Both jobs are independent
-# inside the process: a failure in one cannot wedge the other.
+# The Unix-socket reconnect permit remains for any leftover relay clients
+# but is unused by public-mirror (one process, no per-region permits).
 [Unit]
-Description=spacetimedb-relay reconnect coordinator + /health aggregator
-After=network-online.target
+Description=relay-coordinator /health aggregator (public-mirror)
+After=network-online.target public-mirror.service
 Wants=network-online.target
 
 [Service]
@@ -25,7 +19,7 @@ ExecStart=/srv/relay/spacetimedb-relay/target/release/relay-coordinator \
     --socket /run/relay/coordinator.sock \
     --max-concurrent 1 \
     --health-bind 127.0.0.1:8082 \
-    --unit-dir /etc/systemd/system \
+    --mirrors-url http://127.0.0.1:3000/v1/mirrors \
     --index-html /srv/relay/bitcraft-relay/www/index.html
 RuntimeDirectory=relay
 RuntimeDirectoryMode=0750
