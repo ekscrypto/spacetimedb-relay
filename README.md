@@ -292,8 +292,7 @@ requests. Responses carry a 60-second `Cache-Control` hint.
 | `relay-test-harness`   | Standalone v2 client; useful for end-to-end testing against either the local SpacetimeDB or a remote upstream. |
 | `tools/codegen.py`     | Schema JSON → Rust source for the mirror crate. Emits `#[table]` structs + four writer-gated reducers per table, each taking an `Option<UpstreamReducerInfo>` arg. |
 | `tools/mirror-template/` | `Cargo.toml` + `rust-toolchain.toml` copied into the publisher's workdir. |
-| `tools/fleet-status.sh` | Ops script for multi-instance hosts: auto-discovers every `relay-*` systemd unit, reads its dashboard port, and prints a per-instance sync-status table (upstream/stdb state, 1-min throughput). Run on the host: `./tools/fleet-status.sh` (one-shot) or `-w` to watch. |
-| `tools/relay-fleet-start.sh` | Sequencer invoked by `relay-fleet-sequencer.service` at boot: waits for the shared stdb's `/v1/health`, then starts each relay one at a time (waiting for `upstream.state == "up"` before the next) so concurrent schema-drift rebuilds don't OOM the host. Idempotent — safe to re-run. |
+| `tools/fleet-status.sh`, `relay-fleet-start.sh`, `check-integrity.sh`, `relay-cache.service`, nginx snippets | **Moved.** These fleet ops scripts and systemd units now live in the sibling `bitcraft-relay` repo (`bitcraft-relay/tools/`) after the 2026-07 split — they're BitCraft-deployment-shaped (region-band ports, `relay-bc<N>` units). The sequencer starts each relay one at a time, waiting for `upstream.state == "up"` before the next so concurrent schema-drift rebuilds don't OOM the host (each relay spawns its own stdb via `--stdb-spawn`; there is no shared stdb). Idempotent — safe to re-run. |
 
 ## Large databases
 
