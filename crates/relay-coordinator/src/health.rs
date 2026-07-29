@@ -584,17 +584,26 @@ fn is_mirror_unit(stem: &str) -> bool {
 /// Looks for:
 /// - `--frontend-bind 127.0.0.1:PORT` or `0.0.0.0:PORT` → frontend port
 /// - `--dashboard-bind 127.0.0.1:PORT` → dashboard port
-/// - `--mirror-database NAME` or `--mirror-database=NAME` → database
+/// - `--database NAME` → upstream BitCraft database (used for the
+///   `/health` source key via [`source_name_for_database`])
+/// - `--mirror-database NAME` → local SpacetimeDB database clients
+///   subscribe to on the relay frontend
 ///
-/// The source name comes from `naming.project(unit_stem)`.
+/// When `--database` is present the source key matches the dashboard
+/// contract (`global`, `bitcraft-live-N`). The `database` field always
+/// comes from `--mirror-database`.
 pub fn parse_unit(body: &str, unit_stem: &str, naming: &NamingSpec) -> Option<DiscoveredSource> {
     let frontend_port = parse_bind_port(body, "--frontend-bind")?;
     let dashboard_port = parse_bind_port(body, "--dashboard-bind")?;
-    let database = parse_flag_value(body, "--mirror-database")?;
-    let name = naming.project(unit_stem);
+    let mirror_database = parse_flag_value(body, "--mirror-database")?;
+    let upstream_database = parse_flag_value(body, "--database");
+    let name = match upstream_database {
+        Some(upstream) => source_name_for_database(&upstream),
+        None => naming.project(unit_stem),
+    };
     Some(DiscoveredSource {
         name,
-        database,
+        database: mirror_database,
         frontend_port,
         dashboard_port,
     })
@@ -650,11 +659,32 @@ mod tests {
 
     /// Build a fake systemd unit body with the standard flag layout.
     fn unit_body(frontend: &str, dashboard: &str, mirror_db: &str) -> String {
+        unit_body_with_upstream(frontend, dashboard, mirror_db, "upstream-db")
+    }
+
+    fn unit_body_with_upstream(
+        frontend: &str,
+        dashboard: &str,
+        mirror_db: &str,
+        upstream_db: &str,
+    ) -> String {
         format!(
             "[Service]\n\
              ExecStart=/srv/relay/target/release/relay \\\n\
              --upstream wss://upstream.example.com \\\n\
-             --database upstream-db \\\n\
+             --database {upstream_db} \\\n\
+             --mirror-database {mirror_db} \\\n\
+             --frontend-bind {frontend} \\\n\
+             --dashboard-bind {dashboard} \\\n\
+             --stdb-spawn\n"
+        )
+    }
+
+    fn unit_body_mirror_only(frontend: &str, dashboard: &str, mirror_db: &str) -> String {
+        format!(
+            "[Service]\n\
+             ExecStart=/srv/relay/target/release/relay \\\n\
+             --upstream wss://upstream.example.com \\\n\
              --mirror-database {mirror_db} \\\n\
              --frontend-bind {frontend} \\\n\
              --dashboard-bind {dashboard} \\\n\
@@ -664,8 +694,8 @@ mod tests {
 
     #[test]
     fn parse_unit_file_extracts_ports_and_database() {
-        // Default naming = passthrough: the unit stem is the source name.
-        let body = unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14");
+        // Default naming = passthrough when no `--database` is present.
+        let body = unit_body_mirror_only("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14");
         let src = parse_unit(&body, "relay-region14", &NamingSpec::passthrough()).expect("parsed");
         assert_eq!(src.name, "relay-region14");
         assert_eq!(src.database, "relay-mirror-region14");
@@ -674,13 +704,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_unit_file_prefers_upstream_database_for_bitcraft_names() {
+        let body = unit_body_with_upstream(
+            "127.0.0.1:3014",
+            "127.0.0.1:3114",
+            "relay-mirror-bc14",
+            "bitcraft-live-14",
+        );
+        let src = parse_unit(&body, "relay-bc14", &NamingSpec::passthrough()).expect("parsed");
+        assert_eq!(src.name, "bitcraft-live-14");
+        assert_eq!(src.database, "relay-mirror-bc14");
+
+        let global = unit_body_with_upstream(
+            "127.0.0.1:3000",
+            "127.0.0.1:3100",
+            "relay-mirror-bc-global",
+            "bitcraft-live-global",
+        );
+        let src = parse_unit(&global, "relay-global", &NamingSpec::passthrough()).expect("parsed");
+        assert_eq!(src.name, "global");
+        assert_eq!(src.database, "relay-mirror-bc-global");
+    }
+
+    #[test]
     fn parse_unit_file_projects_name_via_naming_spec() {
-        // A deployment convention: `relay-region14` → `live-14`.
+        // A deployment convention: `relay-region14` → `live-14` when no
+        // `--database` names the source.
         let naming = NamingSpec {
             template: Some("live-{stem}".into()),
             stem_prefix: Some("relay-region".into()),
         };
-        let body = unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14");
+        let body = unit_body_mirror_only("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14");
         let src = parse_unit(&body, "relay-region14", &naming).expect("parsed");
         assert_eq!(src.name, "live-14");
         assert_eq!(src.database, "relay-mirror-region14");
@@ -710,7 +764,7 @@ mod tests {
     fn parse_unit_file_accepts_0000_frontend_bind() {
         // Legacy public-facing binds used 0.0.0.0. The parser must
         // still extract the port (only the host part differs).
-        let body = unit_body("0.0.0.0:3000", "127.0.0.1:3100", "relay-mirror-global");
+        let body = unit_body_mirror_only("0.0.0.0:3000", "127.0.0.1:3100", "relay-mirror-global");
         let src = parse_unit(&body, "relay-global", &NamingSpec::passthrough()).expect("parsed");
         assert_eq!(src.name, "relay-global");
         assert_eq!(src.frontend_port, 3000);
@@ -743,15 +797,15 @@ mod tests {
         };
         mk(
             "relay-global",
-            &unit_body("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-global"),
+            &unit_body_mirror_only("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-global"),
         );
         mk(
             "relay-region14",
-            &unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14"),
+            &unit_body_mirror_only("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14"),
         );
         mk(
             "relay-region7",
-            &unit_body("127.0.0.1:3007", "127.0.0.1:3107", "relay-mirror-region7"),
+            &unit_body_mirror_only("127.0.0.1:3007", "127.0.0.1:3107", "relay-mirror-region7"),
         );
         // These should all be skipped:
         mk(
@@ -792,12 +846,12 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join("relay-region14.service"),
-            unit_body("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14"),
+            unit_body_mirror_only("127.0.0.1:3014", "127.0.0.1:3114", "relay-mirror-region14"),
         )
         .unwrap();
         fs::write(
             dir.path().join("relay-global.service"),
-            unit_body("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-global"),
+            unit_body_mirror_only("127.0.0.1:3000", "127.0.0.1:3100", "relay-mirror-global"),
         )
         .unwrap();
         let naming = NamingSpec {
