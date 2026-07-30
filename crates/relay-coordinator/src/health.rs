@@ -5,7 +5,7 @@
 //! Two discovery modes:
 //!
 //! 1. **Public-mirror (preferred):** poll once
-//!    `GET {mirrors_url}` (default `http://127.0.0.1:3001/v1/mirrors`)
+//!    `GET {mirrors_url}` (default `http://127.0.0.1:3030/v1/mirrors`)
 //!    and map each mirror row into `sources[*]` with public port derived
 //!    from the database name (`bitcraft-live-global` → 3000,
 //!    `bitcraft-live-N` → `3000+N`). Legacy `relay-*.service` units for
@@ -501,6 +501,10 @@ fn opt_string(v: Option<&Value>) -> Option<String> {
     v.and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
+/// Offset from the main listen port to the isolated `GET /v1/mirrors`
+/// sidecar. Must match spacetimedb-public-mirror `MIRROR_STATUS_PORT_OFFSET`.
+pub const MIRROR_STATUS_PORT_OFFSET: u16 = 30;
+
 /// Public frontend port for a mirrored database name.
 ///
 /// `bitcraft-live-global` → 3000; `bitcraft-live-N` → 3000+N.
@@ -514,6 +518,13 @@ pub fn public_port_for_database(database: &str) -> u16 {
         }
     }
     3000
+}
+
+/// Sidecar HTTP port for mirror readiness (`GET /v1/mirrors`).
+pub fn mirror_status_port_for_database(database: &str) -> u16 {
+    public_port_for_database(database)
+        .checked_add(MIRROR_STATUS_PORT_OFFSET)
+        .expect("mirror status port overflow")
 }
 
 /// `/health` sources key: global is shown as `"global"`, regions keep
@@ -1058,6 +1069,9 @@ mod tests {
         assert_eq!(public_port_for_database("bitcraft-live-global"), 3000);
         assert_eq!(public_port_for_database("bitcraft-live-14"), 3014);
         assert_eq!(public_port_for_database("bitcraft-live-3"), 3003);
+        assert_eq!(mirror_status_port_for_database("bitcraft-live-global"), 3030);
+        assert_eq!(mirror_status_port_for_database("bitcraft-live-7"), 3037);
+        assert_eq!(mirror_status_port_for_database("bitcraft-live-8"), 3038);
         assert_eq!(source_name_for_database("bitcraft-live-global"), "global");
         assert_eq!(source_name_for_database("bitcraft-live-14"), "bitcraft-live-14");
     }

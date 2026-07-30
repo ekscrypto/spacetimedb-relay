@@ -39,7 +39,7 @@ struct Args {
     #[arg(
         long,
         env = "RELAY_MIRRORS_URL",
-        default_value = "http://127.0.0.1:3001/v1/mirrors"
+        default_value = "http://127.0.0.1:3030/v1/mirrors"
     )]
     mirrors_url: String,
 

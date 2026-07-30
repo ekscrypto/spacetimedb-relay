@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 
-use crate::health::public_port_for_database;
+use crate::health::{mirror_status_port_for_database, public_port_for_database};
 
 /// Poll interval while waiting for an instance to reach `live`.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -234,7 +234,7 @@ async fn ensure_instance_live(
     http: &Client,
     database: &str,
 ) -> Result<()> {
-    let port = public_port_for_database(database);
+    let port = mirror_status_port_for_database(database);
     let unit = cfg.unit_name(database);
     let started = Instant::now();
 
