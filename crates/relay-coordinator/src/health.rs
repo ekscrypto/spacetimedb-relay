@@ -297,6 +297,19 @@ impl HealthState {
     }
 
     async fn fetch_mirror_snapshots(&self, url: &str) -> BTreeMap<String, SourceSnapshot> {
+        let urls: Vec<&str> = url.split(',').map(str::trim).filter(|u| !u.is_empty()).collect();
+        if urls.is_empty() {
+            return BTreeMap::new();
+        }
+
+        let mut next: BTreeMap<String, SourceSnapshot> = BTreeMap::new();
+        for u in urls {
+            next.extend(self.fetch_mirror_snapshots_one(u).await);
+        }
+        next
+    }
+
+    async fn fetch_mirror_snapshots_one(&self, url: &str) -> BTreeMap<String, SourceSnapshot> {
         let fetched = fetch_mirrors(&self.inner.http, self.inner.fetch_timeout, url).await;
         let Some(body) = fetched else {
             tracing::warn!(
