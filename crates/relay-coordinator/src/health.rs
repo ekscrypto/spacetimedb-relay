@@ -5,13 +5,13 @@
 //! Two discovery modes:
 //!
 //! 1. **Public-mirror (preferred):** poll once
-//!    `GET {mirrors_url}` (default `http://127.0.0.1:3000/v1/mirrors`)
+//!    `GET {mirrors_url}` (default `http://127.0.0.1:3001/v1/mirrors`)
 //!    and map each mirror row into `sources[*]` with public port derived
 //!    from the database name (`bitcraft-live-global` → 3000,
-//!    `bitcraft-live-N` → `3000+N`).
-//! 2. **Legacy relay units:** walk `relay-*.service` files for
-//!    `--frontend-bind` / `--dashboard-bind` / `--mirror-database` and
-//!    poll each loopback `/metrics` (kept for transition / tests).
+//!    `bitcraft-live-N` → `3000+N`). Legacy `relay-*.service` units for
+//!    the same source name are skipped (mirror wins).
+//! 2. **Legacy relay units only:** when `mirrors_url` is empty, walk
+//!    `relay-*.service` files and poll each loopback `/metrics`.
 //!
 //! ```jsonc
 //! {
@@ -218,32 +218,115 @@ impl HealthState {
     /// One discovery + poll pass. Idempotent; safe to call concurrently
     /// (the second caller waits on `refresh_lock`). On failure for any
     /// single instance that instance's prior snapshot is retained.
+    ///
+    /// When `mirrors_url` is set, public-mirror rows are merged with
+    /// legacy unit discovery: mirror rows win for the same source name.
     pub async fn refresh_sources(&self) {
         let _guard = self.inner.refresh_lock.lock().await;
         if let Some(url) = self.inner.mirrors_url.clone() {
-            self.refresh_from_mirrors(&url).await;
+            self.refresh_hybrid(&url).await;
         } else {
             self.refresh_from_units().await;
         }
     }
 
-    async fn refresh_from_mirrors(&self, url: &str) {
+    async fn refresh_hybrid(&self, mirrors_url: &str) {
+        let mirror_map = self.fetch_mirror_snapshots(mirrors_url).await;
+        let discovered = discover(&self.inner.unit_dir, &self.inner.naming);
+        if discovered.is_empty() && mirror_map.is_empty() {
+            self.inner.sources.write().clear();
+            return;
+        }
+
+        let mut tasks = Vec::new();
+        for src in &discovered {
+            if mirror_map.contains_key(&src.name) {
+                continue;
+            }
+            let http = self.inner.http.clone();
+            let timeout = self.inner.fetch_timeout;
+            let dash = src.dashboard_port;
+            let db = src.database.clone();
+            tasks.push((
+                src.clone(),
+                tokio::spawn(async move { (db, fetch_metrics(&http, timeout, dash).await) }),
+            ));
+        }
+
+        let prior = self.inner.sources.read().clone();
+        let mut next: BTreeMap<String, SourceSnapshot> = mirror_map;
+        for (src, task) in tasks {
+            let (db, fetched) = task.await.unwrap_or_else(|_| (src.database.clone(), None));
+            let metrics = fetched.or_else(|| prior.get(&src.name).and_then(|s| s.metrics.clone()));
+            let schema_cached = match &metrics {
+                Some(m) => m
+                    .get("publisher")
+                    .and_then(|p| p.get("fingerprint"))
+                    .and_then(|f| f.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+                None => false,
+            };
+            let metrics = metrics.map(|m| prepare_metrics(&m));
+            next.insert(
+                src.name.clone(),
+                SourceSnapshot {
+                    port: src.frontend_port,
+                    database: db,
+                    schema_cached,
+                    connectivity: None,
+                    tables_live: None,
+                    tables_total: None,
+                    transactions_processed: None,
+                    connected_since: None,
+                    disconnected_since: None,
+                    next_attempt_at: None,
+                    next_attempt_eta_secs: None,
+                    metrics,
+                },
+            );
+        }
+        for src in &discovered {
+            if let Some(snap) = next.get_mut(&src.name) {
+                if snap.database.is_empty() {
+                    snap.database = src.database.clone();
+                }
+            }
+        }
+        self.inner.sources.write().clone_from(&next);
+    }
+
+    async fn fetch_mirror_snapshots(&self, url: &str) -> BTreeMap<String, SourceSnapshot> {
         let fetched = fetch_mirrors(&self.inner.http, self.inner.fetch_timeout, url).await;
         let Some(body) = fetched else {
             tracing::warn!(
                 target: "relay_coordinator::health",
                 %url,
-                "/v1/mirrors poll failed; keeping prior sources"
+                "/v1/mirrors poll failed; keeping prior mirror sources"
             );
-            return;
+            return self
+                .inner
+                .sources
+                .read()
+                .iter()
+                .filter(|(_, s)| s.metrics.is_none())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
         };
         let Some(arr) = body.get("mirrors").and_then(|v| v.as_array()) else {
             tracing::warn!(
                 target: "relay_coordinator::health",
                 %url,
-                "/v1/mirrors missing mirrors[]; keeping prior sources"
+                "/v1/mirrors missing mirrors[]; keeping prior mirror sources"
             );
-            return;
+            return self
+                .inner
+                .sources
+                .read()
+                .iter()
+                .filter(|(_, s)| s.metrics.is_none())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
         };
 
         let mut next: BTreeMap<String, SourceSnapshot> = BTreeMap::new();
@@ -289,7 +372,7 @@ impl HealthState {
                 },
             );
         }
-        self.inner.sources.write().clone_from(&next);
+        next
     }
 
     async fn refresh_from_units(&self) {

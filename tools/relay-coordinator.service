@@ -31,6 +31,7 @@ RuntimeDirectory=relay
 RuntimeDirectoryMode=0750
 WorkingDirectory=/srv/relay/spacetimedb-relay
 Environment="PATH=/srv/relay/.local/bin:/srv/relay/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RELAY_MIRRORS_URL=http://127.0.0.1:3001/v1/mirrors"
 Environment="RUST_LOG=relay_coordinator=info"
 Environment="RELAY_MIRROR_INSTANCES_FILE="
 Environment="RELAY_FLEET_SEQUENCER=false"
