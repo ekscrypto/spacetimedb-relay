@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 
-use crate::health::{mirror_status_port_for_database, public_port_for_database};
+use crate::health::mirror_status_port_for_database;
 
 /// Poll interval while waiting for an instance to reach `live`.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -116,15 +116,21 @@ async fn unit_is_active(argv: &[String], unit: &str) -> bool {
     if argv.is_empty() {
         return false;
     }
+    // Do not pass `--quiet`: sudoers matches exact argv shapes, and
+    // `systemctl is-active UNIT --quiet` is not covered by the
+    // `is-active public-mirror@*.service` rule.
     let mut cmd = Command::new(&argv[0]);
     for arg in &argv[1..] {
         cmd.arg(arg);
     }
-    cmd.arg("is-active").arg(unit).arg("--quiet");
-    cmd.output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    cmd.arg("is-active").arg(unit);
+    match cmd.output().await {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.trim() == "active"
+        }
+        _ => false,
+    }
 }
 
 /// Stop every instance listed in the manifest (best-effort).

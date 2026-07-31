@@ -29,6 +29,7 @@ use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tower_http::cors::CorsLayer;
 
+use crate::fleet_sequencer::{self, FleetSequencerConfig};
 use crate::health::{HealthState, NamingSpec};
 use crate::sys_metrics::SysState;
 
@@ -48,6 +49,9 @@ use crate::sys_metrics::SysState;
 /// stub page is served instead. Load it from a deployment-specific file
 /// via `--index-html` so the generic coordinator crate carries no
 /// deployment-specific UI.
+///
+/// When `fleet_sequencer` is `Some`, also boots each
+/// `public-mirror@DATABASE` listed in the instances file one at a time.
 pub async fn run(
     socket_path: PathBuf,
     max_concurrent: usize,
@@ -56,6 +60,7 @@ pub async fn run(
     unit_dir: PathBuf,
     naming: NamingSpec,
     index_html: Option<String>,
+    fleet_sequencer: Option<FleetSequencerConfig>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     // Remove a stale socket from a previous run.
@@ -75,6 +80,16 @@ pub async fn run(
     );
 
     let sem = Arc::new(Semaphore::new(max_concurrent));
+
+    // Sequential public-mirror fleet bootstrap (optional).
+    let fleet_task = if let Some(cfg) = fleet_sequencer {
+        let shutdown = shutdown_signal_clone();
+        Some(tokio::spawn(async move {
+            fleet_sequencer::run_fleet_sequencer(cfg, shutdown).await;
+        }))
+    } else {
+        None
+    };
 
     // Health aggregator: background poller + host sampler + HTTP server.
     // The poller runs one immediate pass at startup so /health is
@@ -193,10 +208,11 @@ pub async fn run(
     }
 
     cleanup(&socket_path);
-    // Drop the health task handle so it winds down with the process.
+    // Drop background task handles so they wind down with the process.
     // The spawned tasks observe their own shutdown futures firing; the
     // process is exiting regardless, so we don't await them here.
     drop(health_task);
+    drop(fleet_task);
     Ok(())
 }
 

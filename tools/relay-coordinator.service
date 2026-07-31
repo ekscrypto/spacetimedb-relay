@@ -31,10 +31,12 @@ RuntimeDirectory=relay
 RuntimeDirectoryMode=0750
 WorkingDirectory=/srv/relay/spacetimedb-relay
 Environment="PATH=/srv/relay/.local/bin:/srv/relay/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="RELAY_MIRRORS_URL=http://127.0.0.1:3030/v1/mirrors"
 Environment="RUST_LOG=relay_coordinator=info"
-Environment="RELAY_MIRROR_INSTANCES_FILE="
-Environment="RELAY_FLEET_SEQUENCER=false"
+# Comma-separated per-instance sidecars are installed by cutover drop-ins.
+# Base default covers a single sidecar when no drop-in is present.
+Environment="RELAY_MIRRORS_URL=http://127.0.0.1:3030/v1/mirrors"
+Environment="RELAY_MIRROR_INSTANCES_FILE=/srv/relay/bitcraft-relay/tools/public-mirror.instances"
+Environment="RELAY_FLEET_SEQUENCER=true"
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=10s

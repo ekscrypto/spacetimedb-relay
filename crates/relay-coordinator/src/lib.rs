@@ -15,6 +15,7 @@
 //! stdb backoff that lives in `stdb_mode.rs`.
 
 pub mod daemon;
+pub mod fleet_sequencer;
 pub mod health;
 pub mod sys_metrics;
 

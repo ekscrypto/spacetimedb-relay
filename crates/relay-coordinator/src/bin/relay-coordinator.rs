@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
+use relay_coordinator::fleet_sequencer::FleetSequencerConfig;
 use relay_coordinator::health::NamingSpec;
 
 #[derive(Debug, Parser)]
@@ -71,6 +72,29 @@ struct Args {
     /// pick up edits.
     #[arg(long, env = "RELAY_INDEX_HTML")]
     index_html: Option<PathBuf>,
+
+    /// Enable sequential `public-mirror@DATABASE` bootstrap from
+    /// `--mirror-instances-file`. Requires passwordless sudo systemctl
+    /// for the service user (see `relay-coordinator.sudoers`).
+    #[arg(long, env = "RELAY_FLEET_SEQUENCER", default_value_t = false)]
+    fleet_sequencer: bool,
+
+    /// Newline-separated upstream database names to start as
+    /// `public-mirror@DATABASE.service` (e.g. `bitcraft-live-7`).
+    /// Empty disables the fleet sequencer even when `--fleet-sequencer`
+    /// is set.
+    #[arg(long, env = "RELAY_MIRROR_INSTANCES_FILE", default_value = "")]
+    mirror_instances_file: String,
+
+    /// argv prefix for systemd from the fleet sequencer
+    /// (default: `sudo -n systemctl`).
+    #[arg(
+        long,
+        env = "RELAY_FLEET_SYSTEMCTL",
+        default_value = "sudo,-n,systemctl",
+        value_delimiter = ','
+    )]
+    fleet_systemctl: Vec<String>,
 }
 
 #[tokio::main]
@@ -135,6 +159,27 @@ async fn main() -> Result<()> {
         }
     };
 
+    let fleet_sequencer = {
+        let path = args.mirror_instances_file.trim();
+        if args.fleet_sequencer && !path.is_empty() {
+            Some(FleetSequencerConfig {
+                instances_file: PathBuf::from(path),
+                systemctl_argv: args.fleet_systemctl,
+                poll_interval: relay_coordinator::fleet_sequencer::DEFAULT_POLL_INTERVAL,
+                instance_timeout: relay_coordinator::fleet_sequencer::DEFAULT_INSTANCE_TIMEOUT,
+                fetch_timeout: relay_coordinator::fleet_sequencer::DEFAULT_FETCH_TIMEOUT,
+            })
+        } else {
+            if args.fleet_sequencer && path.is_empty() {
+                tracing::warn!(
+                    target: "relay_coordinator",
+                    "--fleet-sequencer set but --mirror-instances-file empty; sequencer idle"
+                );
+            }
+            None
+        }
+    };
+
     relay_coordinator::daemon::run(
         args.socket,
         args.max_concurrent,
@@ -146,6 +191,7 @@ async fn main() -> Result<()> {
             stem_prefix: args.source_name_stem_prefix,
         },
         index_html,
+        fleet_sequencer,
         shutdown,
     )
     .await
