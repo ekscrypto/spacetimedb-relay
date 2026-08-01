@@ -578,13 +578,23 @@ async fn run_check_integrity(
             "http" | "https" => {}
             other => anyhow::bail!("unsupported scheme: {other}"),
         }
+        // Match the WS clients: `--via-frontend` is normally a bare host
+        // (`wss://host:port`). Append /v1/database/<db>/schema. If the
+        // caller already passed a .../subscribe URL, swap the trailing
+        // segment instead (do not double-append).
         let mut path = url.path().trim_end_matches('/').to_string();
-        // The frontend URL already carries /v1/database/<db>/subscribe;
-        // swap the trailing segment for /schema.
         if path.ends_with("/subscribe") {
             path.truncate(path.len() - "/subscribe".len());
+            if !path.ends_with("/schema") {
+                path.push_str("/schema");
+            }
+        } else if path.ends_with("/schema") {
+            // already the schema path
+        } else {
+            path.push_str("/v1/database/");
+            path.push_str(&database);
+            path.push_str("/schema");
         }
-        path.push_str("/schema");
         url.set_path(&path);
         url.query_pairs_mut().clear().append_pair("version", "9");
 
