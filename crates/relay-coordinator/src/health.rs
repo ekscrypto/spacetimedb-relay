@@ -24,6 +24,7 @@
 //!       "tables_live": 12,
 //!       "tables_total": 12,
 //!       "transactions_processed": 12345,
+//!       "transactions_per_sec": 42.0,
 //!       "connected_since": "…"
 //!     }
 //!   },
@@ -32,15 +33,19 @@
 //! }
 //! ```
 //!
+//! `transactions_per_sec` is computed in-process from a 60×1s rotating
+//! bucket ring (mean of per-second deltas of `transactions_processed`).
+//! Refreshing the dashboard never resets the rate.
+//!
 //! Failures are graceful: a failed `/v1/mirrors` (or per-instance
 //! `/metrics`) poll keeps the prior snapshot for one cycle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -52,6 +57,10 @@ use crate::sys_metrics::SysState;
 pub const SOURCES_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Per-instance `/metrics` fetch timeout.
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+/// Tx/s sampler tick (one bucket per tick).
+pub const TX_RATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// Number of 1s buckets in the rotating tx/s window.
+pub const TX_RATE_BUCKETS: usize = 60;
 
 /// One row of the `sources` map. `metrics` is `None` when the last
 /// legacy `/metrics` poll failed AND there was no prior snapshot.
@@ -70,6 +79,10 @@ pub struct SourceSnapshot {
     pub tables_total: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transactions_processed: Option<u64>,
+    /// Mean tx/s over the last up-to-60 one-second buckets. Populated by
+    /// the coordinator's rotating sampler; absent until two samples land.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transactions_per_sec: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected_since: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +161,81 @@ pub struct HealthState {
     inner: Arc<Inner>,
 }
 
+/// Per-source rotating window of 1s `transactions_processed` deltas.
+struct SourceTxRate {
+    last_tx: Option<u64>,
+    buckets: [u64; TX_RATE_BUCKETS],
+    /// Next write index into `buckets`.
+    head: usize,
+    /// How many buckets hold a real sample (`0..TX_RATE_BUCKETS`).
+    filled: usize,
+}
+
+impl Default for SourceTxRate {
+    fn default() -> Self {
+        Self {
+            last_tx: None,
+            buckets: [0; TX_RATE_BUCKETS],
+            head: 0,
+            filled: 0,
+        }
+    }
+}
+
+impl SourceTxRate {
+    /// Record a cumulative `transactions_processed` counter. The first
+    /// observation only primes `last_tx`; subsequent ticks push the
+    /// delta into the ring (0 on counter reset / rewind).
+    fn record(&mut self, tx: u64) {
+        if let Some(prev) = self.last_tx {
+            let delta = if tx >= prev { tx - prev } else { 0 };
+            self.buckets[self.head] = delta;
+            self.head = (self.head + 1) % TX_RATE_BUCKETS;
+            if self.filled < TX_RATE_BUCKETS {
+                self.filled += 1;
+            }
+        }
+        self.last_tx = Some(tx);
+    }
+
+    /// Mean of the filled 1s buckets, or `None` before the first delta.
+    fn rate(&self) -> Option<f64> {
+        if self.filled == 0 {
+            return None;
+        }
+        let sum: u64 = if self.filled < TX_RATE_BUCKETS {
+            self.buckets[..self.filled].iter().sum()
+        } else {
+            self.buckets.iter().sum()
+        };
+        Some(sum as f64 / self.filled as f64)
+    }
+}
+
+/// Fleet-wide tx/s rings keyed by `/health` source name.
+#[derive(Default)]
+struct TxRateTracker {
+    sources: HashMap<String, SourceTxRate>,
+}
+
+impl TxRateTracker {
+    fn record(&mut self, name: &str, tx: u64) {
+        self.sources.entry(name.to_string()).or_default().record(tx);
+    }
+
+    fn rates(&self) -> HashMap<String, f64> {
+        self.sources
+            .iter()
+            .filter_map(|(name, ring)| ring.rate().map(|r| (name.clone(), r)))
+            .collect()
+    }
+
+    /// Drop rings for sources no longer present in the latest sample.
+    fn retain(&mut self, live: &HashMap<String, u64>) {
+        self.sources.retain(|name, _| live.contains_key(name));
+    }
+}
+
 struct Inner {
     /// When set, poll this `/v1/mirrors` URL instead of legacy unit
     /// discovery. Empty/`None` → legacy `unit_dir` mode.
@@ -157,6 +245,8 @@ struct Inner {
     fetch_timeout: Duration,
     http: Client,
     sources: RwLock<BTreeMap<String, SourceSnapshot>>,
+    /// 60×1s rotating `transactions_processed` deltas → tx/s.
+    tx_rates: Mutex<TxRateTracker>,
     /// Guards concurrent `refresh_sources` calls — a single poll in
     /// flight at a time. Steady-state is one caller (the poller task);
     /// the lock exists so a manual `/health`-triggered refresh can't
@@ -209,6 +299,7 @@ impl HealthState {
                 fetch_timeout: DEFAULT_FETCH_TIMEOUT,
                 http,
                 sources: RwLock::new(BTreeMap::new()),
+                tx_rates: Mutex::new(TxRateTracker::default()),
                 refresh_lock: TokioMutex::new(()),
                 sys,
             }),
@@ -278,6 +369,7 @@ impl HealthState {
                     tables_live: None,
                     tables_total: None,
                     transactions_processed: None,
+                    transactions_per_sec: None,
                     connected_since: None,
                     disconnected_since: None,
                     next_attempt_at: None,
@@ -294,6 +386,7 @@ impl HealthState {
             }
         }
         self.inner.sources.write().clone_from(&next);
+        self.stamp_tx_rates();
     }
 
     async fn fetch_mirror_snapshots(&self, url: &str) -> BTreeMap<String, SourceSnapshot> {
@@ -377,6 +470,7 @@ impl HealthState {
                     transactions_processed: m
                         .get("transactions_processed")
                         .and_then(|v| v.as_u64()),
+                    transactions_per_sec: None,
                     connected_since: opt_string(m.get("connected_since")),
                     disconnected_since: opt_string(m.get("disconnected_since")),
                     next_attempt_at: opt_string(m.get("next_attempt_at")),
@@ -431,6 +525,7 @@ impl HealthState {
                     tables_live: None,
                     tables_total: None,
                     transactions_processed: None,
+                    transactions_per_sec: None,
                     connected_since: None,
                     disconnected_since: None,
                     next_attempt_at: None,
@@ -447,6 +542,7 @@ impl HealthState {
             }
         }
         self.inner.sources.write().clone_from(&next);
+        self.stamp_tx_rates();
     }
 
     /// Background task: poll every [`SOURCES_POLL_INTERVAL`], starting
@@ -465,6 +561,88 @@ impl HealthState {
                     self.refresh_sources().await;
                 }
             }
+        }
+    }
+
+    /// Background task: sample mirror `transactions_processed` every
+    /// [`TX_RATE_SAMPLE_INTERVAL`] into a 60-bucket rotating window and
+    /// stamp `transactions_per_sec` onto `/health` sources.
+    pub async fn run_tx_rate_sampler(self, shutdown: impl std::future::Future<Output = ()>) {
+        let mut shutdown = std::pin::pin!(shutdown);
+        let mut tick = tokio::time::interval(TX_RATE_SAMPLE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => break,
+                _ = tick.tick() => {
+                    self.sample_tx_rates().await;
+                }
+            }
+        }
+    }
+
+    async fn sample_tx_rates(&self) {
+        let Some(mirrors_url) = self.inner.mirrors_url.clone() else {
+            return;
+        };
+        let urls: Vec<&str> = mirrors_url
+            .split(',')
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .collect();
+        if urls.is_empty() {
+            return;
+        }
+
+        let mut observed: HashMap<String, u64> = HashMap::new();
+        for url in urls {
+            let Some(body) = fetch_mirrors(&self.inner.http, self.inner.fetch_timeout, url).await
+            else {
+                continue;
+            };
+            let Some(arr) = body.get("mirrors").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for m in arr {
+                let Some(database) = m.get("database").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(tx) = m.get("transactions_processed").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let name = source_name_for_database(database);
+                observed.insert(name, tx);
+            }
+        }
+
+        {
+            let mut tracker = self.inner.tx_rates.lock();
+            for (name, tx) in &observed {
+                tracker.record(name, *tx);
+            }
+            tracker.retain(&observed);
+        }
+
+        // Keep lifetime counters fresh between the slower sources poller
+        // ticks so Refresh always shows a current total + rate.
+        {
+            let mut sources = self.inner.sources.write();
+            for (name, tx) in &observed {
+                if let Some(snap) = sources.get_mut(name) {
+                    snap.transactions_processed = Some(*tx);
+                }
+            }
+        }
+        self.stamp_tx_rates();
+    }
+
+    /// Copy current ring rates onto every source that has one.
+    fn stamp_tx_rates(&self) {
+        let rates = self.inner.tx_rates.lock().rates();
+        let mut sources = self.inner.sources.write();
+        for (name, snap) in sources.iter_mut() {
+            snap.transactions_per_sec = rates.get(name).copied();
         }
     }
 
@@ -1064,7 +1242,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn public_port_and_source_name_from_database() {
         assert_eq!(public_port_for_database("bitcraft-live-global"), 3000);
         assert_eq!(public_port_for_database("bitcraft-live-14"), 3014);
@@ -1112,5 +1289,48 @@ mod tests {
         // No sources discovered → empty sources object, schema_count 0.
         assert!(snap["sources"].as_object().unwrap().is_empty());
         assert_eq!(snap["schema_count"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn tx_rate_ring_needs_two_samples() {
+        let mut ring = SourceTxRate::default();
+        ring.record(100);
+        assert!(ring.rate().is_none());
+        ring.record(110);
+        assert_eq!(ring.rate(), Some(10.0));
+    }
+
+    #[test]
+    fn tx_rate_ring_means_over_filled_buckets() {
+        let mut ring = SourceTxRate::default();
+        ring.record(0);
+        ring.record(10); // +10
+        ring.record(30); // +20
+        ring.record(60); // +30
+        assert_eq!(ring.rate(), Some(20.0));
+    }
+
+    #[test]
+    fn tx_rate_ring_rotates_at_capacity() {
+        let mut ring = SourceTxRate::default();
+        ring.record(0);
+        // Fill 60 buckets with +1 each → mean 1.0
+        for i in 1..=TX_RATE_BUCKETS as u64 {
+            ring.record(i);
+        }
+        assert_eq!(ring.filled, TX_RATE_BUCKETS);
+        assert!((ring.rate().unwrap() - 1.0).abs() < 1e-9);
+        // Next sample +100 should evict one +1 bucket.
+        ring.record(TX_RATE_BUCKETS as u64 + 100);
+        let expected = (59.0 + 100.0) / 60.0;
+        assert!((ring.rate().unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tx_rate_ring_treats_counter_rewind_as_zero_delta() {
+        let mut ring = SourceTxRate::default();
+        ring.record(1_000);
+        ring.record(50); // rewind after mirror restart
+        assert_eq!(ring.rate(), Some(0.0));
     }
 }

@@ -116,9 +116,8 @@ pub async fn run(
             );
         }
 
-        // Spawn the sources poller (drives the `sources` map) and the
-        // host metrics sampler (drives `system.cpu` / `system.memory` /
-        // `system.network`).
+        // Spawn the sources poller (drives the `sources` map), the
+        // 60×1s tx/s sampler, and the host metrics sampler.
         // Each task owns its own shutdown future — they exit when the
         // coordinator does.
         {
@@ -126,6 +125,13 @@ pub async fn run(
             let shutdown = shutdown_signal_clone();
             tokio::spawn(async move {
                 h.run_sources_poller(shutdown).await;
+            });
+        }
+        {
+            let h = health.clone();
+            let shutdown = shutdown_signal_clone();
+            tokio::spawn(async move {
+                h.run_tx_rate_sampler(shutdown).await;
             });
         }
         {
