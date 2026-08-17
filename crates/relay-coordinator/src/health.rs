@@ -37,8 +37,13 @@
 //! bucket ring (mean of per-second deltas of `transactions_processed`).
 //! Refreshing the dashboard never resets the rate.
 //!
-//! Failures are graceful: a failed `/v1/mirrors` (or per-instance
-//! `/metrics`) poll keeps the prior snapshot for one cycle.
+//! Failures are graceful but bounded: a failed `/v1/mirrors` (or
+//! per-instance `/metrics`) poll keeps the prior snapshot verbatim for
+//! [`MIRROR_POLL_GRACE_CYCLES`] cycles (the poll interval is 30s). Once
+//! the grace is exceeded the prior rows are served with
+//! `connectivity: "unreachable"` and a `last_success_unix` timestamp —
+//! `/health` never keeps reporting `live` for an endpoint that is no
+//! longer answering.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -61,11 +66,24 @@ pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 pub const TX_RATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Number of 1s buckets in the rotating tx/s window.
 pub const TX_RATE_BUCKETS: usize = 60;
+/// Consecutive failed `/v1/mirrors` polls before prior rows are marked
+/// `unreachable`. 1 = the last good snapshot is served verbatim for one
+/// failed cycle, then degraded — a sidecar that dies stops looking
+/// `live` on `/health` within two poll cycles (~60s).
+pub const MIRROR_POLL_GRACE_CYCLES: u32 = 1;
+/// Same grace for legacy per-instance `/metrics` fetches before the
+/// retained metrics are dropped and the row is marked `unreachable`.
+pub const METRICS_POLL_GRACE_CYCLES: u32 = 1;
 
 /// One row of the `sources` map. `metrics` is `None` when the last
 /// legacy `/metrics` poll failed AND there was no prior snapshot.
 /// Mirror-mode rows populate the connectivity / table / tx fields and
 /// leave `metrics` unset.
+///
+/// When a source's status endpoint stays unreachable past the poll
+/// grace, its row is served with `connectivity: "unreachable"` and the
+/// last-known field values plus `last_success_unix` — never a stale
+/// `"live"`.
 #[derive(Clone, Serialize)]
 pub struct SourceSnapshot {
     pub port: u16,
@@ -91,6 +109,11 @@ pub struct SourceSnapshot {
     pub next_attempt_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_attempt_eta_secs: Option<u64>,
+    /// When this source's status endpoint last answered successfully
+    /// (unix seconds). Preserved through degraded cycles so consumers
+    /// can tell how old the rest of the row is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Value>,
 }
@@ -247,6 +270,13 @@ struct Inner {
     sources: RwLock<BTreeMap<String, SourceSnapshot>>,
     /// 60×1s rotating `transactions_processed` deltas → tx/s.
     tx_rates: Mutex<TxRateTracker>,
+    /// Consecutive failed `/v1/mirrors` polls per URL. Reset on success;
+    /// past [`MIRROR_POLL_GRACE_CYCLES`] the prior rows for that URL are
+    /// served degraded (`connectivity: "unreachable"`).
+    mirror_fail_counts: Mutex<HashMap<String, u32>>,
+    /// Consecutive failed legacy `/metrics` fetches per source name.
+    /// Same reset/degrade rule with [`METRICS_POLL_GRACE_CYCLES`].
+    metrics_fail_counts: Mutex<HashMap<String, u32>>,
     /// Guards concurrent `refresh_sources` calls — a single poll in
     /// flight at a time. Steady-state is one caller (the poller task);
     /// the lock exists so a manual `/health`-triggered refresh can't
@@ -262,11 +292,7 @@ impl HealthState {
 
     /// Like [`HealthState::new`] but with a custom [`NamingSpec`] for
     /// projecting unit stems into source names (legacy unit mode only).
-    pub fn with_naming(
-        unit_dir: impl Into<PathBuf>,
-        sys: SysState,
-        naming: NamingSpec,
-    ) -> Self {
+    pub fn with_naming(unit_dir: impl Into<PathBuf>, sys: SysState, naming: NamingSpec) -> Self {
         Self::with_options(None, unit_dir, sys, naming)
     }
 
@@ -300,6 +326,8 @@ impl HealthState {
                 http,
                 sources: RwLock::new(BTreeMap::new()),
                 tx_rates: Mutex::new(TxRateTracker::default()),
+                mirror_fail_counts: Mutex::new(HashMap::new()),
+                metrics_fail_counts: Mutex::new(HashMap::new()),
                 refresh_lock: TokioMutex::new(()),
                 sys,
             }),
@@ -348,7 +376,8 @@ impl HealthState {
         let mut next: BTreeMap<String, SourceSnapshot> = mirror_map;
         for (src, task) in tasks {
             let (db, fetched) = task.await.unwrap_or_else(|_| (src.database.clone(), None));
-            let metrics = fetched.or_else(|| prior.get(&src.name).and_then(|s| s.metrics.clone()));
+            let (metrics, connectivity, last_success_unix) =
+                self.legacy_metrics_with_grace(&src.name, fetched, &prior);
             let schema_cached = match &metrics {
                 Some(m) => m
                     .get("publisher")
@@ -365,7 +394,7 @@ impl HealthState {
                     port: src.frontend_port,
                     database: db,
                     schema_cached,
-                    connectivity: None,
+                    connectivity,
                     tables_live: None,
                     tables_total: None,
                     transactions_processed: None,
@@ -374,6 +403,7 @@ impl HealthState {
                     disconnected_since: None,
                     next_attempt_at: None,
                     next_attempt_eta_secs: None,
+                    last_success_unix,
                     metrics,
                 },
             );
@@ -390,14 +420,32 @@ impl HealthState {
     }
 
     async fn fetch_mirror_snapshots(&self, url: &str) -> BTreeMap<String, SourceSnapshot> {
-        let urls: Vec<&str> = url.split(',').map(str::trim).filter(|u| !u.is_empty()).collect();
+        let urls: Vec<&str> = url
+            .split(',')
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .collect();
         if urls.is_empty() {
             return BTreeMap::new();
         }
 
+        // Fresh rows from succeeding URLs always win; degraded rows
+        // (their status endpoint is unreachable past the grace) only
+        // fill names no live URL served, so one dead sidecar in the
+        // comma-list can't shadow fresh data with stale rows.
         let mut next: BTreeMap<String, SourceSnapshot> = BTreeMap::new();
+        let mut degraded: BTreeMap<String, SourceSnapshot> = BTreeMap::new();
         for u in urls {
-            next.extend(self.fetch_mirror_snapshots_one(u).await);
+            for (name, snap) in self.fetch_mirror_snapshots_one(u).await {
+                if snap.connectivity.as_deref() == Some("unreachable") {
+                    degraded.entry(name).or_insert(snap);
+                } else {
+                    next.insert(name, snap);
+                }
+            }
+        }
+        for (name, snap) in degraded {
+            next.entry(name).or_insert(snap);
         }
         next
     }
@@ -405,36 +453,17 @@ impl HealthState {
     async fn fetch_mirror_snapshots_one(&self, url: &str) -> BTreeMap<String, SourceSnapshot> {
         let fetched = fetch_mirrors(&self.inner.http, self.inner.fetch_timeout, url).await;
         let Some(body) = fetched else {
-            tracing::warn!(
-                target: "relay_coordinator::health",
-                %url,
-                "/v1/mirrors poll failed; keeping prior mirror sources"
-            );
-            return self
-                .inner
-                .sources
-                .read()
-                .iter()
-                .filter(|(_, s)| s.metrics.is_none())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            return self.degraded_mirror_rows(url, "poll failed");
         };
         let Some(arr) = body.get("mirrors").and_then(|v| v.as_array()) else {
-            tracing::warn!(
-                target: "relay_coordinator::health",
-                %url,
-                "/v1/mirrors missing mirrors[]; keeping prior mirror sources"
-            );
-            return self
-                .inner
-                .sources
-                .read()
-                .iter()
-                .filter(|(_, s)| s.metrics.is_none())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            return self.degraded_mirror_rows(url, "missing mirrors[]");
         };
+        self.inner
+            .mirror_fail_counts
+            .lock()
+            .insert(url.to_string(), 0);
 
+        let now = now_unix();
         let mut next: BTreeMap<String, SourceSnapshot> = BTreeMap::new();
         for m in arr {
             let database = m
@@ -450,7 +479,10 @@ impl HealthState {
                 .get("connectivity")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let tables_live = m.get("tables_live").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let tables_live = m
+                .get("tables_live")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
             let tables_total = m
                 .get("tables_total")
                 .and_then(|v| v.as_u64())
@@ -475,11 +507,60 @@ impl HealthState {
                     disconnected_since: opt_string(m.get("disconnected_since")),
                     next_attempt_at: opt_string(m.get("next_attempt_at")),
                     next_attempt_eta_secs: m.get("next_attempt_eta_secs").and_then(|v| v.as_u64()),
+                    last_success_unix: Some(now),
                     metrics: None,
                 },
             );
         }
         next
+    }
+
+    /// Serve the prior mirror rows for a `/v1/mirrors` URL that just
+    /// failed to answer. Within [`MIRROR_POLL_GRACE_CYCLES`] the rows
+    /// are returned verbatim (a transient blip never flips the fleet
+    /// view); past it they come back with `connectivity: "unreachable"`
+    /// and their `last_success_unix`, so `/health` stops reporting a
+    /// dead fleet as `live`.
+    fn degraded_mirror_rows(&self, url: &str, why: &str) -> BTreeMap<String, SourceSnapshot> {
+        let fails = {
+            let mut counts = self.inner.mirror_fail_counts.lock();
+            let c = counts.entry(url.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        let prior: BTreeMap<String, SourceSnapshot> = self
+            .inner
+            .sources
+            .read()
+            .iter()
+            .filter(|(_, s)| s.metrics.is_none())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if prior.is_empty() || fails <= MIRROR_POLL_GRACE_CYCLES {
+            tracing::warn!(
+                target: "relay_coordinator::health",
+                %url,
+                why,
+                fails,
+                "/v1/mirrors failed; keeping prior mirror sources (grace)"
+            );
+            return prior;
+        }
+        tracing::warn!(
+            target: "relay_coordinator::health",
+            %url,
+            why,
+            fails,
+            count = prior.len(),
+            "/v1/mirrors unreachable past grace; marking sources unreachable"
+        );
+        prior
+            .into_iter()
+            .map(|(k, mut v)| {
+                v.connectivity = Some("unreachable".to_string());
+                (k, v)
+            })
+            .collect()
     }
 
     async fn refresh_from_units(&self) {
@@ -504,7 +585,8 @@ impl HealthState {
         let mut next: BTreeMap<String, SourceSnapshot> = BTreeMap::new();
         for (src, task) in discovered.iter().zip(tasks) {
             let (db, fetched) = task.await.unwrap_or_else(|_| (src.database.clone(), None));
-            let metrics = fetched.or_else(|| prior.get(&src.name).and_then(|s| s.metrics.clone()));
+            let (metrics, connectivity, last_success_unix) =
+                self.legacy_metrics_with_grace(&src.name, fetched, &prior);
             let schema_cached = match &metrics {
                 Some(m) => m
                     .get("publisher")
@@ -521,7 +603,7 @@ impl HealthState {
                     port: src.frontend_port,
                     database: db,
                     schema_cached,
-                    connectivity: None,
+                    connectivity,
                     tables_live: None,
                     tables_total: None,
                     transactions_processed: None,
@@ -530,6 +612,7 @@ impl HealthState {
                     disconnected_since: None,
                     next_attempt_at: None,
                     next_attempt_eta_secs: None,
+                    last_success_unix,
                     metrics,
                 },
             );
@@ -543,6 +626,49 @@ impl HealthState {
         }
         self.inner.sources.write().clone_from(&next);
         self.stamp_tx_rates();
+    }
+
+    /// Merge a legacy `/metrics` fetch with the prior snapshot under the
+    /// poll-grace rule. Success resets the per-source failure counter;
+    /// the first [`METRICS_POLL_GRACE_CYCLES`] failures keep the prior
+    /// metrics; beyond that the metrics are dropped and the row is
+    /// marked `unreachable` instead of serving frozen numbers forever.
+    ///
+    /// Returns `(metrics, connectivity, last_success_unix)`.
+    fn legacy_metrics_with_grace(
+        &self,
+        name: &str,
+        fetched: Option<Value>,
+        prior: &BTreeMap<String, SourceSnapshot>,
+    ) -> (Option<Value>, Option<String>, Option<u64>) {
+        let prior_snap = prior.get(name);
+        match fetched {
+            Some(m) => {
+                self.inner
+                    .metrics_fail_counts
+                    .lock()
+                    .insert(name.to_string(), 0);
+                (Some(m), None, Some(now_unix()))
+            }
+            None => {
+                let mut counts = self.inner.metrics_fail_counts.lock();
+                let fails = counts.entry(name.to_string()).or_insert(0);
+                *fails += 1;
+                if *fails <= METRICS_POLL_GRACE_CYCLES {
+                    (
+                        prior_snap.and_then(|s| s.metrics.clone()),
+                        None,
+                        prior_snap.and_then(|s| s.last_success_unix),
+                    )
+                } else {
+                    (
+                        None,
+                        Some("unreachable".to_string()),
+                        prior_snap.and_then(|s| s.last_success_unix),
+                    )
+                }
+            }
+        }
     }
 
     /// Background task: poll every [`SOURCES_POLL_INTERVAL`], starting
@@ -677,6 +803,15 @@ async fn fetch_mirrors(http: &Client, timeout: Duration, url: &str) -> Option<Va
 
 fn opt_string(v: Option<&Value>) -> Option<String> {
     v.and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// Current unix time in seconds (0 only if the clock predates the
+/// epoch — practically unreachable).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Offset from the main listen port to the isolated `GET /v1/mirrors`
@@ -941,6 +1076,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Build a fake systemd unit body with the standard flag layout.
     fn unit_body(frontend: &str, dashboard: &str, mirror_db: &str) -> String {
@@ -1332,5 +1468,235 @@ mod tests {
         ring.record(1_000);
         ring.record(50); // rewind after mirror restart
         assert_eq!(ring.rate(), Some(0.0));
+    }
+
+    /// Serve `body` as a canned 200/JSON response on an ephemeral
+    /// loopback port. Returns the URL, the raw port, and the server
+    /// task handle; abort the handle to make the port refuse
+    /// connections.
+    async fn spawn_json_server(body: String) -> (String, u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    // Drain (part of) the request head, then answer.
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1/mirrors"), port, handle)
+    }
+
+    /// A loopback port with nothing listening (bind ephemeral, drop).
+    async fn dead_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn mirror_poll_failure_marks_unreachable_after_grace() {
+        let payload = json!({
+            "mirrors": [
+                {
+                    "database": "bitcraft-live-global",
+                    "connectivity": "live",
+                    "tables_live": 12,
+                    "tables_total": 12,
+                    "transactions_processed": 100
+                }
+            ]
+        })
+        .to_string();
+        let (url, _port, server) = spawn_json_server(payload).await;
+        let state = HealthState::with_options(
+            Some(url),
+            "/nonexistent",
+            SysState::new(),
+            NamingSpec::passthrough(),
+        );
+
+        // Healthy: row is live, success timestamp stamped.
+        state.refresh_sources().await;
+        {
+            let sources = state.inner.sources.read();
+            let row = sources.get("global").expect("row present");
+            assert_eq!(row.connectivity.as_deref(), Some("live"));
+            assert!(row.last_success_unix.expect("success stamped") > 0);
+        }
+
+        server.abort();
+        // First failed cycle: grace keeps the prior row verbatim.
+        state.refresh_sources().await;
+        {
+            let sources = state.inner.sources.read();
+            assert_eq!(
+                sources.get("global").unwrap().connectivity.as_deref(),
+                Some("live")
+            );
+        }
+        // Past grace: the row must stop claiming live.
+        state.refresh_sources().await;
+        {
+            let sources = state.inner.sources.read();
+            let row = sources.get("global").unwrap();
+            assert_eq!(row.connectivity.as_deref(), Some("unreachable"));
+            // Last-known context is preserved, not blanked.
+            assert_eq!(row.database, "bitcraft-live-global");
+            assert_eq!(row.port, 3000);
+            assert_eq!(row.tables_live, Some(12));
+            assert_eq!(row.tables_total, Some(12));
+            assert!(row.last_success_unix.unwrap() > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_url_does_not_shadow_fresh_rows() {
+        let a_payload = json!({
+            "mirrors": [
+                {
+                    "database": "bitcraft-live-global",
+                    "connectivity": "live",
+                    "tables_live": 12,
+                    "tables_total": 12
+                }
+            ]
+        })
+        .to_string();
+        let (url_a, _port_a, server_a) = spawn_json_server(a_payload).await;
+        let url_b = format!("http://127.0.0.1:{}/v1/mirrors", dead_port().await);
+        let state = HealthState::with_options(
+            Some(format!("{url_a},{url_b}")),
+            "/nonexistent",
+            SysState::new(),
+            NamingSpec::passthrough(),
+        );
+
+        // Cycle 1: A delivers; B fails for the first time (no prior
+        // rows of its own to re-inject yet).
+        state.refresh_sources().await;
+        assert_eq!(
+            state
+                .inner
+                .sources
+                .read()
+                .get("global")
+                .unwrap()
+                .connectivity
+                .as_deref(),
+            Some("live")
+        );
+
+        // Cycles 2+: B is past grace and degrades its copy of the prior
+        // rows, but A keeps delivering fresh data — fresh must win.
+        for _ in 0..3 {
+            state.refresh_sources().await;
+            assert_eq!(
+                state
+                    .inner
+                    .sources
+                    .read()
+                    .get("global")
+                    .unwrap()
+                    .connectivity
+                    .as_deref(),
+                Some("live")
+            );
+        }
+
+        // A dies too: one grace cycle, then nothing fresh remains and
+        // the row degrades.
+        server_a.abort();
+        state.refresh_sources().await;
+        assert_eq!(
+            state
+                .inner
+                .sources
+                .read()
+                .get("global")
+                .unwrap()
+                .connectivity
+                .as_deref(),
+            Some("live")
+        );
+        state.refresh_sources().await;
+        assert_eq!(
+            state
+                .inner
+                .sources
+                .read()
+                .get("global")
+                .unwrap()
+                .connectivity
+                .as_deref(),
+            Some("unreachable")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_metrics_failure_drops_after_grace() {
+        let metrics = json!({
+            "publisher": { "fingerprint": "abc123" },
+            "now": 1_000,
+            "started_at": 500
+        })
+        .to_string();
+        let (_url, dash_port, server) = spawn_json_server(metrics).await;
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("relay-region14.service"),
+            unit_body_mirror_only(
+                "127.0.0.1:3014",
+                &format!("127.0.0.1:{dash_port}"),
+                "relay-mirror-region14",
+            ),
+        )
+        .unwrap();
+        let state =
+            HealthState::with_options(None, dir.path(), SysState::new(), NamingSpec::passthrough());
+
+        state.refresh_sources().await;
+        {
+            let sources = state.inner.sources.read();
+            let row = sources.get("relay-region14").expect("row present");
+            assert!(row.metrics.is_some());
+            assert!(row.last_success_unix.is_some());
+        }
+
+        server.abort();
+        // Grace cycle: prior metrics retained, no unreachable verdict.
+        state.refresh_sources().await;
+        {
+            let sources = state.inner.sources.read();
+            let row = sources.get("relay-region14").unwrap();
+            assert!(row.metrics.is_some());
+            assert_eq!(row.connectivity, None);
+        }
+        // Past grace: frozen metrics dropped, row marked unreachable.
+        state.refresh_sources().await;
+        {
+            let sources = state.inner.sources.read();
+            let row = sources.get("relay-region14").unwrap();
+            assert!(row.metrics.is_none());
+            assert_eq!(row.connectivity.as_deref(), Some("unreachable"));
+            assert!(row.last_success_unix.is_some());
+        }
     }
 }
