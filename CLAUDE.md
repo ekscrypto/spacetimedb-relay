@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Production:** On relay.bitcraftsync.app only `relay-coordinator` and
+> `relay-test-harness` are deployed; the mirror stack lives in sibling
+> `spacetimedb-bitcraft-mirror`. See [`PRODUCTION.md`](PRODUCTION.md).
+
 ## Project: spacetimedb-relay
 
 A Rust relay/proxy for SpacetimeDB. One upstream subscription fans out

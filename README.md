@@ -1,5 +1,9 @@
 # spacetimedb-relay
 
+> **relay.bitcraftsync.app** builds only `relay-coordinator` and
+> `relay-test-harness` from this repo. The live mirror + cache run in
+> `spacetimedb-bitcraft-mirror`. See [`PRODUCTION.md`](PRODUCTION.md).
+
 A relay/proxy for SpacetimeDB. One persistent subscription to an
 upstream SpacetimeDB instance fans out to many downstream clients
 without multiplying load on the game server.
