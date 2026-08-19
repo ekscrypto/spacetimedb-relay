@@ -1,17 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/relay",
     "crates/relay-coordinator",
     "crates/relay-protocol",
-    "crates/relay-upstream",
     "crates/relay-test-harness",
-    "crates/relay-publisher",
-    "crates/relay-mirror-driver",
-    "crates/relay-frontend",
-    "spike/replay",
 ]
-exclude = ["test-module", "spike/mirror"]
 
 [workspace.package]
 version = "2.2.0"
@@ -21,24 +14,18 @@ repository = "https://github.com/ekscrypto/spacetimedb-relay"
 
 [workspace.dependencies]
 relay-protocol = { path = "crates/relay-protocol" }
-relay-upstream = { path = "crates/relay-upstream" }
-relay-publisher = { path = "crates/relay-publisher" }
-relay-mirror-driver = { path = "crates/relay-mirror-driver" }
-relay-frontend = { path = "crates/relay-frontend" }
 relay-coordinator = { path = "crates/relay-coordinator" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-rustls = { version = "0.23", features = ["ring"] }
 futures = "0.3"
 futures-util = "0.3"
 bytes = "1"
 http = "1"
 url = "2"
+rustls = { version = "0.23", features = ["ring"] }
 
 axum = { version = "0.7", features = ["ws", "macros"] }
-tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 
@@ -46,34 +33,24 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 prost = "0.13"
 
-tracing = "0.1"
+tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 anyhow = "1"
 thiserror = "2"
 
 clap = { version = "4", features = ["derive", "env"] }
-dashmap = "6"
-hashbrown = "0.14"
 parking_lot = "0.12"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
-dhat = "0.3"
-uuid = { version = "1", features = ["v4", "serde"] }
 hex = "0.4"
-sha2 = "0.10"
-base64 = "0.22"
 rand = "0.8"
 
-# SpacetimeDB internal crates. Pinned to a known-good version; revisit if wire format changes.
-# If these are not on crates.io we will switch to a git dep on clockworklabs/SpacetimeDB.
+# SpacetimeDB wire crates (relay-protocol + relay-test-harness).
 spacetimedb-sats = "2.2"
 spacetimedb-client-api-messages = "2.2"
 spacetimedb-lib = "2.2"
-spacetimedb-sql-parser = "2.2"
 
-# Pinned v1.12.0 — the last v1.x release. Pulled in alongside the 2.x crates so we can decode
-# upstream traffic from servers that still speak `v1.bsatn.spacetimedb`. Used only inside
-# `relay-upstream`; v1 messages are translated to the v2 shape before reaching other crates.
+# v1 compat for relay-test-harness integrity checks against v1.bsatn endpoints.
 spacetimedb-client-api-messages-v1 = { package = "spacetimedb-client-api-messages", version = "=1.12.0" }
 spacetimedb-lib-v1 = { package = "spacetimedb-lib", version = "=1.12.0" }
 
