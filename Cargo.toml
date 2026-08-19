@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/relay-coordinator",
     "crates/relay-protocol",
     "crates/relay-test-harness",
 ]
@@ -14,7 +13,6 @@ repository = "https://github.com/ekscrypto/spacetimedb-relay"
 
 [workspace.dependencies]
 relay-protocol = { path = "crates/relay-protocol" }
-relay-coordinator = { path = "crates/relay-coordinator" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

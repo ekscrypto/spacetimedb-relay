@@ -4,30 +4,26 @@ Agent guide for **spacetimedb-relay** (post–2026-08 slim workspace).
 
 ## What remains
 
-Three crates only:
+Two crates only:
 
 | Crate | Notes |
 |-------|-------|
-| `relay-coordinator` | `health.rs` = `/health`; `daemon.rs` = Unix reconnect permits; `fleet_sequencer.rs` = legacy relay-bc* systemd control (disabled on green) |
 | `relay-protocol` | No I/O — schema + BSATN decode shared with `relay-cache` |
 | `relay-test-harness` | Standalone integrity binary; uses `relay-protocol` + SpacetimeDB wire crates |
 
-The old **`relay` binary stack** was removed. Do not recreate it — mirroring
-lives in `spacetimedb-bitcraft-mirror`.
+Fleet `/health` moved to `spacetimedb-bitcraft-mirror/crates/mirror-health`
+(`mirror-health` binary, `mirror-health.service`).
+
+The old **`relay` binary stack** and **`relay-coordinator`** were removed.
+Do not recreate them — mirroring lives in `spacetimedb-bitcraft-mirror`.
 
 ## Commands
 
 ```sh
-cargo build --release -p relay-coordinator -p relay-test-harness
-cargo test -p relay-coordinator -p relay-protocol
+cargo build --release -p relay-test-harness
+cargo test -p relay-protocol
 cargo clippy --workspace --all-targets -- -D warnings
 ```
-
-## relay-coordinator
-
-- **`/health`** aggregates from `RELAY_MIRRORS_URL` (production: `http://127.0.0.1:3130/v1/mirrors`).
-- Empty `RELAY_MIRRORS_URL` falls back to walking `relay-*.service` units (legacy; unused on green).
-- Dashboard HTML path: `--index-html` (from `relay-coordinator.service`).
 
 ## relay-protocol
 
@@ -49,6 +45,6 @@ client protocols directly.
 
 ## History
 
-Per-region relay architecture (R→P→L→F diagram, codegen, stdb-spawn, etc.) was
-removed from the tree 2026-08. See git history before that date to recover the
-old crates and docs.
+Per-region relay architecture (R→P→L→F diagram, codegen, stdb-spawn, etc.) and
+`relay-coordinator` were removed or relocated 2026-08. See git history before
+that date to recover the old crates and docs.

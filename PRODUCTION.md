@@ -1,27 +1,28 @@
 # Production on relay.bitcraftsync.app
 
-## Deployed crates
+## Deployed from this repo
 
 | Crate / binary | Role | Deploy |
 |--------------|------|--------|
-| **`relay-coordinator`** | Fleet `/health`; polls green `:3130/v1/mirrors` | `tools/deploy.sh core` |
 | **`relay-test-harness`** | Post-deploy integrity gate | Built during deploy verify |
 | **`relay-protocol`** | Library for `relay-cache` (sibling fork) | Not deployed standalone |
 
-Mirroring + read cache: **`spacetimedb-bitcraft-mirror`**
-(`bitcraft-mirror.service`).
+Fleet `/health`: **`mirror-health`** in `spacetimedb-bitcraft-mirror`
+(`mirror-health.service`). Mirroring + read cache: **`bitcraft-mirror.service`**.
 
 ## Build
 
 ```sh
-cargo build --release -p relay-coordinator -p relay-test-harness
+cargo build --release -p relay-test-harness
 ```
 
 ## Removed (2026-08)
 
 The per-region relay daemon and its dependency crates (`relay`,
 `relay-upstream`, `relay-publisher`, `relay-mirror-driver`, `relay-frontend`)
-were deleted from this repo. Retrieve them from git history if needed.
+were deleted from this repo. **`relay-coordinator`** moved to
+`spacetimedb-bitcraft-mirror/crates/mirror-health` (2026-08). Retrieve old
+crates from git history if needed.
 
 ## Docs
 

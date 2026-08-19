@@ -1,43 +1,33 @@
 # spacetimedb-relay
 
-Shared Rust crates for **relay.bitcraftsync.app** ops: fleet health aggregation,
-post-deploy integrity checks, and wire-format helpers consumed by
-`relay-cache` in the sibling `spacetimedb-bitcraft-mirror` repo.
+Shared Rust crates for **relay.bitcraftsync.app** ops: post-deploy integrity
+checks and wire-format helpers consumed by `relay-cache` in the sibling
+`spacetimedb-bitcraft-mirror` repo.
 
 > **Community project — not affiliated with Clockwork Labs.**
 
-The per-region **`relay` daemon stack** (upstream subscribe → codegen mirror
-module → local SpacetimeDB → frontend proxy) was removed in 2026-08. Production
-mirroring runs in `spacetimedb-bitcraft-mirror` instead. The old crates remain
-in git history.
+The per-region **`relay` daemon stack** and **`relay-coordinator`** (`/health`
+aggregator) were removed or relocated in 2026-08. Fleet `/health` now lives in
+`spacetimedb-bitcraft-mirror/crates/mirror-health`. The old crates remain in
+git history.
 
 ## Crates
 
 | Crate | Binary | Role |
 |-------|--------|------|
-| **`relay-coordinator`** | `relay-coordinator` | `/health` JSON + reconnect permit daemon |
 | **`relay-test-harness`** | `relay-test-harness` | v1/v2 BSATN + schema integrity gate |
 | **`relay-protocol`** | (library) | Schema parse + BSATN row decode |
 
-See [`PRODUCTION.md`](PRODUCTION.md) for what deploys to production.
+See [`PRODUCTION.md`](PRODUCTION.md) for what deploys from this repo.
 
 ## Build
 
 ```sh
-cargo build --release -p relay-coordinator -p relay-test-harness
-cargo test -p relay-coordinator -p relay-protocol
+cargo build --release -p relay-test-harness
+cargo test -p relay-protocol
 ```
 
-Deploy from the workspace root: [`../DEPLOY.md`](../DEPLOY.md) (`tools/deploy.sh core`).
-
-## relay-coordinator
-
-Polls `GET /v1/mirrors` on the green status sidecar (`127.0.0.1:3130` by
-default) and serves aggregated fleet JSON at `/health` (public via nginx).
-Also listens on a Unix socket for reconnect permits (legacy relay fleet used
-this; harmless on green).
-
-Unit file: [`tools/relay-coordinator.service`](tools/relay-coordinator.service).
+Deploy from the workspace root: [`../DEPLOY.md`](../DEPLOY.md).
 
 ## relay-test-harness
 
@@ -60,11 +50,8 @@ crate versions aligned across both workspaces.
 
 ```
 crates/
-  relay-coordinator/   /health daemon
   relay-protocol/      shared decode types
   relay-test-harness/  integrity binary
-tools/
-  relay-coordinator.service
 ```
 
 Sibling repos under the workspace root: `spacetimedb-bitcraft-mirror`,
